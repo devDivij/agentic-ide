@@ -66,6 +66,23 @@ export function failuresByStep(nodes: TraceNode[]): Map<string, FailureInfo> {
   return out;
 }
 
+/**
+ * What the agent said it accomplished, per step.
+ *
+ * The executor writes this every time it finishes a step; showing it is the
+ * difference between "step 2 ✓" and "step 2 ✓ — created calculator.js with
+ * the four operator functions and started the server on port 8080".
+ */
+export function notesByStep(nodes: TraceNode[]): Map<string, StepEndPayload> {
+  const out = new Map<string, StepEndPayload>();
+  for (const node of nodes) {
+    if (node.kind !== 'step_end' || !node.stepId) continue;
+    const payload = asStepEnd(node.payload);
+    if (payload?.outcome === 'done') out.set(node.stepId, payload);
+  }
+  return out;
+}
+
 /** The task's final outcome, once it has one. */
 export function taskEndOf(nodes: TraceNode[]): TaskEndPayload | null {
   for (let i = nodes.length - 1; i >= 0; i--) {

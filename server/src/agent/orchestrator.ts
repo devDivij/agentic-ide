@@ -272,6 +272,27 @@ export async function runTask(
 
     const steps = db.getSteps(task.id);
     const done = steps.filter((s) => s.status === 'done').length;
+
+    // What the agent said about its own work, gathered from the step events.
+    const stepNotes = db.getEvents(task.id)
+      .filter((e) => e.kind === 'step_end')
+      .map((e) => {
+        const p = e.payload as StepEndPayload;
+        const spec = steps.find((s) => s.stepId === e.stepId)?.spec;
+        return {
+          stepId: e.stepId ?? '',
+          intent: spec?.intent ?? '',
+          ...(p.summary ? { summary: p.summary } : {}),
+          facts: p.facts ?? [],
+        };
+      });
+    const salvagedSteps = db.getEvents(task.id)
+      .filter((e) => e.kind === 'step_end' && (e.payload as StepEndPayload).salvaged).length;
+    const report_ = composeReport(stepNotes);
+    const links = collectLinks([
+      ...stepNotes.flatMap((s) => s.facts),
+      ...db.getLiveFacts(task.id).map((f) => f.text),
+    ]);
     const status: Task['status'] = abortReason
       ? 'aborted'
       : done === plan.steps.length ? 'awaiting_review' : 'failed';
@@ -289,8 +310,10 @@ export async function runTask(
         stepsTotal: plan.steps.length,
         abortReason,
         changedFiles: countChangedFiles(diff),
+        ...(report_ ? { report: report_ } : {}),
+        ...(links.length > 0 ? { links } : {}),
         ...describeOutcome(status, done, plan.steps.length, abortReason, db, task.id,
-                           diff.trim().length > 0),
+                           diff.trim().length > 0, salvagedSteps),
       } satisfies TaskEndPayload,
     });
 
@@ -512,12 +535,32 @@ async function runOneStep(
           const sha = await agent.checkpoints.commit(`step ${step.id}: ${step.intent}`);
           db.addFacts(task.id, step.id, result.newFacts);
           agent.retriever.invalidate();
+          // A step salvaged from a give-up is not a step completed. Its
+          // "summary" is the stuck-detector's complaint, not an account of
+          // work, and reporting it as one claims success for a model that
+          // quit — the same conflation of "finished" with "did something"
+          // that sent a user to an empty Review pane.
+          const salvaged = result.outcome === 'blocked';
+          const note = salvaged
+            ? `Did not finish cleanly (${result.blockedReason ?? 'the executor gave up'}), ` +
+              `but what it had already written passes verification.`
+            : result.summary;
+
           markStep(db, task.id, step, 'done', sha, attempt);
           db.appendEvent({
             taskId: task.id, parentId: stepEventId, kind: 'step_end',
             stepId: step.id,
-            payload: { outcome: 'done', sha, attempts: attempt } satisfies StepEndPayload,
+            // Carry the executor's own account forward: it is the only place
+            // the system says what it actually did, rather than that it did.
+            payload: {
+              outcome: 'done', sha, attempts: attempt,
+              ...(note ? { summary: note } : {}),
+              ...(salvaged ? { salvaged: true } : {}),
+              ...(result.newFacts.length > 0 ? { facts: result.newFacts } : {}),
+              ...(result.filesTouched.length > 0 ? { filesTouched: result.filesTouched } : {}),
+            } satisfies StepEndPayload,
           });
+          if (note) report(agent, `  ${salvaged ? '~' : '✓'} ${note}`);
           return true;
         }
         evidence.verifyFailed = true;
@@ -577,8 +620,21 @@ async function runOneStep(
 function describeOutcome(
   status: Task['status'], done: number, total: number,
   abortReason: string | null, db: Store, taskId: string,
-  changedAnything: boolean,
+  changedAnything: boolean, salvagedSteps: number,
 ): { summary: string; advice?: string } {
+  if (status === 'awaiting_review' && salvagedSteps > 0 && changedAnything) {
+    // Every step "passed", but at least one only because its half-finished
+    // output happened to parse. Saying "done" here would be a claim the run
+    // does not support.
+    return {
+      summary: `Finished all ${total} step${total === 1 ? '' : 's'}, but ` +
+               `${salvagedSteps} did not complete cleanly — the agent stopped early ` +
+               `and what it had written was kept because it passes basic checks.`,
+      advice: 'Read the diff carefully: this is more likely than usual to be ' +
+              'incomplete. Re-running the unfinished part as its own request often ' +
+              'works better than one broad instruction.',
+    };
+  }
   if (status === 'awaiting_review') {
     // "Completed" and "changed something" are different claims, and conflating
     // them sent a user to a Review pane to accept a diff that did not exist.
@@ -626,6 +682,33 @@ function describeOutcome(
 /** How many files a unified diff touches. Zero means there is nothing to review. */
 export function countChangedFiles(diff: string): number {
   return (diff.match(/^diff --git /gm) ?? []).length;
+}
+
+/**
+ * The agent's closing account of the work, in its own words.
+ *
+ * Assembled in code from what the executor said as it finished each step —
+ * no extra model call. Two reasons: a report of what happened must not be
+ * able to fail, and the sentences are the model's own regardless, so paying
+ * for a second pass would buy phrasing rather than content.
+ */
+export function composeReport(
+  stepNotes: Array<{ stepId: string; intent: string; summary?: string }>,
+): string | undefined {
+  const told = stepNotes.filter((s) => s.summary?.trim());
+  if (told.length === 0) return undefined;
+  // One step is the common case: its own sentence is the whole report.
+  if (told.length === 1) return told[0]!.summary!.trim();
+  return told.map((s) => `• ${s.summary!.trim()}`).join('\n');
+}
+
+/** Addresses worth handing back, e.g. a dev server the agent started. */
+export function collectLinks(texts: string[]): string[] {
+  const found = new Set<string>();
+  for (const text of texts) {
+    for (const url of text.match(/https?:\/\/[^\s"'<>,)]+/g) ?? []) found.add(url);
+  }
+  return [...found];
 }
 
 function toWireFailure(failure: Failure): FailureInfo {
@@ -732,7 +815,10 @@ async function executeStepTurns(
         `${toolCall.name}(${summariseArgs(toolCall.args)}) -> REFUSED: you already ` +
         `ran this exact call and its result is above. Repeating it changes nothing. ` +
         `Make the actual change now with write_file, or reply "done"/"blocked".`);
-      exploring++;
+      // Jump straight to insisting. A model that repeats itself has already
+      // stopped making progress, and the stuck-detector kills the step on the
+      // third repeat — which arrived before a turn-counting budget could fire.
+      exploring = Math.max(exploring + 1, EXPLORE_BUDGET);
       continue;
     }
     if (seen >= 3) {

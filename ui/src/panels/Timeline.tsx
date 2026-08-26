@@ -9,10 +9,12 @@
 import { useEffect, useReducer, useState } from 'react';
 
 import type {
-  ApprovalRequest, AsideBubble, FailureInfo, StepWire, TaskEndPayload, TraceNode,
+  ApprovalRequest, AsideBubble, FailureInfo, StepEndPayload, StepWire,
+  TaskEndPayload, TraceNode,
 } from '../types.ts';
 import {
-  activityFeed, currentActivity, failuresByStep, shortModel, stepDurations, taskEndOf,
+  activityFeed, currentActivity, failuresByStep, notesByStep, shortModel,
+  stepDurations, taskEndOf,
 } from '../activity.ts';
 
 /** One task in the conversation, whether it is live, finished, or historical. */
@@ -71,6 +73,7 @@ export function TaskEntry({
   useTick(running);
 
   const failures = failuresByStep(task.nodes);
+  const notes = notesByStep(task.nodes);
   const durations = stepDurations(task.nodes);
   const end = taskEndOf(task.nodes);
   const elapsed = running ? Date.now() - task.createdAt : task.elapsedMs;
@@ -97,6 +100,7 @@ export function TaskEntry({
                 step={s}
                 durationMs={durations.get(s.id)}
                 failure={failures.get(s.id)}
+                note={notes.get(s.id)}
               />
             ))}
           </div>
@@ -170,9 +174,12 @@ export function TaskEntry({
 }
 
 function Step({
-  step, durationMs, failure,
+  step, durationMs, failure, note,
 }: {
-  step: StepWire; durationMs: number | undefined; failure: FailureInfo | undefined;
+  step: StepWire;
+  durationMs: number | undefined;
+  failure: FailureInfo | undefined;
+  note: StepEndPayload | undefined;
 }): JSX.Element {
   return (
     <div className="step-block">
@@ -186,6 +193,16 @@ function Step({
           <span className="muted small">{(durationMs / 1000).toFixed(0)}s</span>
         )}
       </div>
+
+      {/* What the agent says it actually did — the note it writes on finishing
+          a step, which used to be discarded. */}
+      {note?.summary && <div className="step-note">{note.summary}</div>}
+      {note?.filesTouched && note.filesTouched.length > 0 && (
+        <div className="step-files muted small">
+          {note.filesTouched.map((f) => <code key={f}>{f}</code>)}
+        </div>
+      )}
+
       {failure && <Failure failure={failure} />}
     </div>
   );
@@ -216,6 +233,18 @@ function Outcome({
 }): JSX.Element {
   return (
     <div className="outcome">
+      {/* The agent's own closing account comes first: it is what a person
+          actually wants to read, and the status line is context for it. */}
+      {end.report && <div className="outcome-report">{end.report}</div>}
+
+      {end.links && end.links.length > 0 && (
+        <div className="outcome-links">
+          {end.links.map((url) => (
+            <a key={url} href={url} target="_blank" rel="noreferrer">{url}</a>
+          ))}
+        </div>
+      )}
+
       <div className="outcome-summary">{end.summary}</div>
       {end.abortReason && <div className="muted small">{end.abortReason}</div>}
       {end.advice && <div className="outcome-advice">{end.advice}</div>}

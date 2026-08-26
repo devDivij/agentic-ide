@@ -13,7 +13,8 @@ import { join } from 'node:path';
 import { coerceTurn, extractJson } from '../src/agent/parse.ts';
 import { normalisePlan, singleStepPlan } from '../src/agent/workers.ts';
 import {
-  classifyInCode, countChangedFiles, orderSteps, parsePinTags, TAXONOMY, toToolCall,
+  classifyInCode, collectLinks, composeReport, countChangedFiles, orderSteps,
+  parsePinTags, TAXONOMY, toToolCall,
 } from '../src/agent/orchestrator.ts';
 import {
   BUDGETS, RateBucket, Router, isPayingWorthIt, scoreTask, SECONDS_PER_USD,
@@ -575,4 +576,32 @@ test('countChangedFiles: counts files in a diff, zero for an empty one', () => {
     '-1',
     '+2',
   ].join('\n')), 2);
+});
+
+// ---------------------------------------------------------------------------
+// The agent's own account of its work
+// ---------------------------------------------------------------------------
+
+test('composeReport: one step speaks for itself, several become a list', () => {
+  assert.equal(composeReport([]), undefined);
+  assert.equal(composeReport([{ stepId: 's1', intent: 'i' }]), undefined);
+  assert.equal(
+    composeReport([{ stepId: 's1', intent: 'i', summary: 'Created calculator.js.' }]),
+    'Created calculator.js.');
+  assert.equal(
+    composeReport([
+      { stepId: 's1', intent: 'i', summary: 'Created calculator.js.' },
+      { stepId: 's2', intent: 'i', summary: 'Started the server on 8080.' },
+    ]),
+    '• Created calculator.js.\n• Started the server on 8080.');
+});
+
+test('collectLinks: recovers the address the agent reported, deduplicated', () => {
+  assert.deepEqual(
+    collectLinks(['Server running on http://localhost:8080', 'nothing here']),
+    ['http://localhost:8080']);
+  assert.deepEqual(
+    collectLinks(['see http://localhost:3000,', 'again http://localhost:3000']),
+    ['http://localhost:3000']);
+  assert.deepEqual(collectLinks(['no url at all']), []);
 });

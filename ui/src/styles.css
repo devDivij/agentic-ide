@@ -403,3 +403,27 @@ pre { margin: 6px 0; }
   background: var(--panel-2); border: 1px solid var(--line);
   border-radius: 4px; padding: 0 4px;
 }
+
+/* --- what the agent says it did ---------------------------------------- */
+/* The step note and the closing report are prose, not status: they get the
+   normal text colour and room to breathe, so they read as the agent talking
+   rather than as another badge. */
+.step-note {
+  margin: 3px 0 4px 34px;
+  padding-left: 9px;
+  border-left: 2px solid var(--line);
+  color: var(--text);
+  white-space: pre-wrap;
+}
+.step-files { margin: 0 0 6px 34px; display: flex; gap: 8px; flex-wrap: wrap; }
+.step-files code { color: var(--ok); }
+
+.outcome-report {
+  white-space: pre-wrap;
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 13px;
+}
+.outcome-links { display: flex; flex-direction: column; gap: 3px; margin-bottom: 8px; }
+.outcome-links a { color: var(--accent); font-family: var(--mono); font-size: 12px; }

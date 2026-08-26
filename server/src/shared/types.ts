@@ -66,6 +66,23 @@ export interface StepEndPayload {
   sha?: string;
   attempts?: number;
   failure?: FailureInfo;
+  /**
+   * The agent's own account of what this step did, in its words.
+   *
+   * The executor has always written this when it finishes a step; it used to
+   * be discarded, so the UI could show that a step succeeded but never what
+   * it actually accomplished.
+   */
+  summary?: string;
+  /**
+   * True when the step was accepted only because what it had already written
+   * passed verification, after the executor itself gave up. Kept distinct
+   * from a clean finish so nothing claims success on its behalf.
+   */
+  salvaged?: boolean;
+  /** What the step learned and wrote to memory. */
+  facts?: string[];
+  filesTouched?: string[];
 }
 
 /** Payload of a `task_end` trace node. */
@@ -85,6 +102,19 @@ export interface TaskEndPayload {
   summary: string;
   /** What the user can do next, when the task did not simply succeed. */
   advice?: string;
+  /**
+   * The agent's closing account of the work, assembled from what it said as
+   * it finished each step. Composed in code rather than by another model
+   * call: a report of what happened must not itself be able to fail, and the
+   * sentences are the model's own either way.
+   */
+  report?: string;
+  /**
+   * Addresses the agent reported — a dev server it started. Rendered
+   * clickable, because "hand me the localhost port" is a real request whose
+   * answer is otherwise buried in a fact table.
+   */
+  links?: string[];
 }
 
 // ---------------------------------------------------------------------------
