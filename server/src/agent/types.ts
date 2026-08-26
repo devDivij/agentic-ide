@@ -212,8 +212,23 @@ export interface ToolResult {
 }
 
 /**
+ * What a human decided about a side-effecting tool call.
+ *
+ * `feedback` matters more than it looks: a bare "no" tells the model nothing,
+ * so it tends to propose the same thing again. "Not there, put it in src/"
+ * redirects it in one turn. Carried through on approval too, since "yes, but
+ * also handle the empty case" is a normal thing to want to say.
+ */
+export interface ApprovalDecision {
+  approved: boolean;
+  feedback?: string;
+}
+
+/**
  * Called before any side-effecting tool runs; resolves with the human's
  * decision. The CLI implements this with a terminal prompt, the web server
- * with a question in the browser, batch runs with () => true.
+ * with a question in the browser, batch runs with an unconditional yes.
  */
-export type ApprovalFn = (call: ToolCall, description: string) => Promise<boolean>;
+export type ApprovalFn = (
+  call: ToolCall, description: string,
+) => Promise<ApprovalDecision>;

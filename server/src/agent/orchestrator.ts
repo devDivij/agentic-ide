@@ -37,6 +37,7 @@ import { assertLegalCatalogue, PROVIDERS } from './providers.ts';
 import { runTool } from './tools.ts';
 import { verifyChanges } from './verify.ts';
 import { CallFailedError } from './call.ts';
+import { TaskCancelledError } from './llm.ts';
 import {
   classifyTask, diagnoseFailure, executeTurn, makePlan,
 } from './workers.ts';
@@ -87,6 +88,14 @@ export interface Agent {
    * owner of the session can stop them; `stopBackground` does that.
    */
   background: ChildProcess[];
+  /**
+   * Fires when the user asks the task to stop. Checked at every loop
+   * boundary and passed to the HTTP layer, so an in-flight model call is
+   * aborted rather than waited out — otherwise Stop could take 75 seconds.
+   */
+  cancel: AbortController;
+  /** `cancel.signal`, exposed so the Agent satisfies CallDeps directly. */
+  signal: AbortSignal;
 }
 
 export interface AgentOptions {
@@ -104,6 +113,7 @@ export async function createAgent(opts: AgentOptions): Promise<Agent> {
   await assertGitAvailable();
 
   const retriever = new Retriever(opts.projectRoot);
+  const cancel = new AbortController();
   return {
     projectRoot: opts.projectRoot,
     db: new Store(opts.projectRoot),
@@ -114,9 +124,23 @@ export async function createAgent(opts: AgentOptions): Promise<Agent> {
     projectRules: await readProjectRules(opts.projectRoot),
     approval: opts.approval,
     background: [],
+    cancel,
+    signal: cancel.signal,
     ...(opts.testCommand ? { testCommand: opts.testCommand } : {}),
     ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
   };
+}
+
+/**
+ * Ask a running task to stop.
+ *
+ * Cooperative, not a kill: the loop finishes what it is safely able to,
+ * commits, and returns 'aborted' with the partial diff intact. Everything
+ * already written stays on disk and reviewable — a Stop that discarded the
+ * work would make people afraid to use it.
+ */
+export function requestStop(agent: Agent): void {
+  agent.cancel.abort();
 }
 
 /**
@@ -378,6 +402,8 @@ async function runSteps(
   for (const step of orderSteps(plan.steps)) {
     if (completed.has(step.id)) continue;
 
+    if (agent.cancel.signal.aborted) return 'stopped by you';
+
     const overBudget = checkBudget(agent, task, startedAt, stepsRun);
     if (overBudget) return overBudget;
 
@@ -388,7 +414,15 @@ async function runSteps(
     }
 
     stepsRun++;
-    const ok = await runOneStep(agent, task, plan, step, pinned, rootId);
+    let ok: boolean;
+    try {
+      ok = await runOneStep(agent, task, plan, step, pinned, rootId);
+    } catch (err) {
+      // A stop is not a failure to diagnose and retry. Unwind to the normal
+      // finish: commit, diff, and report 'aborted' with the work intact.
+      if (err instanceof TaskCancelledError) return 'stopped by you';
+      throw err;
+    }
     if (ok) completed.add(step.id);
   }
   return null;
@@ -571,6 +605,7 @@ async function runOneStep(
         problem = [result.blockedReason, ...verdict.problems].filter(Boolean).join('\n');
       }
     } catch (err) {
+      if (err instanceof TaskCancelledError) throw err;   // not ours to handle
       if (err instanceof CallFailedError) evidence.callKind = err.kind;
       problem = err instanceof CallFailedError
         ? `${err.kind}: ${err.message}`
@@ -660,10 +695,15 @@ function describeOutcome(
   }
 
   if (status === 'aborted') {
+    const byUser = abortReason === 'stopped by you';
     return {
-      summary: `Stopped early after ${done} of ${total} steps: ${abortReason}.`,
-      advice: 'Whatever finished is still in the diff — review it, then resume or ' +
-              're-run with a narrower request.',
+      summary: byUser
+        ? `Stopped at your request after ${done} of ${total} steps.`
+        : `Stopped early after ${done} of ${total} steps: ${abortReason}.`,
+      advice: changedAnything
+        ? 'Everything finished before the stop is still on disk and in the diff — ' +
+          'review it, or resume to carry on from the next unfinished step.'
+        : 'Nothing had been changed yet, so nothing was lost.',
     };
   }
 
@@ -778,6 +818,10 @@ async function executeStepTurns(
   let exploring = 0;
 
   for (let turn = 0; turn < MAX_TURNS_PER_STEP; turn++) {
+    // Between turns is the cheapest safe place to stop: the last tool call has
+    // finished and nothing is half-applied.
+    if (agent.cancel.signal.aborted) throw new TaskCancelledError();
+
     const { turn: action, eventId } = await executeTurn(
       agent, task, plan, step, facts, chunks, pinned,
       recentOutcomes, transcript, projectFiles, parentId, retryHint,

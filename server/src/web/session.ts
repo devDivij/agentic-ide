@@ -12,11 +12,12 @@
 import type { ChildProcess } from 'node:child_process';
 
 import {
-  createAgent, runTask, stopBackground, type Agent, type TaskOutcome,
+  createAgent, requestStop, runTask, stopBackground,
+  type Agent, type TaskOutcome,
 } from '../agent/orchestrator.ts';
 import { scoreTask } from '../agent/router.ts';
 import { describeEffect } from '../agent/tools.ts';
-import type { ToolCall } from '../agent/types.ts';
+import type { ApprovalDecision, ToolCall } from '../agent/types.ts';
 import type { ApprovalRequest, ServerEvent, StepWire } from '../shared/types.ts';
 import type { EventBus } from './events.ts';
 
@@ -25,7 +26,7 @@ export class Session {
   /** Servers the agent started, kept alive past the task that started them. */
   private background: ChildProcess[] = [];
   /** Approval requests waiting on a human, keyed by the id sent to the UI. */
-  private pending = new Map<number, (approved: boolean) => void>();
+  private pending = new Map<number, (decision: ApprovalDecision) => void>();
   private approvalCounter = 0;
   private currentTaskId: string | null = null;
   private streamed = new Set<number>();
@@ -98,7 +99,7 @@ export class Session {
   }
 
   /** Called by the approval callback; resolves when the human answers. */
-  private requestApproval(call: ToolCall, effect: string): Promise<boolean> {
+  private requestApproval(call: ToolCall, effect: string): Promise<ApprovalDecision> {
     const eventId = ++this.approvalCounter;
     const request: ApprovalRequest = {
       taskId: this.currentTaskId ?? '',
@@ -119,11 +120,37 @@ export class Session {
   }
 
   /** Called by the HTTP handler when the human answers. */
-  resolveApproval(eventId: number, approved: boolean): boolean {
+  resolveApproval(eventId: number, approved: boolean, feedback?: string): boolean {
     const resolve = this.pending.get(eventId);
     if (!resolve) return false;
     this.pending.delete(eventId);
-    resolve(approved);
+    resolve({ approved, ...(feedback?.trim() ? { feedback: feedback.trim() } : {}) });
+    return true;
+  }
+
+  /**
+   * Ask the running task to stop. Cooperative: it unwinds at the next safe
+   * point and finishes as 'aborted', keeping whatever it already changed.
+   */
+  stop(): boolean {
+    if (!this.agent) return false;
+    requestStop(this.agent);
+
+    // Setting the flag is not enough on its own. A task parked on an approval
+    // is not in a model call and not between turns — it is waiting on a
+    // promise only a human can resolve, so it would sit there for ever while
+    // "stopping". Release those first: the tool sees a refusal, the turn ends,
+    // and the loop reaches its next cancellation check.
+    for (const [eventId, resolve] of this.pending) {
+      resolve({ approved: false, feedback: 'The task was stopped; do not continue.' });
+      this.publish({ type: 'approval_resolved', eventId });
+    }
+    this.pending.clear();
+
+    this.publish({
+      type: 'log', taskId: this.currentTaskId, level: 'info',
+      message: 'Stop requested — finishing the current action and shutting down cleanly.',
+    });
     return true;
   }
 

@@ -27,7 +27,8 @@ import type { Store } from './store.ts';
 import type { RouteDecision, Router } from './router.ts';
 import type { BuiltContext } from './context.ts';
 import {
-  chatComplete, ModelGoneError, TransientProviderError, TruncatedReasoningError,
+  chatComplete, ModelGoneError, TaskCancelledError, TransientProviderError,
+  TruncatedReasoningError,
 } from './llm.ts';
 import { describeZodError, extractJson } from './parse.ts';
 
@@ -36,6 +37,8 @@ export interface CallDeps {
   db: Store;
   router: Router;
   keys: Map<string, string>;
+  /** Aborts an in-flight call when the user stops the task. */
+  signal?: AbortSignal;
 }
 
 export interface CallOptions<T> {
@@ -129,6 +132,7 @@ export async function callModel<T>(
         json: true,
         ...(opts.suppressReasoning ? { suppressReasoning: true } : {}),
         ...(opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : {}),
+        ...(deps.signal ? { signal: deps.signal } : {}),
       }, keys);
 
       router.recordUsage(route.providerId, result.tokensIn + result.tokensOut);
@@ -192,6 +196,8 @@ export async function callModel<T>(
 
     } catch (err) {
       if (err instanceof CallFailedError) throw err;
+      // Nothing to retry, nowhere to fall back to, no provider at fault.
+      if (err instanceof TaskCancelledError) throw err;
 
       if (err instanceof TruncatedReasoningError) {
         // We underfunded the model, it did not misbehave. Buy it room.

@@ -22,6 +22,8 @@ export interface ChatRequest {
   suppressReasoning?: boolean;
   /** Override the hang timeout. Mechanical roles pass something much shorter. */
   timeoutMs?: number;
+  /** Cancels the request when the user stops the task mid-call. */
+  signal?: AbortSignal;
 }
 
 export interface ChatResult {
@@ -57,6 +59,20 @@ export class ModelGoneError extends Error {
     super(`${providerId}/${modelId} no longer exists (HTTP ${statusCode}). ` +
           `Run 'npm run cli -- providers' to see what still answers.`);
     this.name = 'ModelGoneError';
+  }
+}
+
+/**
+ * The user stopped the task.
+ *
+ * Deliberately not a provider failure: there is nothing to retry, no other
+ * model to try, and no penalty to record. It unwinds to a clean 'aborted'
+ * outcome that keeps whatever the task had already changed.
+ */
+export class TaskCancelledError extends Error {
+  constructor() {
+    super('Stopped by the user.');
+    this.name = 'TaskCancelledError';
   }
 }
 
@@ -134,6 +150,7 @@ export async function chatComplete(
     { method: 'POST', headers, body: JSON.stringify(body) },
     providerId,
     req.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    req.signal,
   );
 
   if (!res.ok) {
@@ -184,12 +201,18 @@ export async function chatComplete(
 
 async function fetchWithTimeout(
   url: string, init: RequestInit, providerId: string, timeoutMs: number,
+  cancel?: AbortSignal,
 ): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // Either the deadline or the user can end this call. Aborting the request
+  // itself is what makes Stop feel immediate rather than "some time within
+  // the next 75 seconds".
+  const signal = cancel ? AbortSignal.any([controller.signal, cancel]) : controller.signal;
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    return await fetch(url, { ...init, signal });
   } catch (err) {
+    if (cancel?.aborted) throw new TaskCancelledError();
     // A timeout or socket error is transient: another provider may well work.
     // Penalise this one for longer than a plain error — a model that hung once
     // tends to hang again, and re-picking it costs the whole timeout.

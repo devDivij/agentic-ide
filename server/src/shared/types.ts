@@ -189,6 +189,20 @@ export interface ReviewBundle {
 // Approvals (human gate before side effects)
 // ---------------------------------------------------------------------------
 
+/**
+ * The human's answer to an approval request.
+ *
+ * `feedback` is the point: rejecting without saying why leaves the agent to
+ * guess, and it usually guesses the same thing again. Guidance is passed
+ * through to the model either way — "no, use the existing helper instead" is
+ * as useful attached to an approval as to a refusal.
+ */
+export interface ApprovalDecision {
+  eventId: number;
+  approved: boolean;
+  feedback?: string;
+}
+
 export interface ApprovalRequest {
   taskId: string;
   eventId: number;
@@ -257,5 +271,7 @@ export type ServerEvent =
   | { type: 'steps'; taskId: string; steps: StepWire[] }
   | { type: 'routing'; update: RoutingUpdate }
   | { type: 'approval_request'; request: ApprovalRequest }
+  /** An approval no longer needs an answer — stopping the task releases them. */
+  | { type: 'approval_resolved'; eventId: number }
   | { type: 'aside'; aside: AsideBubble }
   | { type: 'log'; taskId: string | null; level: 'info' | 'warn' | 'error'; message: string };

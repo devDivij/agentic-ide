@@ -15,6 +15,7 @@ import { coerceTurn, extractJson } from '../src/agent/parse.ts';
 import { normalisePlan, singleStepPlan } from '../src/agent/workers.ts';
 import {
   classifyInCode, collectLinks, composeReport, countChangedFiles, orderSteps,
+  requestStop,
   parsePinTags, TAXONOMY, toToolCall,
 } from '../src/agent/orchestrator.ts';
 import {
@@ -524,7 +525,7 @@ test('toToolCall: start_server is a real tool, distinct from run_command', () =>
 
 test('write_file reports a syntax error as its own result, and keeps the file', async () => {
   const root = await mkdtemp(join(tmpdir(), 'az-write-'));
-  const ctx = { projectRoot: root, approval: async () => true };
+  const ctx = { projectRoot: root, approval: async () => ({ approved: true }) };
 
   // A real error a model made: `delete` is a reserved word.
   const bad = await runTool(ctx, {
@@ -615,7 +616,7 @@ test('collectLinks: recovers the address the agent reported, deduplicated', () =
 
 test('write_file rejects a regression and keeps the version that worked', async () => {
   const root = await mkdtemp(join(tmpdir(), 'az-regress-'));
-  const ctx = { projectRoot: root, approval: async () => true };
+  const ctx = { projectRoot: root, approval: async () => ({ approved: true }) };
   const good = 'def perms(n):\n    return list(range(1, n + 1))\n';
 
   const first = await runTool(ctx, {
@@ -638,7 +639,7 @@ test('write_file rejects a regression and keeps the version that worked', async 
 
 test('write_file still keeps a broken NEW file, since nothing good was lost', async () => {
   const root = await mkdtemp(join(tmpdir(), 'az-newbad-'));
-  const ctx = { projectRoot: root, approval: async () => true };
+  const ctx = { projectRoot: root, approval: async () => ({ approved: true }) };
   const bad = await runTool(ctx, {
     name: 'write_file', args: { path: 'fresh.py', content: 'def (:\n' },
   });
@@ -646,4 +647,53 @@ test('write_file still keeps a broken NEW file, since nothing good was lost', as
   assert.match(bad.output, /does NOT parse/);
   assert.equal(existsSync(join(root, 'fresh.py')), true,
     'a broken first draft stays so the model can repair it');
+});
+
+// ---------------------------------------------------------------------------
+// Approval feedback: a bare "no" leaves the model to guess, and it guesses
+// the same thing again. The human's words must reach it verbatim.
+// ---------------------------------------------------------------------------
+
+test('a rejection carries the human\'s instruction to the model', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'az-reject-'));
+  const result = await runTool({
+    projectRoot: root,
+    approval: async () => ({ approved: false, feedback: 'put it in src/, not the root' }),
+  }, { name: 'write_file', args: { path: 'x.py', content: 'x = 1\n' } });
+
+  assert.equal(result.ok, false);
+  assert.match(result.output, /put it in src\/, not the root/);
+  assert.match(result.output, /Do not retry the rejected action as-is/);
+  assert.equal(existsSync(join(root, 'x.py')), false, 'a rejected write must not happen');
+});
+
+test('a rejection with no instruction still says plainly that it was refused', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'az-reject2-'));
+  const result = await runTool({
+    projectRoot: root, approval: async () => ({ approved: false }),
+  }, { name: 'write_file', args: { path: 'x.py', content: 'x = 1\n' } });
+  assert.equal(result.ok, false);
+  assert.match(result.output, /rejected this action/);
+});
+
+test('guidance given alongside an approval reaches the model too', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'az-approve-'));
+  const result = await runTool({
+    projectRoot: root,
+    approval: async () => ({ approved: true, feedback: 'also handle n = 0' }),
+  }, { name: 'write_file', args: { path: 'ok.py', content: 'def f(n):\n    return n\n' } });
+
+  assert.equal(result.ok, true);
+  assert.match(result.output, /it parses/);          // the tool still reports itself
+  assert.match(result.output, /also handle n = 0/);  // and carries the note
+  assert.equal(existsSync(join(root, 'ok.py')), true);
+});
+
+test('requestStop makes the agent signal fire, without killing anything', () => {
+  // A stop is cooperative: the flag flips and the loop unwinds at a safe point.
+  const cancel = new AbortController();
+  const fake = { cancel, signal: cancel.signal } as unknown as Parameters<typeof requestStop>[0];
+  assert.equal(fake.signal.aborted, false);
+  requestStop(fake);
+  assert.equal(fake.signal.aborted, true);
 });

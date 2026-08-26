@@ -64,14 +64,25 @@ export const api = {
       method: 'POST', body: JSON.stringify({ projectRoot }),
     }),
 
+  /**
+   * Ask a running task to stop. Not instant: the loop finishes what it is in
+   * the middle of and stops at its next safe point, keeping whatever it has
+   * already changed. The task_end event is what confirms it actually stopped.
+   */
+  stopTask: (projectRoot: string, taskId: string) =>
+    request<{ ok: boolean }>(`/api/tasks/${encodeURIComponent(taskId)}/stop`, {
+      method: 'POST', body: JSON.stringify({ projectRoot }),
+    }),
+
   bytheway: (question: string) =>
     request<AsideBubble>('/api/bytheway', {
       method: 'POST', body: JSON.stringify({ question }),
     }),
 
-  approve: (projectRoot: string, eventId: number, approved: boolean) =>
+  /** `feedback` reaches the agent whether it was approved or rejected. */
+  approve: (projectRoot: string, eventId: number, approved: boolean, feedback?: string) =>
     request<{ ok: boolean }>('/api/approvals', {
-      method: 'POST', body: JSON.stringify({ projectRoot, eventId, approved }),
+      method: 'POST', body: JSON.stringify({ projectRoot, eventId, approved, feedback }),
     }),
 
   /**

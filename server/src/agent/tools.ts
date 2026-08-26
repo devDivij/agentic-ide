@@ -103,37 +103,53 @@ export async function runTool(ctx: ToolContext, call: ToolCall): Promise<ToolRes
   if (!spec) return { ok: false, output: `No such tool: ${call.name}` };
 
   // The approval gate, enforced once for everything side-effecting.
+  let guidance = '';
   if (spec.sideEffecting) {
-    let approved: boolean;
+    let decision;
     try {
-      approved = await ctx.approval(call, describeEffect(call));
+      decision = await ctx.approval(call, describeEffect(call));
     } catch (err) {
       // A gate that throws is a misconfiguration; surface it as the result so
       // the trace still records that the tool was attempted.
       return { ok: false, output: `Approval could not be obtained: ${(err as Error).message}` };
     }
-    if (!approved) {
+    const note = decision.feedback?.trim();
+    if (!decision.approved) {
       return {
         ok: false,
-        output: 'The human rejected this action. Do not retry it. ' +
-                'Either find another approach or report that you are blocked.',
+        output: note
+          // Their words verbatim: a paraphrase is exactly the kind of lossy
+          // relay that makes the model repeat the rejected idea.
+          ? `The human rejected this action and said:\n"${note}"\n\n` +
+            `Follow that instruction. Do not retry the rejected action as-is.`
+          : `The human rejected this action. Do not retry it. ` +
+            `Either find another approach or report that you are blocked.`,
       };
     }
+    if (note) guidance = `\n\nThe human approved this and added: "${note}"`;
   }
 
   try {
-    switch (call.name) {
-      case 'read_file':   return await doReadFile(ctx, String(call.args.path ?? ''));
-      case 'list_files':  return await doListFiles(ctx, String(call.args.path ?? '.'));
-      case 'search_code': return await doSearchCode(ctx, String(call.args.query ?? ''));
-      case 'write_file':  return await doWriteFile(ctx,
-        String(call.args.path ?? ''), String(call.args.content ?? ''));
-      case 'run_command': return await doRunCommand(ctx, String(call.args.command ?? ''));
-      case 'start_server': return await doStartServer(ctx, String(call.args.command ?? ''));
-      default:            return { ok: false, output: `Unhandled tool: ${call.name}` };
-    }
+    const result = await dispatch(ctx, call);
+    // An approval that came with a note carries it into the result, so the
+    // instruction reaches the model on its very next turn.
+    return guidance ? { ...result, output: result.output + guidance } : result;
   } catch (err) {
     return { ok: false, output: `Tool failed: ${(err as Error).message}` };
+  }
+}
+
+function dispatch(ctx: ToolContext, call: ToolCall): Promise<ToolResult> {
+  switch (call.name) {
+    case 'read_file':    return doReadFile(ctx, String(call.args.path ?? ''));
+    case 'list_files':   return doListFiles(ctx, String(call.args.path ?? '.'));
+    case 'search_code':  return doSearchCode(ctx, String(call.args.query ?? ''));
+    case 'write_file':   return doWriteFile(ctx,
+      String(call.args.path ?? ''), String(call.args.content ?? ''));
+    case 'run_command':  return doRunCommand(ctx, String(call.args.command ?? ''));
+    case 'start_server': return doStartServer(ctx, String(call.args.command ?? ''));
+    default:             return Promise.resolve(
+      { ok: false, output: `Unhandled tool: ${call.name}` });
   }
 }
 

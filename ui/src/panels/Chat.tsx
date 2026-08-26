@@ -23,7 +23,7 @@ import { Aside, TaskEntry, type ChatTask, type TaskActions } from './Timeline.ts
 
 export function Chat({
   projectRoot, task, steps, trace, logs, approvals, asides, history, running,
-  onSubmit, onBytheway, onResume, onApprove, onReview, draft, setDraft,
+  onSubmit, onBytheway, onResume, onStop, onApprove, onReview, draft, setDraft,
 }: {
   projectRoot: string;
   task: TaskSummary | null;
@@ -38,7 +38,8 @@ export function Chat({
   onSubmit: (prompt: string) => void;
   onBytheway: (question: string) => void;
   onResume: (taskId: string) => void;
-  onApprove: (eventId: number, approved: boolean) => void;
+  onStop: (taskId: string) => void;
+  onApprove: (eventId: number, approved: boolean, feedback?: string) => void;
   onReview: () => void;
   draft: string;
   setDraft: (value: string) => void;
@@ -78,6 +79,7 @@ export function Chat({
 
   const actions: TaskActions = {
     onApprove,
+    onStop,
     onReview,
     onResume,
     onRetry: focusComposer,

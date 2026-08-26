@@ -427,3 +427,31 @@ pre { margin: 6px 0; }
 }
 .outcome-links { display: flex; flex-direction: column; gap: 3px; margin-bottom: 8px; }
 .outcome-links a { color: var(--accent); font-family: var(--mono); font-size: 12px; }
+
+/* --- stop control + approval feedback ---------------------------------- */
+/* The stop button sits at the end of the "what it is doing now" row, which is
+   where attention already is while a task runs. `activity-what` takes the
+   slack so the elapsed counter and the button stay put whether or not there
+   is a call in flight — two competing `margin-left:auto` would not. */
+.activity-what {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.activity-stop { padding: 2px 10px; font-size: 11px; }
+.activity-stop:disabled { opacity: .55; }
+
+.approval-note {
+  width: 100%;
+  min-height: 46px;
+  max-height: 160px;
+  resize: vertical;
+  margin: 8px 0;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 7px 9px;
+  font-family: inherit;
+  font-size: 12px;
+}
+.approval-note:focus { outline: none; border-color: var(--accent); }

@@ -39,12 +39,14 @@ export interface ChatTask {
 }
 
 export interface TaskActions {
-  onApprove: (eventId: number, approved: boolean) => void;
+  /** `feedback` is optional guidance, passed on whether or not it was allowed. */
+  onApprove: (eventId: number, approved: boolean, feedback?: string) => void;
   onReview: () => void;
   onResume: (taskId: string) => void;
   onRetry: (prompt: string) => void;
   onAsk: (prompt: string) => void;
   onExplain: (taskId: string) => void;
+  onStop: (taskId: string) => void;
 }
 
 /** Re-render on a timer, so an elapsed counter actually counts. */
@@ -71,6 +73,10 @@ export function TaskEntry({
 }): JSX.Element {
   const running = task.live && task.status === 'running';
   useTick(running);
+
+  // Cleared implicitly: once the task ends, `running` goes false and the whole
+  // activity strip unmounts along with this state.
+  const [stopping, setStopping] = useState(false);
 
   const failures = failuresByStep(task.nodes);
   const notes = notesByStep(task.nodes);
@@ -110,7 +116,13 @@ export function TaskEntry({
           </div>
         )}
 
-        {running && <ActivityStrip nodes={task.nodes} />}
+        {running && (
+          <ActivityStrip
+            nodes={task.nodes}
+            stopping={stopping}
+            onStop={() => { setStopping(true); actions.onStop(task.id); }}
+          />
+        )}
 
         <div className="metrics">
           <span>${task.costUsd.toFixed(5)}</span>
@@ -167,7 +179,11 @@ export function TaskEntry({
       </div>
 
       {approvals.map((a) => (
-        <Approval key={a.eventId} request={a} onDecide={(ok) => actions.onApprove(a.eventId, ok)} />
+        <Approval
+          key={a.eventId}
+          request={a}
+          onDecide={(ok, feedback) => actions.onApprove(a.eventId, ok, feedback)}
+        />
       ))}
     </>
   );
@@ -286,22 +302,46 @@ function Outcome({
  * seen to take 100. Without a running counter that is indistinguishable from
  * a hang, which is exactly how a working run came to look broken.
  */
-function ActivityStrip({ nodes }: { nodes: TraceNode[] }): JSX.Element {
+function ActivityStrip({
+  nodes, stopping, onStop,
+}: {
+  nodes: TraceNode[];
+  stopping: boolean;
+  onStop: () => void;
+}): JSX.Element {
   const now = currentActivity(nodes);
   const feed = activityFeed(nodes);
 
   return (
     <div className="activity">
-      {now && (
-        <div className="activity-now">
+      <div className="activity-now">
+        <span className="activity-what">
           <span className="spinner" />
-          <b>{now.phase}</b>
-          <span className="muted">{now.detail}</span>
+          {now ? (
+            <>
+              <b>{now.phase}</b>
+              <span className="muted">{now.detail}</span>
+            </>
+          ) : (
+            <span className="muted">working…</span>
+          )}
+        </span>
+        {now && (
           <span className="activity-elapsed">
             {Math.max(0, Math.round((Date.now() - now.since) / 1000))}s
           </span>
-        </div>
-      )}
+        )}
+        {/* Stopping is not instant — the loop finishes the step it is in.
+            Saying so is what stops people clicking it repeatedly. */}
+        <button
+          className="danger activity-stop"
+          disabled={stopping}
+          title="Stop after the current step; everything changed so far is kept"
+          onClick={onStop}
+        >
+          {stopping ? 'stopping…' : 'Stop'}
+        </button>
+      </div>
       {feed.length > 0 && (
         <div className="activity-feed">
           {feed.map((line) => (
@@ -341,11 +381,13 @@ export function Approval({
   request, onDecide,
 }: {
   request: ApprovalRequest;
-  onDecide: (approved: boolean) => void;
+  onDecide: (approved: boolean, feedback?: string) => void;
 }): JSX.Element {
   const [showAll, setShowAll] = useState(false);
+  const [note, setNote] = useState('');
   const contentLines = (request.content ?? '').split('\n');
   const preview = showAll ? contentLines : contentLines.slice(0, 24);
+  const decide = (approved: boolean): void => onDecide(approved, note.trim() || undefined);
 
   return (
     <div className={`approval ${request.command !== undefined ? 'unconfined' : ''}`}>
@@ -386,9 +428,28 @@ export function Approval({
         </div>
       )}
 
+      {/* Optional, and it must stay optional: most approvals are one click.
+          But a bare "no" tells the agent nothing, so it tends to propose the
+          same thing again — a sentence here redirects it in one turn. */}
+      <textarea
+        className="approval-note"
+        value={note}
+        placeholder="optional: tell the agent what to do instead"
+        onChange={(e) => setNote(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) decide(true);
+          // Escape clears the box rather than deciding: a stray keypress must
+          // never approve or reject something on the user's behalf.
+          if (e.key === 'Escape') { e.stopPropagation(); setNote(''); }
+        }}
+      />
+
       <div className="row">
-        <button className="primary" onClick={() => onDecide(true)}>Allow</button>
-        <button className="danger" onClick={() => onDecide(false)}>Reject</button>
+        <button className="primary" onClick={() => decide(true)}>Allow</button>
+        <button className="danger" onClick={() => decide(false)}>Reject</button>
+        {note.trim() && (
+          <span className="muted small">sent with your decision</span>
+        )}
       </div>
     </div>
   );

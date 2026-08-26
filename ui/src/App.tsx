@@ -95,8 +95,14 @@ export function App(): JSX.Element {
     void api.bytheway(question).catch((e: Error) => pushLog('error', e.message));
   };
 
-  const approve = (eventId: number, approved: boolean): void => {
-    void api.approve(projectRoot, eventId, approved)
+  const stop = (taskId: string): void => {
+    void api.stopTask(projectRoot, taskId)
+      .then(() => pushLog('info', 'Stop requested — finishing the current step.'))
+      .catch((e: Error) => setToast(e.message));
+  };
+
+  const approve = (eventId: number, approved: boolean, feedback?: string): void => {
+    void api.approve(projectRoot, eventId, approved, feedback)
       .then(() => clearApproval(eventId))
       .catch((e: Error) => setToast(e.message));
   };
@@ -176,6 +182,7 @@ export function App(): JSX.Element {
                   onSubmit={submit}
                   onBytheway={bytheway}
                   onResume={resume}
+                  onStop={stop}
                   onApprove={approve}
                   onReview={() => setTab('review')}
                   draft={draft}

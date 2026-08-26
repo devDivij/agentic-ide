@@ -83,6 +83,13 @@ function reduce(state: AppState, action: Action): AppState {
       return state.approvals.some((a) => a.eventId === event.request.eventId)
         ? state
         : { ...state, approvals: [...state.approvals, event.request] };
+    case 'approval_resolved':
+      // The server answered it for us (stopping a task releases anything
+      // waiting on a human), so the card must go away on its own.
+      return {
+        ...state,
+        approvals: state.approvals.filter((a) => a.eventId !== event.eventId),
+      };
     case 'aside':
       return state.asides.some((a) => a.ts === event.aside.ts)
         ? state

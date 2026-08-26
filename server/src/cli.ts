@@ -15,7 +15,7 @@ import { resolve } from 'node:path';
 import { stdin, stdout } from 'node:process';
 
 import {
-  createAgent, runTask, stopBackground, type TaskOutcome,
+  createAgent, requestStop, runTask, stopBackground, type TaskOutcome,
 } from './agent/orchestrator.ts';
 import { PROVIDERS, assertLegalCatalogue } from './agent/providers.ts';
 import { scoreTask } from './agent/router.ts';
@@ -103,6 +103,18 @@ async function startTask(
     onRoute: (d) => console.log(`  -> [${d.providerId}] ${d.modelId}  (${d.reason})`),
   });
 
+  // Ctrl+C asks the task to stop rather than killing the process, so the work
+  // done so far is committed and reported instead of vanishing. A second
+  // Ctrl+C is the escape hatch if the graceful path itself wedges.
+  let stopping = false;
+  const onSigint = (): void => {
+    if (stopping) { console.log('\nForcing exit.'); process.exit(130); }
+    stopping = true;
+    console.log('\nStopping… (Ctrl+C again to force). Finishing the current action.');
+    requestStop(agent);
+  };
+  process.on('SIGINT', onSigint);
+
   try {
     console.log(`\nProject: ${projectRoot}`);
     if (prompt) console.log(`Task: ${prompt}\n`);
@@ -116,6 +128,7 @@ async function startTask(
                   `started during this task.`);
     }
   } finally {
+    process.off('SIGINT', onSigint);
     stopBackground(agent);
     agent.db.close();
   }
@@ -145,7 +158,7 @@ task id     ${outcome.taskId}
 // ---------------------------------------------------------------------------
 
 /** ONLY for unattended batch runs — everything is approved unread. */
-const autoApprove: ApprovalFn = async () => true;
+const autoApprove: ApprovalFn = async () => ({ approved: true });
 
 /** Ask in the terminal, showing the exact command or file contents. */
 const terminalApproval: ApprovalFn = async (call: ToolCall) => {
@@ -166,7 +179,13 @@ const terminalApproval: ApprovalFn = async (call: ToolCall) => {
     console.log(`  ${'-'.repeat(66)}`);
 
     const answer = await rl.question('  allow? [y/N] ');
-    return answer.trim().toLowerCase().startsWith('y');
+    const approved = answer.trim().toLowerCase().startsWith('y');
+    // Saying why is optional but valuable: a bare "no" leaves the model to
+    // guess, and it usually guesses the same thing again.
+    const feedback = (await rl.question(
+      approved ? '  anything to add? [enter to skip] '
+               : '  what should it do instead? [enter to skip] ')).trim();
+    return { approved, ...(feedback ? { feedback } : {}) };
   } finally {
     rl.close();
   }

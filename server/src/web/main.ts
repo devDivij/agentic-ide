@@ -208,13 +208,29 @@ const routes: Array<{ method: string; pattern: RegExp; handle: Handler }> = [
     method: 'POST', pattern: /^\/api\/approvals$/,
     handle: async (req, res) => {
       const body = await readJson(req) as
-        { projectRoot?: string; eventId?: number; approved?: boolean };
+        { projectRoot?: string; eventId?: number; approved?: boolean; feedback?: string };
       if (!body.projectRoot || body.eventId === undefined) {
         return json(res, 400, { error: 'projectRoot and eventId are required' });
       }
-      const ok = sessionFor(resolve(body.projectRoot))
-        .resolveApproval(Number(body.eventId), body.approved === true);
+      const ok = sessionFor(resolve(body.projectRoot)).resolveApproval(
+        Number(body.eventId), body.approved === true, body.feedback);
       json(res, ok ? 200 : 404, { ok });
+    },
+  },
+
+  // -- stop a running task ---------------------------------------------------
+  {
+    method: 'POST', pattern: /^\/api\/tasks\/([^/]+)\/stop$/,
+    handle: async (req, res) => {
+      const body = await readJson(req) as { projectRoot?: string };
+      if (!body.projectRoot) return json(res, 400, { error: 'projectRoot required' });
+      const session = sessions.get(resolve(body.projectRoot));
+      if (!session?.isRunning) {
+        return json(res, 409, { error: 'No task is running in this project.' });
+      }
+      // Cooperative: the loop unwinds at its next safe point and reports
+      // 'aborted' with whatever it already changed still on disk.
+      json(res, 202, { ok: session.stop() });
     },
   },
 
