@@ -9,7 +9,11 @@
  * live view and the post-hoc view are the same data by construction.
  */
 
-import { runTask, createAgent, type Agent, type TaskOutcome } from '../agent/orchestrator.ts';
+import type { ChildProcess } from 'node:child_process';
+
+import {
+  createAgent, runTask, stopBackground, type Agent, type TaskOutcome,
+} from '../agent/orchestrator.ts';
 import { scoreTask } from '../agent/router.ts';
 import { describeEffect } from '../agent/tools.ts';
 import type { ToolCall } from '../agent/types.ts';
@@ -18,6 +22,8 @@ import type { EventBus } from './events.ts';
 
 export class Session {
   private agent: Agent | null = null;
+  /** Servers the agent started, kept alive past the task that started them. */
+  private background: ChildProcess[] = [];
   /** Approval requests waiting on a human, keyed by the id sent to the UI. */
   private pending = new Map<number, (approved: boolean) => void>();
   private approvalCounter = 0;
@@ -82,6 +88,10 @@ export class Session {
       this.stopPump();
       this.flush();
       this.currentTaskId = null;
+      // A server the agent started must OUTLIVE the task — the whole point of
+      // "run it and give me the port" is that the port still works afterwards.
+      // The session keeps the handles and kills them when it closes.
+      if (this.agent) this.background.push(...this.agent.background.splice(0));
       this.agent?.db.close();
       this.agent = null;
     }
@@ -119,6 +129,10 @@ export class Session {
 
   close(): void {
     this.stopPump();
+    if (this.agent) stopBackground(this.agent);
+    for (const child of this.background.splice(0)) {
+      try { child.kill('SIGTERM'); } catch { /* already gone */ }
+    }
     this.agent?.db.close();
     this.agent = null;
   }

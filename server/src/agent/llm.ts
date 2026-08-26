@@ -20,6 +20,8 @@ export interface ChatRequest {
   json?: boolean;
   /** Turn off chain-of-thought on models that think by default (see providers.ts). */
   suppressReasoning?: boolean;
+  /** Override the hang timeout. Mechanical roles pass something much shorter. */
+  timeoutMs?: number;
 }
 
 export interface ChatResult {
@@ -60,7 +62,17 @@ export class TruncatedReasoningError extends Error {
   }
 }
 
-const TIMEOUT_MS = 120_000;
+/**
+ * How long to wait before calling a request hung rather than slow.
+ *
+ * This was 120s, and a provider that simply never answered cost 120 of one
+ * run's 146 seconds — 82% of it spent waiting on a call that was never
+ * coming. Measured legitimate calls on these models: classify ~2s, diagnose
+ * ~10s, plan 13-50s, execute 3-19s. So a generation call gets real headroom
+ * and a mechanical one does not, because a 30s classify is not slow, it is
+ * broken — and the sooner we know, the sooner the router tries elsewhere.
+ */
+const DEFAULT_TIMEOUT_MS = 75_000;
 
 export async function chatComplete(
   providerId: string, modelId: string, req: ChatRequest, keys: Map<string, string>,
@@ -103,6 +115,7 @@ export async function chatComplete(
     `${provider.baseUrl}/chat/completions`,
     { method: 'POST', headers, body: JSON.stringify(body) },
     providerId,
+    req.timeoutMs ?? DEFAULT_TIMEOUT_MS,
   );
 
   if (!res.ok) {
@@ -149,16 +162,22 @@ export async function chatComplete(
 }
 
 async function fetchWithTimeout(
-  url: string, init: RequestInit, providerId: string,
+  url: string, init: RequestInit, providerId: string, timeoutMs: number,
 ): Promise<Response> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(url, { ...init, signal: controller.signal });
   } catch (err) {
     // A timeout or socket error is transient: another provider may well work.
+    // Penalise this one for longer than a plain error — a model that hung once
+    // tends to hang again, and re-picking it costs the whole timeout.
+    const hung = controller.signal.aborted;
     throw new TransientProviderError(
-      `Request to ${providerId} failed: ${(err as Error).message}`, providerId, 2_000, 0);
+      hung
+        ? `${providerId} did not respond within ${(timeoutMs / 1000).toFixed(0)}s`
+        : `Request to ${providerId} failed: ${(err as Error).message}`,
+      providerId, hung ? 30_000 : 2_000, 0);
   } finally {
     clearTimeout(timer);
   }

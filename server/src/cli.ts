@@ -14,7 +14,9 @@ import { createInterface } from 'node:readline/promises';
 import { resolve } from 'node:path';
 import { stdin, stdout } from 'node:process';
 
-import { createAgent, runTask, type TaskOutcome } from './agent/orchestrator.ts';
+import {
+  createAgent, runTask, stopBackground, type TaskOutcome,
+} from './agent/orchestrator.ts';
 import { PROVIDERS, assertLegalCatalogue } from './agent/providers.ts';
 import { scoreTask } from './agent/router.ts';
 import { Store } from './agent/store.ts';
@@ -106,7 +108,14 @@ async function startTask(
     const outcome = await runTask(agent, prompt,
       resumeTaskId ? { resumeTaskId } : {});
     printOutcome(outcome);
+    if (agent.background.length > 0) {
+      // Headless runs have no one to hand a live server to, so say what was
+      // started and stop it rather than leaving orphans behind.
+      console.log(`\nStopping ${agent.background.length} background process(es) ` +
+                  `started during this task.`);
+    }
   } finally {
+    stopBackground(agent);
     agent.db.close();
   }
 }

@@ -51,6 +51,8 @@ export interface CallOptions<T> {
   difficulty?: 'routine' | 'hairy';
   /** Skip chain-of-thought (mechanical roles: ~20x cheaper, same answer). */
   suppressReasoning?: boolean;
+  /** Hang timeout. Short for mechanical roles: a slow one is a broken one. */
+  timeoutMs?: number;
 }
 
 const MAX_REPAIRS = 2;
@@ -124,6 +126,7 @@ export async function callModel<T>(
         temperature: opts.temperature ?? 0.2,
         json: true,
         ...(opts.suppressReasoning ? { suppressReasoning: true } : {}),
+        ...(opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : {}),
       }, keys);
 
       router.recordUsage(route.providerId, result.tokensIn + result.tokensOut);
@@ -179,8 +182,10 @@ export async function callModel<T>(
         { role: 'assistant', content: result.text },
         { role: 'user', content:
             `That response was not valid for the required schema:\n${lastError}\n\n` +
-            `Reply with ONLY a single JSON object that satisfies the schema. ` +
-            `No prose, no code fences.` },
+            `Re-read the required JSON shape given above and follow it exactly. ` +
+            `An empty list is never a valid answer — if you are unsure, give one ` +
+            `entry that describes the whole request. Reply with ONLY a single ` +
+            `JSON object. No prose, no code fences.` },
       ];
 
     } catch (err) {

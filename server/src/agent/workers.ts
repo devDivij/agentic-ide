@@ -58,6 +58,9 @@ export async function classifyTask(
     parentId,
     schema: ClassifySchema,
     maxTokens: 200,
+    // A difficulty label that takes 30s is not slow, it is broken — fail over
+    // rather than spend a minute on one word.
+    timeoutMs: 30_000,
     // A one-word label gains nothing from deliberation at ~20x the tokens.
     suppressReasoning: true,
     context: buildContext({
@@ -112,7 +115,55 @@ Rules:
   - Prefer few steps. One step per file that must change is usually right.
 `.trim();
 
+/**
+ * Planning that cannot fail the task.
+ *
+ * A small model sometimes cannot produce a step list at all: observed live,
+ * one returned a plan keyed by filename and then twice returned `"steps": []`,
+ * which killed the whole task before a single file was touched. But a task
+ * with no plan is not a task with no hope — the executor can often just do
+ * what was asked. So a planning failure degrades to a one-step plan carrying
+ * the user's own request, which is exactly right for simple work and no worse
+ * than failing for complex work.
+ */
 export async function makePlan(
+  ctx: WorkerCtx, task: Task, chunks: CodeChunk[], pinned: CodeChunk[],
+  projectFiles: string[], parentId: number,
+): Promise<Plan> {
+  try {
+    return await planWithModel(ctx, task, chunks, pinned, projectFiles, parentId);
+  } catch (err) {
+    ctx.db.appendEvent({
+      taskId: task.id, parentId, kind: 'error', role: 'plan',
+      payload: {
+        failureClass: 'plan_unusable',
+        message: (err as Error).message,
+        action: 'falling back to a single step carrying the original request',
+      },
+      status: 'error',
+    });
+    return singleStepPlan(task);
+  }
+}
+
+/** The fallback: do what was asked, as one step, and let verification judge it. */
+export function singleStepPlan(task: Task): Plan {
+  return {
+    summary: 'Planning did not produce usable steps; carrying out the request directly.',
+    steps: [{
+      id: 's1',
+      intent: task.prompt,
+      targetFiles: [],
+      acceptanceCriteria: ['The change the request describes is present and the project still parses.'],
+      dependsOn: [],
+      // Treated as hard: it is the whole task in one step, so it deserves the
+      // strongest model available rather than the cheapest.
+      difficulty: 'hairy',
+    }],
+  };
+}
+
+async function planWithModel(
   ctx: WorkerCtx, task: Task, chunks: CodeChunk[], pinned: CodeChunk[],
   projectFiles: string[], parentId: number,
 ): Promise<Plan> {
@@ -204,7 +255,8 @@ To use a tool, set "action" to the tool name and put its arguments beside it:
 {"thought": "why", "action": "read_file", "path": "calc.py"}
 {"thought": "why", "action": "search_code", "query": "multiply"}
 {"thought": "why", "action": "list_files", "path": "."}
-{"thought": "why", "action": "run_command", "command": "python -m pytest -q"}
+{"thought": "why", "action": "run_command", "command": "python3 -m pytest -q"}
+{"thought": "why", "action": "start_server", "command": "node server.js"}
 {"thought": "why", "action": "write_file", "path": "calc.py", "content": "COMPLETE NEW FILE"}
 
 When the step is finished:
@@ -220,6 +272,8 @@ Rules:
   - Read a file before rewriting it. "content" must be the COMPLETE new file,
     not a fragment or a diff.
   - Do not repeat a call that already gave you what you needed.
+  - To start a server or any process that keeps running, use "start_server",
+    never "run_command" - run_command waits for the process to exit.
   - After editing, finish with "done" - do not keep looking around.
 `.trim();
 
@@ -228,7 +282,8 @@ export async function executeTurn(
   task: Task, plan: Plan, step: PlanStep,
   facts: Fact[], chunks: CodeChunk[], pinned: CodeChunk[],
   recentOutcomes: string[], stepTranscript: string[],
-  projectFiles: string[], parentId: number, previousAttempt?: string,
+  projectFiles: string[], parentId: number,
+  previousAttempt?: string, directive?: string,
 ): Promise<{ turn: ExecutorTurn; eventId: number }> {
   const { value, eventId } = await callModel(ctx, {
     taskId: task.id,
@@ -245,6 +300,7 @@ export async function executeTurn(
       plan, step, facts, chunks, pinned,
       recentOutcomes, stepTranscript,
       ...(previousAttempt ? { previousAttempt } : {}),
+      ...(directive ? { directive } : {}),
       outputContract: `${renderToolCatalog()}\n\n${EXECUTE_CONTRACT}`,
     }),
   });
@@ -297,6 +353,7 @@ export async function diagnoseFailure(
     // cheaper than a repair loop that cannot converge.
     maxTokens: 1200,
     suppressReasoning: true,
+    timeoutMs: 40_000,
     context: buildContext({
       role: 'diagnose', prompt: task.prompt,
       projectRules: ctx.projectRules,

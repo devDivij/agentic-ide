@@ -19,6 +19,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import type { ChildProcess } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -44,6 +45,27 @@ import {
 const MAX_TURNS_PER_STEP = 12;
 
 /**
+ * Read-only turns allowed before the loop insists on a change.
+ *
+ * Small models orient endlessly: one observed run reasoned correctly ("I need
+ * to create calculator.js, then start a server") and then opened every single
+ * turn with "let me first check the current files", never acting. Retrieval
+ * has already put the file list and the relevant code in the window, so four
+ * turns of looking is generous.
+ */
+const EXPLORE_BUDGET = 4;
+
+/** The instruction the loop issues once looking around has stopped paying. */
+function mustActNow(turns: number): string {
+  return `You have spent ${turns} turns looking without changing anything, and ` +
+    `you already have the project's file list and the relevant code above. ` +
+    `Your next action MUST be write_file (or start_server if the task asks you ` +
+    `to run something, or "done" if the work is already complete, or "blocked" ` +
+    `if you genuinely cannot proceed). Do NOT call read_file, list_files or ` +
+    `search_code again.`;
+}
+
+/**
  * Everything a task run needs, wired once in createAgent(). There is no
  * dependency-injection framework and no interfaces-with-one-implementation:
  * to swap the retriever, edit retrieval.ts.
@@ -60,6 +82,11 @@ export interface Agent {
   approval: ApprovalFn;
   testCommand?: string;
   onProgress?: (message: string) => void;
+  /**
+   * Processes the agent started and left running (dev servers). Held so the
+   * owner of the session can stop them; `stopBackground` does that.
+   */
+  background: ChildProcess[];
 }
 
 export interface AgentOptions {
@@ -86,9 +113,20 @@ export async function createAgent(opts: AgentOptions): Promise<Agent> {
     checkpoints: new Checkpoints(opts.projectRoot),
     projectRules: await readProjectRules(opts.projectRoot),
     approval: opts.approval,
+    background: [],
     ...(opts.testCommand ? { testCommand: opts.testCommand } : {}),
     ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
   };
+}
+
+/**
+ * Stop anything the agent left running. Called when a session closes, so a
+ * task that started a dev server does not leak it for the rest of the day.
+ */
+export function stopBackground(agent: Agent): void {
+  for (const child of agent.background.splice(0)) {
+    try { child.kill('SIGTERM'); } catch { /* already gone */ }
+  }
 }
 
 /** AGENTS.md if present (conventional filenames, in preference order). */
@@ -332,12 +370,19 @@ async function runSteps(
  * this table decides what to do about it. Keeping the mapping in code is what
  * makes an unreliable model safe to use for a judgement-shaped job.
  */
-const TAXONOMY: Record<FailureClass, 'retry' | 'revert' | 'abort'> = {
+export const TAXONOMY: Record<FailureClass, 'retry' | 'revert' | 'abort'> = {
   malformed_output: 'retry',   // repair already happened inside callModel
   transient_api:    'retry',   // provider swapped underneath; step untouched
   patch_conflict:   'retry',   // re-read the files and try again
   missing_context:  'retry',   // wider retrieval on the next attempt
-  test_failure:     'revert',  // roll back, purge facts, try from clean state
+  // Fail FORWARD, not back. A red check means something identifiable is
+  // wrong with work that mostly exists — reverting deletes the correct files
+  // along with the broken one and makes the next attempt redo all of it
+  // blind, unable to even see the code that failed. Keeping the tree lets the
+  // retry read the failure, read the file, and fix the line.
+  test_failure:     'retry',
+  // Reverting is for a tree we no longer trust: the model was flailing, so
+  // what it left behind is not a foundation to build on.
   wrong_approach:   'revert',
   budget_exhausted: 'abort',
 };
@@ -357,8 +402,8 @@ const ADVICE: Record<FailureClass, string> = {
     'The code needed for this step was never retrieved. Pin the relevant file with ' +
     'an @path tag and try again.',
   test_failure:
-    'The change was made but a check went red. The verification output above says ' +
-    'what broke.',
+    'The change was made but a check went red. The work was kept so it can be ' +
+    'repaired rather than redone — the verification output above says what broke.',
   wrong_approach:
     'The model repeated itself without making progress, so the step was rolled back. ' +
     'Re-phrasing this part of the request more concretely is the usual fix.',
@@ -621,11 +666,14 @@ async function executeStepTurns(
   const transcript: string[] = [];
   const filesTouched = new Set<string>();
   const fingerprints = new Map<string, number>();
+  /** Consecutive turns spent looking around without changing anything. */
+  let exploring = 0;
 
   for (let turn = 0; turn < MAX_TURNS_PER_STEP; turn++) {
     const { turn: action, eventId } = await executeTurn(
       agent, task, plan, step, facts, chunks, pinned,
-      recentOutcomes, transcript, projectFiles, parentId, retryHint);
+      recentOutcomes, transcript, projectFiles, parentId, retryHint,
+      exploring >= EXPLORE_BUDGET ? mustActNow(exploring) : undefined);
 
     if (action.thought) report(agent, `  ${action.thought}`);
 
@@ -645,13 +693,27 @@ async function executeStepTurns(
     if (!toolCall) {
       transcript.push(
         `You replied with "${action.action}", which is not a tool. Use one of: ` +
-        `read_file, list_files, search_code, write_file, run_command, done, blocked.`);
+        `read_file, list_files, search_code, write_file, run_command, ` +
+        `start_server, done, blocked.`);
       continue;
     }
 
     const fingerprint = JSON.stringify(toolCall);
     const seen = (fingerprints.get(fingerprint) ?? 0) + 1;
     fingerprints.set(fingerprint, seen);
+
+    // A repeat that quietly returns the same answer teaches the model nothing
+    // — it was the identical, cheerful `index.html style.css` every time that
+    // let one run circle until the step died. Refuse instead, in band, where
+    // the model is actually looking.
+    if (seen === 2) {
+      transcript.push(
+        `${toolCall.name}(${summariseArgs(toolCall.args)}) -> REFUSED: you already ` +
+        `ran this exact call and its result is above. Repeating it changes nothing. ` +
+        `Make the actual change now with write_file, or reply "done"/"blocked".`);
+      exploring++;
+      continue;
+    }
     if (seen >= 3) {
       return {
         outcome: 'blocked',
@@ -669,6 +731,7 @@ async function executeStepTurns(
       projectRoot: agent.projectRoot,
       approval: agent.approval,
       onFilesChanged: () => agent.retriever.invalidate(),
+      onProcessStarted: (child) => agent.background.push(child),
     }, toolCall);
 
     db.appendEvent({
@@ -676,6 +739,11 @@ async function executeStepTurns(
       stepId: step.id, payload: { call: toolCall, result },
       status: result.ok ? 'ok' : 'error',
     });
+
+    // Looking around is only progress until it stops being progress.
+    const changedSomething =
+      toolCall.name === 'write_file' || toolCall.name === 'start_server';
+    exploring = changedSomething ? 0 : exploring + 1;
 
     for (const f of result.filesTouched ?? []) filesTouched.add(f);
     transcript.push(
@@ -845,6 +913,7 @@ export function toToolCall(action: {
       return { name: action.action,
                args: { path: action.path ?? '', content: action.content ?? '' } };
     case 'run_command':
+    case 'start_server':
       return { name: action.action, args: { command: action.command ?? '' } };
     default:
       return null;

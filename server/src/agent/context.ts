@@ -54,6 +54,17 @@ export interface ContextRequest {
    * blind retry.
    */
   previousAttempt?: string;
+  /**
+   * A hard instruction from the loop for THIS turn — e.g. "stop looking and
+   * make the edit".
+   *
+   * Control flow lives in code, so when the loop can see the model circling,
+   * it says so rather than hoping the model notices. Observed live: a model
+   * that correctly reasoned "I need to create calculator.js, then start a
+   * server" but prefixed every single turn with "let me first check the
+   * current files", and so never acted.
+   */
+  directive?: string;
   /** Exact JSON shape this call must return. Rendered LAST — small models
    *  follow the most recent instruction most reliably. */
   outputContract?: string;
@@ -157,6 +168,9 @@ export function buildContext(req: ContextRequest): BuiltContext {
       `\n\nDo not repeat any of the above. If the required change is now in place, ` +
       `reply with action "done" and list the files you changed.`,
       'pinned');
+  }
+  if (req.directive) {
+    add('directive', 'loop', `IMPORTANT: ${req.directive}`, 'pinned');
   }
   if (req.outputContract) {
     add('contract', 'output-format', req.outputContract, 'pinned');

@@ -33,6 +33,15 @@ const SYNTAX_CHECKS: Record<string, (abs: string) => [string, string[]]> = {
     `JSON.parse(require('fs').readFileSync(${JSON.stringify(abs)},'utf8'))`]],
 };
 
+/**
+ * Syntax-check one file. Exported because the write tool calls it the instant
+ * it writes, so a parse error comes back as that write's result rather than
+ * surfacing a whole step later.
+ */
+export function checkFileSyntax(projectRoot: string, relPath: string): Promise<string | null> {
+  return checkSyntax(projectRoot, relPath);
+}
+
 export async function verifyChanges(
   projectRoot: string, changedFiles: string[], testCommand?: string,
 ): Promise<Verdict> {

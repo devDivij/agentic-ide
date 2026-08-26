@@ -6,13 +6,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { mkdtemp, mkdir, symlink, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { coerceTurn, extractJson } from '../src/agent/parse.ts';
-import { normalisePlan } from '../src/agent/workers.ts';
+import { normalisePlan, singleStepPlan } from '../src/agent/workers.ts';
 import {
-  classifyInCode, orderSteps, parsePinTags, toToolCall,
+  classifyInCode, orderSteps, parsePinTags, TAXONOMY, toToolCall,
 } from '../src/agent/orchestrator.ts';
 import {
   BUDGETS, RateBucket, Router, isPayingWorthIt, scoreTask, SECONDS_PER_USD,
@@ -20,7 +21,7 @@ import {
 import { buildContext } from '../src/agent/context.ts';
 import { buildPatch, parseDiff } from '../src/web/review.ts';
 import { confinePath, PathEscapeError } from '../src/agent/paths.ts';
-import { scrubEnvironment } from '../src/agent/tools.ts';
+import { findUrl, runTool, scrubEnvironment } from '../src/agent/tools.ts';
 import { Store } from '../src/agent/store.ts';
 import type { PlanStep, Task } from '../src/agent/types.ts';
 
@@ -481,4 +482,72 @@ test('buildContext: the previous attempt is pinned and survives eviction', () =>
   const user = built.messages[1]!.content;
   assert.ok(built.compacted, 'should have had to drop something');
   assert.ok(user.includes('Attempt 1 FAILED'), 'retry feedback must never be evicted');
+});
+
+// ---------------------------------------------------------------------------
+// Planning must never be able to kill a task, and servers must be startable
+// ---------------------------------------------------------------------------
+
+test('singleStepPlan: a failed plan degrades to one step carrying the request', () => {
+  const task = {
+    id: 't', projectRoot: '/tmp', prompt: 'make a calculator web app',
+    status: 'running' as const, complexity: 'medium' as const,
+    createdAt: 0, budget: BUDGETS.medium,
+  };
+  const plan = singleStepPlan(task);
+  assert.equal(plan.steps.length, 1);
+  assert.equal(plan.steps[0]!.intent, 'make a calculator web app');
+  assert.equal(plan.steps[0]!.difficulty, 'hairy');   // one step = the whole task
+  assert.ok(plan.steps[0]!.acceptanceCriteria.length > 0);
+});
+
+test('findUrl: recovers the address a server announced', () => {
+  assert.equal(findUrl('Server running at http://localhost:3000/'),
+    'http://localhost:3000/');
+  assert.equal(findUrl('Listening on 8080'), 'http://localhost:8080');
+  assert.equal(findUrl('* Running on http://127.0.0.1:5000 (Press CTRL+C)'),
+    'http://127.0.0.1:5000');
+  assert.equal(findUrl('nothing useful here'), null);
+});
+
+test('toToolCall: start_server is a real tool, distinct from run_command', () => {
+  assert.deepEqual(toToolCall({ action: 'start_server', command: 'node server.js' }),
+    { name: 'start_server', args: { command: 'node server.js' } });
+});
+
+// ---------------------------------------------------------------------------
+// Write-time verification: the agent's feedback loop closes at the write,
+// not at the end of the step.
+// ---------------------------------------------------------------------------
+
+test('write_file reports a syntax error as its own result, and keeps the file', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'az-write-'));
+  const ctx = { projectRoot: root, approval: async () => true };
+
+  // A real error a model made: `delete` is a reserved word.
+  const bad = await runTool(ctx, {
+    name: 'write_file',
+    args: { path: 'calc.js', content: 'function delete() { return 1; }\n' },
+  });
+  assert.equal(bad.ok, false, 'a file that does not parse is not a successful write');
+  assert.match(bad.output, /does NOT parse/);
+  assert.match(bad.output, /delete/);
+  assert.deepEqual(bad.filesTouched, ['calc.js']);
+  // The file must stay on disk: the model has to read it back to repair it.
+  assert.equal(existsSync(join(root, 'calc.js')), true);
+
+  const good = await runTool(ctx, {
+    name: 'write_file',
+    args: { path: 'calc.js', content: 'function remove() { return 1; }\n' },
+  });
+  assert.equal(good.ok, true);
+  assert.match(good.output, /it parses/);
+});
+
+test('a fixable failure keeps the work instead of reverting it', () => {
+  // Reverting a red check deletes the correct files along with the broken one
+  // and leaves the retry unable to see what failed.
+  assert.equal(TAXONOMY.test_failure, 'retry');
+  // A flailing model's tree is not a foundation to build on.
+  assert.equal(TAXONOMY.wrong_approach, 'revert');
 });

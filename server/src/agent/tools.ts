@@ -10,7 +10,7 @@
  *      point, not left for each tool to remember.
  */
 
-import { execFile } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { dirname, relative } from 'node:path';
 import { promisify } from 'node:util';
@@ -18,6 +18,7 @@ import { promisify } from 'node:util';
 import type { ApprovalFn, ToolCall, ToolResult } from './types.ts';
 import { confinePath } from './paths.ts';
 import { IGNORED_DIRS, findMatches, scanProject, toRegions } from './retrieval.ts';
+import { checkFileSyntax } from './verify.ts';
 
 const exec = promisify(execFile);
 const MAX_OUTPUT_CHARS = 20_000;
@@ -59,8 +60,17 @@ export const TOOLS: ToolSpec[] = [
   {
     name: 'run_command',
     args: 'command',
-    description: 'Run a shell command in the project root, e.g. the test suite. ' +
-                 'Use this to verify your own work.',
+    description: 'Run a shell command in the project root and wait for it to finish, ' +
+                 'e.g. the test suite. Use this to verify your own work. ' +
+                 'Do NOT use it to start a server — it waits for the command to exit.',
+    sideEffecting: true,
+  },
+  {
+    name: 'start_server',
+    args: 'command',
+    description: 'Start a long-running process (a dev server, a watcher) in the ' +
+                 'background and return the URL it printed, without waiting for it ' +
+                 'to exit. Use this whenever the task asks you to run or serve something.',
     sideEffecting: true,
   },
 ];
@@ -80,6 +90,12 @@ export interface ToolContext {
   approval: ApprovalFn;
   /** Called after any write so the retrieval cache can invalidate. */
   onFilesChanged?: (paths: string[]) => void;
+  /**
+   * Called with any process the agent leaves running, so whoever owns the
+   * session can stop it. An agent that starts servers and never stops them
+   * leaks a process per task.
+   */
+  onProcessStarted?: (child: ChildProcess) => void;
 }
 
 export async function runTool(ctx: ToolContext, call: ToolCall): Promise<ToolResult> {
@@ -113,6 +129,7 @@ export async function runTool(ctx: ToolContext, call: ToolCall): Promise<ToolRes
       case 'write_file':  return await doWriteFile(ctx,
         String(call.args.path ?? ''), String(call.args.content ?? ''));
       case 'run_command': return await doRunCommand(ctx, String(call.args.command ?? ''));
+      case 'start_server': return await doStartServer(ctx, String(call.args.command ?? ''));
       default:            return { ok: false, output: `Unhandled tool: ${call.name}` };
     }
   } catch (err) {
@@ -128,6 +145,8 @@ export function describeEffect(call: ToolCall): string {
              `(${String(call.args.content ?? '').split('\n').length} lines)`;
     case 'run_command':
       return `Run: ${String(call.args.command ?? '')}`;
+    case 'start_server':
+      return `Start a background process: ${String(call.args.command ?? '')}`;
     default:
       return `Run ${call.name}`;
   }
@@ -182,17 +201,37 @@ async function doSearchCode(ctx: ToolContext, query: string): Promise<ToolResult
   return { ok: true, output: truncate(out.join('\n')) };
 }
 
+/**
+ * Write a file, then immediately check that it parses.
+ *
+ * Checking here rather than only at the end of the step is what closes the
+ * agent's feedback loop. Observed live: a model wrote `function delete() {…}`
+ * — a reserved word — and because syntax was only checked after the step
+ * finished, the whole step was reverted and retried from scratch while the
+ * model was never told what was wrong. Returned as the write's own result,
+ * the same error is a one-line fix on the very next turn.
+ *
+ * The file stays on disk either way: the model needs to read and repair it,
+ * and a broken file it can see beats a rolled-back one it cannot.
+ */
 async function doWriteFile(ctx: ToolContext, path: string, content: string): Promise<ToolResult> {
   const abs = await confinePath(ctx.projectRoot, path);
   await mkdir(dirname(abs), { recursive: true });
   await writeFile(abs, content, 'utf8');
   const rel = relative(ctx.projectRoot, abs);
   ctx.onFilesChanged?.([rel]);
-  return {
-    ok: true,
-    output: `Wrote ${rel} (${content.split('\n').length} lines).`,
-    filesTouched: [rel],
-  };
+
+  const lines = content.split('\n').length;
+  const problem = await checkFileSyntax(ctx.projectRoot, rel);
+  if (problem) {
+    return {
+      ok: false,
+      output: `Wrote ${rel} (${lines} lines), but it does NOT parse:\n${problem}\n\n` +
+              `Fix it now with another write_file containing the corrected file.`,
+      filesTouched: [rel],
+    };
+  }
+  return { ok: true, output: `Wrote ${rel} (${lines} lines); it parses.`, filesTouched: [rel] };
 }
 
 /**
@@ -218,6 +257,69 @@ async function doRunCommand(ctx: ToolContext, command: string): Promise<ToolResu
     // suite is exactly the feedback the agent needs.
     return { ok: false, output: truncate(`${e.stdout ?? ''}${e.stderr ?? ''}` || e.message) };
   }
+}
+
+/**
+ * Start a long-running process and come back with the URL it printed.
+ *
+ * `run_command` waits for exit, so asking it to start a server means waiting
+ * for the timeout and then reporting failure — which is exactly what happened
+ * every time a task said "run the server and give me the port". A server is a
+ * different shape of job: you want it still running, and you want its address.
+ *
+ * So: spawn detached, watch its output for a few seconds, return whatever URL
+ * it announced, and leave it alive. The handle is kept so the session can stop
+ * it later rather than leaking a process for the rest of the day.
+ */
+async function doStartServer(ctx: ToolContext, command: string): Promise<ToolResult> {
+  if (!command.trim()) return { ok: false, output: 'Empty command' };
+
+  const child = spawn('bash', ['-lc', command], {
+    cwd: ctx.projectRoot,
+    env: scrubEnvironment(),
+    detached: false,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let output = '';
+  const collect = (buf: Buffer): void => { output += buf.toString(); };
+  child.stdout?.on('data', collect);
+  child.stderr?.on('data', collect);
+
+  // Give it a moment to bind a port or die. Long enough for a node/python
+  // server to print its banner, short enough not to stall the step.
+  const exited = await Promise.race([
+    new Promise<number | null>((resolve) => child.once('exit', resolve)),
+    new Promise<'running'>((resolve) => setTimeout(() => resolve('running'), 3_000)),
+  ]);
+
+  if (exited !== 'running') {
+    return {
+      ok: false,
+      output: `The process exited immediately with code ${exited}. It is not running.\n` +
+              `${truncate(output) || '(no output)'}`,
+    };
+  }
+
+  ctx.onProcessStarted?.(child);
+  const url = findUrl(output);
+  return {
+    ok: true,
+    output:
+      `Started and still running (pid ${child.pid}).` +
+      (url ? `\nIt is reachable at ${url}` : '') +
+      `\nOutput so far:\n${truncate(output) || '(none yet)'}` +
+      `\n\nDo not start it again. If this is what the task asked for, you are done — ` +
+      `report the URL above in your summary.`,
+  };
+}
+
+/** The first http(s) URL or bare port a server announced on startup. */
+export function findUrl(output: string): string | null {
+  const direct = output.match(/https?:\/\/[^\s"'<>]+/);
+  if (direct) return direct[0];
+  const port = output.match(/(?:port|listening on|:)\s*(\d{4,5})\b/i);
+  return port?.[1] ? `http://localhost:${port[1]}` : null;
 }
 
 /**
