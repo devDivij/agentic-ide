@@ -112,10 +112,18 @@ export function buildPatch(hunks: ParsedHunk[], selectedIds: Set<string>): strin
 // Building and applying a review
 // ---------------------------------------------------------------------------
 
-/** The base..final checkpoint pair this task ran between, from its events. */
-function checkpointRange(
-  db: Store, taskId: string,
-): { baseSha: string; headSha: string } | null {
+/**
+ * The base..final checkpoint pair this task ran between, from its events.
+ *
+ * When the `final` marker is missing — an interrupted task, or one recorded
+ * before that marker existed — fall back to the shadow repo's current HEAD.
+ * Requiring both markers meant such a task rendered as "no file changes",
+ * which is indistinguishable to a user from a broken review screen and is a
+ * lie whenever the task did in fact write something.
+ */
+async function checkpointRange(
+  db: Store, projectRoot: string, taskId: string,
+): Promise<{ baseSha: string; headSha: string; approximate: boolean } | null> {
   let baseSha: string | null = null;
   let headSha: string | null = null;
   for (const ev of db.getEvents(taskId)) {
@@ -124,7 +132,15 @@ function checkpointRange(
     if (p.label === 'baseline' && p.sha && !baseSha) baseSha = p.sha;
     if (p.label === 'final' && p.sha) headSha = p.sha;
   }
-  return baseSha && headSha ? { baseSha, headSha } : null;
+  if (!baseSha) return null;
+  if (headSha) return { baseSha, headSha, approximate: false };
+
+  try {
+    const { stdout } = await git(projectRoot, ['rev-parse', 'HEAD']);
+    return { baseSha, headSha: stdout.trim(), approximate: true };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -148,7 +164,7 @@ export async function buildReview(
 ): Promise<ReviewBundle & { hunksRaw: ParsedHunk[] }> {
   const db = new Store(projectRoot);
   try {
-    const range = checkpointRange(db, taskId);
+    const range = await checkpointRange(db, projectRoot, taskId);
     if (!range) return { taskId, hunks: [], fullDiff: '', hunksRaw: [] };
 
     const fullDiff = await gitDiff(projectRoot, range.baseSha, range.headSha);
@@ -181,9 +197,9 @@ export async function applySelection(
 ): Promise<{ applied: number; rejected: number; files: string[] }> {
   const review = await buildReview(projectRoot, taskId);
   const db = new Store(projectRoot);
-  let range: ReturnType<typeof checkpointRange>;
+  let range: Awaited<ReturnType<typeof checkpointRange>>;
   try {
-    range = checkpointRange(db, taskId);
+    range = await checkpointRange(db, projectRoot, taskId);
   } finally {
     db.close();
   }

@@ -74,6 +74,13 @@ export interface TaskEndPayload {
   stepsCompleted: number;
   stepsTotal: number;
   abortReason?: string | null;
+  /**
+   * Files the task actually changed. Zero is a real and different outcome
+   * from success — completing every step while changing nothing must not
+   * send the user to an empty Review pane. Absent on tasks recorded before
+   * this was reported.
+   */
+  changedFiles?: number;
   /** Human-readable outcome line, ready to render. */
   summary: string;
   /** What the user can do next, when the task did not simply succeed. */

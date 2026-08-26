@@ -288,7 +288,9 @@ export async function runTask(
         stepsCompleted: done,
         stepsTotal: plan.steps.length,
         abortReason,
-        ...describeOutcome(status, done, plan.steps.length, abortReason, db, task.id),
+        changedFiles: countChangedFiles(diff),
+        ...describeOutcome(status, done, plan.steps.length, abortReason, db, task.id,
+                           diff.trim().length > 0),
       } satisfies TaskEndPayload,
     });
 
@@ -575,8 +577,22 @@ async function runOneStep(
 function describeOutcome(
   status: Task['status'], done: number, total: number,
   abortReason: string | null, db: Store, taskId: string,
+  changedAnything: boolean,
 ): { summary: string; advice?: string } {
   if (status === 'awaiting_review') {
+    // "Completed" and "changed something" are different claims, and conflating
+    // them sent a user to a Review pane to accept a diff that did not exist.
+    // An agent that correctly concludes there is nothing to do has succeeded,
+    // but it must say that rather than imply work was done.
+    if (!changedAnything) {
+      return {
+        summary: `Completed all ${total} step${total === 1 ? '' : 's'} without ` +
+                 `changing any files — the agent judged the requested change to be ` +
+                 `already present.`,
+        advice: 'There is nothing to review. If you expected an edit, say more ' +
+                'specifically what should differ, and pin the file with an @path tag.',
+      };
+    }
     return {
       summary: `Done — all ${total} step${total === 1 ? '' : 's'} completed. ` +
                `Review the diff to accept or reject the changes.`,
@@ -605,6 +621,11 @@ function describeOutcome(
       : 'Nothing was changed. Re-phrasing the request more concretely, or pinning ' +
         'the relevant file with an @path tag, usually helps.',
   };
+}
+
+/** How many files a unified diff touches. Zero means there is nothing to review. */
+export function countChangedFiles(diff: string): number {
+  return (diff.match(/^diff --git /gm) ?? []).length;
 }
 
 function toWireFailure(failure: Failure): FailureInfo {

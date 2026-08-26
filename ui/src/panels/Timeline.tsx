@@ -119,15 +119,18 @@ export function TaskEntry({
           )}
         </div>
 
-        {task.status === 'awaiting_review' && (
+        {/* Only offer the Review pane when there is something in it. A task
+            can complete every step and change nothing — the agent judging
+            that the requested change is already present is a real outcome,
+            and sending someone to review an empty diff reads as a bug. */}
+        {task.status === 'awaiting_review' && end?.changedFiles !== 0 && (
           <button className="primary" onClick={actions.onReview}>
             Review the changes →
           </button>
         )}
 
-        {end && end.status !== 'awaiting_review' && end.status !== 'done' && (
-          <Outcome end={end} task={task} actions={actions} />
-        )}
+        {/* Every finished task states how it ended, not just the bad ones. */}
+        {end && <Outcome end={end} task={task} actions={actions} />}
 
         {/* Left mid-flight by a crash or a restart: the plan and every finished
             step are still on disk, so this picks up where it stopped. */}
@@ -222,11 +225,18 @@ function Outcome({
             Resume
           </button>
         )}
-        {end.stepsCompleted > 0 && (
-          <button onClick={actions.onReview}>Review partial changes</button>
+        {/* Never offer a review of nothing: changedFiles === 0 is a definite
+            "the diff is empty", while undefined means an older task that
+            never reported it, where offering is the safer guess. */}
+        {end.stepsCompleted > 0 && end.changedFiles !== 0 && (
+          <button onClick={actions.onReview}>
+            {end.status === 'awaiting_review' ? 'Review the changes' : 'Review partial changes'}
+          </button>
         )}
         {task.prompt && (
-          <button onClick={() => actions.onRetry(task.prompt)}>Try again</button>
+          <button onClick={() => actions.onRetry(task.prompt)}>
+            {end.changedFiles === 0 ? 'Ask for something more specific' : 'Try again'}
+          </button>
         )}
         <button className="ghost" onClick={() => actions.onAsk(task.prompt)}>
           Ask about this

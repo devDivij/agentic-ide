@@ -64,7 +64,23 @@ export function Review({
   if (!taskId) return <Empty>Run a task to review its changes here.</Empty>;
   if (error) return <div className="panel error">{error}</div>;
   if (!bundle) return <Empty>Loading the diff…</Empty>;
-  if (bundle.hunks.length === 0) return <Empty>This task made no file changes.</Empty>;
+  if (bundle.hunks.length === 0) {
+    // Distinguish "the agent decided nothing needed changing" from "the review
+    // screen is broken" — they look identical otherwise, and one of them is
+    // a legitimate outcome.
+    return (
+      <Empty>
+        <div>
+          <p>This task changed no files, so there is nothing to review.</p>
+          <p className="muted small">
+            That usually means the agent judged the requested change to be already
+            present. If you expected an edit, say more specifically what should
+            differ and pin the file with an <code>@path</code> tag.
+          </p>
+        </div>
+      </Empty>
+    );
+  }
 
   const testHunks = bundle.hunks.filter((h) => h.touchesTests).length;
 

@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import { coerceTurn, extractJson } from '../src/agent/parse.ts';
 import { normalisePlan, singleStepPlan } from '../src/agent/workers.ts';
 import {
-  classifyInCode, orderSteps, parsePinTags, TAXONOMY, toToolCall,
+  classifyInCode, countChangedFiles, orderSteps, parsePinTags, TAXONOMY, toToolCall,
 } from '../src/agent/orchestrator.ts';
 import {
   BUDGETS, RateBucket, Router, isPayingWorthIt, scoreTask, SECONDS_PER_USD,
@@ -550,4 +550,29 @@ test('a fixable failure keeps the work instead of reverting it', () => {
   assert.equal(TAXONOMY.test_failure, 'retry');
   // A flailing model's tree is not a foundation to build on.
   assert.equal(TAXONOMY.wrong_approach, 'revert');
+});
+
+// ---------------------------------------------------------------------------
+// A task that changed nothing must say so, not send the user to an empty
+// Review pane. (Observed: every step "done", status awaiting_review, summary
+// "Review the diff to accept or reject the changes", and an empty diff.)
+// ---------------------------------------------------------------------------
+
+test('countChangedFiles: counts files in a diff, zero for an empty one', () => {
+  assert.equal(countChangedFiles(''), 0);
+  assert.equal(countChangedFiles('   \n'), 0);
+  assert.equal(countChangedFiles([
+    'diff --git a/a.py b/a.py',
+    '--- a/a.py',
+    '+++ b/a.py',
+    '@@ -1 +1 @@',
+    '-x',
+    '+y',
+    'diff --git a/b.js b/b.js',
+    '--- a/b.js',
+    '+++ b/b.js',
+    '@@ -1 +1 @@',
+    '-1',
+    '+2',
+  ].join('\n')), 2);
 });
