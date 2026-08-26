@@ -25,6 +25,9 @@ import { join } from 'node:path';
 import type {
   ApprovalFn, CodeChunk, FailureClass, Plan, PlanStep, StepRecord, Task,
 } from './types.ts';
+import type {
+  FailureInfo, StepEndPayload, TaskEndPayload,
+} from '../shared/types.ts';
 import { Store } from './store.ts';
 import { Router, BUDGETS, type RouteDecision } from './router.ts';
 import { Retriever } from './retrieval.ts';
@@ -237,9 +240,18 @@ export async function runTask(
     db.setStatus(task.id, status);
 
     const totals = db.totals(task.id);
+    // The outcome is stated in words, once, where the UI can render it. A
+    // status of "failed" with no explanation is the worst thing this product
+    // can show a person — the reason was always in the log, unsurfaced.
     db.appendEvent({
       taskId: task.id, parentId: rootId, kind: 'task_end',
-      payload: { status, abortReason, stepsCompleted: done },
+      payload: {
+        status,
+        stepsCompleted: done,
+        stepsTotal: plan.steps.length,
+        abortReason,
+        ...describeOutcome(status, done, plan.steps.length, abortReason, db, task.id),
+      } satisfies TaskEndPayload,
     });
 
     return {
@@ -316,10 +328,9 @@ async function runSteps(
 }
 
 /**
- * How the loop responds to each failure class. The diagnose worker chooses
- * the row; this table chooses the action. Keeping the mapping in code is what
- * makes an unreliable model safe to use for a judgement-shaped job: it
- * labels, we decide.
+ * How the loop responds to each failure class. Something labels the failure;
+ * this table decides what to do about it. Keeping the mapping in code is what
+ * makes an unreliable model safe to use for a judgement-shaped job.
  */
 const TAXONOMY: Record<FailureClass, 'retry' | 'revert' | 'abort'> = {
   malformed_output: 'retry',   // repair already happened inside callModel
@@ -330,6 +341,74 @@ const TAXONOMY: Record<FailureClass, 'retry' | 'revert' | 'abort'> = {
   wrong_approach:   'revert',
   budget_exhausted: 'abort',
 };
+
+/** One sentence a person can act on, per failure class. */
+const ADVICE: Record<FailureClass, string> = {
+  malformed_output:
+    'The model could not produce the required JSON shape. A stronger model for this ' +
+    'role, or a smaller step, usually fixes it.',
+  transient_api:
+    'A provider was unreachable or rate-limited. Configuring a second provider key ' +
+    'in Settings gives the router somewhere else to go.',
+  patch_conflict:
+    'An edit did not apply to the file as it now stands. Re-running usually works ' +
+    'once the file is re-read.',
+  missing_context:
+    'The code needed for this step was never retrieved. Pin the relevant file with ' +
+    'an @path tag and try again.',
+  test_failure:
+    'The change was made but a check went red. The verification output above says ' +
+    'what broke.',
+  wrong_approach:
+    'The model repeated itself without making progress, so the step was rolled back. ' +
+    'Re-phrasing this part of the request more concretely is the usual fix.',
+  budget_exhausted:
+    'A cost, time or step ceiling was reached. Whatever finished is still in the diff.',
+};
+
+/**
+ * What went wrong, and how we know.
+ *
+ * `decidedBy` records whether the label came from evidence we already held or
+ * from a model call, because diagnosis is not free: in a measured run, six
+ * diagnose calls cost 148 of 275 seconds of model time and every one of them
+ * failed validation, so the loop silently fell back to a default label. The
+ * fix is below in `classifyFailure`.
+ */
+interface Failure {
+  failureClass: FailureClass;
+  problem: string;
+  decidedBy: 'code' | 'model';
+}
+
+/** Evidence the loop already holds by the time a step attempt has failed. */
+interface FailureEvidence {
+  /** The stuck-detector fired: an identical tool call three times over. */
+  looping?: boolean;
+  /** The step ran out of turns. */
+  turnLimit?: boolean;
+  /** A model call failed in a way callModel already classified. */
+  callKind?: 'malformed_output' | 'transient_api';
+  /** Mechanical verification returned problems. */
+  verifyFailed?: boolean;
+}
+
+/**
+ * Classify a failure from evidence, without a model call where the evidence
+ * is unambiguous — which is most of the time.
+ *
+ * This is the cheap half of "diagnose properly instead of blindly retrying":
+ * a loop detected in code IS `wrong_approach` by definition, and a 429 that
+ * `callModel` already labelled does not need a second opinion. Returns null
+ * only when the executor gave up for a reason it wrote itself, which is the
+ * one genuinely ambiguous case.
+ */
+export function classifyInCode(evidence: FailureEvidence): FailureClass | null {
+  if (evidence.looping || evidence.turnLimit) return 'wrong_approach';
+  if (evidence.callKind) return evidence.callKind;
+  if (evidence.verifyFailed) return 'test_failure';
+  return null;
+}
 
 /** Execute one step, with retries governed by the failure taxonomy. */
 async function runOneStep(
@@ -343,15 +422,25 @@ async function runOneStep(
   });
   report(agent, `Step ${step.id}: ${step.intent}`);
 
+  // Carried into the next attempt's context so a retry is informed rather
+  // than identical. Without this the executor that looped on `list_files`
+  // simply looped again, doubling the wall-clock for the same failure.
+  let lastFailure: Failure | null = null;
+
   for (let attempt = 1; attempt <= task.budget.maxRetriesPerStep; attempt++) {
     markStep(db, task.id, step, 'running', null, attempt);
 
     // Snapshot before the attempt: the revert target if it goes wrong.
     const before = await agent.checkpoints.commit('pre-attempt snapshot');
     let problem: string | null = null;
+    const evidence: FailureEvidence = {};
 
     try {
-      const result = await executeStepTurns(agent, task, plan, step, pinned, stepEventId);
+      const result = await executeStepTurns(
+        agent, task, plan, step, pinned, stepEventId,
+        attempt > 1 && lastFailure ? retryHint(attempt, lastFailure) : undefined);
+      evidence.looping = result.blockedKind === 'looping';
+      evidence.turnLimit = result.blockedKind === 'turn_limit';
 
       // "Blocked" is the model's claim, not ground truth. Small models often
       // complete the change and then flounder on self-verification (observed
@@ -379,24 +468,30 @@ async function runOneStep(
           markStep(db, task.id, step, 'done', sha, attempt);
           db.appendEvent({
             taskId: task.id, parentId: stepEventId, kind: 'step_end',
-            stepId: step.id, payload: { outcome: 'done', sha },
+            stepId: step.id,
+            payload: { outcome: 'done', sha, attempts: attempt } satisfies StepEndPayload,
           });
           return true;
         }
+        evidence.verifyFailed = true;
         problem = [result.blockedReason, ...verdict.problems].filter(Boolean).join('\n');
       }
     } catch (err) {
+      if (err instanceof CallFailedError) evidence.callKind = err.kind;
       problem = err instanceof CallFailedError
         ? `${err.kind}: ${err.message}`
         : (err as Error).message;
     }
 
-    // --- failed: ask diagnose for a label, respond per the taxonomy ---------
-    const failureClass = await classifyFailure(
-      agent, task, step, problem ?? 'unknown failure', stepEventId);
-    report(agent, `Step ${step.id} failed (${failureClass}), attempt ${attempt}`);
+    // --- failed: label it, then respond per the taxonomy --------------------
+    const failure = await classifyFailure(
+      agent, task, step, problem ?? 'unknown failure', evidence, stepEventId);
+    lastFailure = failure;
+    report(agent,
+      `Step ${step.id} failed (${failure.failureClass}, attempt ${attempt}): ` +
+      firstLine(failure.problem));
 
-    const response = TAXONOMY[failureClass];
+    const response = TAXONOMY[failure.failureClass];
     if (response === 'revert') {
       // Roll the tree back AND purge what was learned while it was broken.
       // Doing only the first is how agents poison their own later steps.
@@ -413,9 +508,81 @@ async function runOneStep(
   markStep(db, task.id, step, 'failed', null, task.budget.maxRetriesPerStep);
   db.appendEvent({
     taskId: task.id, parentId: stepEventId, kind: 'step_end',
-    stepId: step.id, payload: { outcome: 'failed' }, status: 'error',
+    stepId: step.id,
+    // The reason travels with the event, so the chat can explain the failure
+    // instead of showing a bare ✕ next to a step and leaving the user to guess.
+    payload: {
+      outcome: 'failed',
+      attempts: task.budget.maxRetriesPerStep,
+      ...(lastFailure ? { failure: toWireFailure(lastFailure) } : {}),
+    } satisfies StepEndPayload,
+    status: 'error',
   });
   return false;
+}
+
+/**
+ * State the outcome in words, plus what the user can do next.
+ *
+ * Deliberately built from state we already have rather than from a model
+ * call: an explanation of a failure must not itself be able to fail.
+ */
+function describeOutcome(
+  status: Task['status'], done: number, total: number,
+  abortReason: string | null, db: Store, taskId: string,
+): { summary: string; advice?: string } {
+  if (status === 'awaiting_review') {
+    return {
+      summary: `Done — all ${total} step${total === 1 ? '' : 's'} completed. ` +
+               `Review the diff to accept or reject the changes.`,
+    };
+  }
+
+  if (status === 'aborted') {
+    return {
+      summary: `Stopped early after ${done} of ${total} steps: ${abortReason}.`,
+      advice: 'Whatever finished is still in the diff — review it, then resume or ' +
+              're-run with a narrower request.',
+    };
+  }
+
+  // Failed: name the step that actually broke, and why.
+  const failed = db.getSteps(taskId).find((s) => s.status === 'failed');
+  const skipped = db.getSteps(taskId).filter((s) => s.status === 'skipped').length;
+  const where = failed ? ` at step ${failed.stepId} (${failed.spec.intent})` : '';
+  return {
+    summary: `Failed${where} after ${done} of ${total} steps completed` +
+             (skipped > 0 ? `; ${skipped} later step${skipped === 1 ? '' : 's'} skipped ` +
+                            `because they depended on it` : '') + '.',
+    advice: done > 0
+      ? 'The completed steps are still in the diff — review them, then resume or ' +
+        're-phrase the failing part.'
+      : 'Nothing was changed. Re-phrasing the request more concretely, or pinning ' +
+        'the relevant file with an @path tag, usually helps.',
+  };
+}
+
+function toWireFailure(failure: Failure): FailureInfo {
+  return {
+    failureClass: failure.failureClass,
+    problem: failure.problem,
+    response: TAXONOMY[failure.failureClass],
+    decidedBy: failure.decidedBy,
+    advice: ADVICE[failure.failureClass],
+  };
+}
+
+/** What the next attempt is told about the last one, so it does not repeat it. */
+function retryHint(attempt: number, failure: Failure): string {
+  return `Attempt ${attempt - 1} of this step FAILED (${failure.failureClass}):\n` +
+    `${failure.problem}\n\n` +
+    `Do not repeat that approach. If you were looking around, you have looked ` +
+    `enough — make the actual edit with write_file now.`;
+}
+
+function firstLine(text: string): string {
+  const line = text.split('\n').find((l) => l.trim()) ?? text;
+  return line.length > 160 ? `${line.slice(0, 160)}…` : line;
 }
 
 /**
@@ -427,13 +594,20 @@ async function runOneStep(
  */
 async function executeStepTurns(
   agent: Agent, task: Task, plan: Plan, step: PlanStep,
-  pinned: CodeChunk[], parentId: number,
+  pinned: CodeChunk[], parentId: number, retryHint?: string,
 ): Promise<{
   outcome: 'completed' | 'blocked';
   summary: string;
   filesTouched: string[];
   newFacts: string[];
   blockedReason?: string;
+  /**
+   * How the step ended, when it ended badly. `looping` and `turn_limit` are
+   * decided in code, so they classify the failure without a model call;
+   * `model_blocked` is the executor's own claim and is the only case that may
+   * need one.
+   */
+  blockedKind?: 'looping' | 'turn_limit' | 'model_blocked';
 }> {
   const db = agent.db;
   const facts = db.getLiveFacts(task.id);
@@ -451,7 +625,7 @@ async function executeStepTurns(
   for (let turn = 0; turn < MAX_TURNS_PER_STEP; turn++) {
     const { turn: action, eventId } = await executeTurn(
       agent, task, plan, step, facts, chunks, pinned,
-      recentOutcomes, transcript, projectFiles, parentId);
+      recentOutcomes, transcript, projectFiles, parentId, retryHint);
 
     if (action.thought) report(agent, `  ${action.thought}`);
 
@@ -463,6 +637,7 @@ async function executeStepTurns(
         filesTouched: [...new Set([...(action.filesTouched ?? []), ...filesTouched])],
         newFacts: action.newFacts ?? [],
         ...(action.blockedReason ? { blockedReason: action.blockedReason } : {}),
+        ...(action.action === 'blocked' ? { blockedKind: 'model_blocked' as const } : {}),
       };
     }
 
@@ -483,7 +658,10 @@ async function executeStepTurns(
         summary: 'Repeated the same tool call without making progress.',
         filesTouched: [...filesTouched],
         newFacts: [],
-        blockedReason: `Called ${toolCall.name} with identical arguments ${seen} times.`,
+        blockedReason:
+          `Called ${toolCall.name}(${summariseArgs(toolCall.args)}) with identical ` +
+          `arguments ${seen} times without making progress.`,
+        blockedKind: 'looping',
       };
     }
 
@@ -510,7 +688,9 @@ async function executeStepTurns(
     summary: `Did not finish within ${MAX_TURNS_PER_STEP} turns.`,
     filesTouched: [...filesTouched],
     newFacts: [],
-    blockedReason: 'Turn limit reached for this step.',
+    blockedReason:
+      `The step used all ${MAX_TURNS_PER_STEP} of its turns without finishing.`,
+    blockedKind: 'turn_limit',
   };
 }
 
@@ -519,17 +699,36 @@ async function executeStepTurns(
 // ---------------------------------------------------------------------------
 
 /**
- * Ask the diagnose worker for a failure label; fall back to 'transient_api'
- * if diagnosis itself is unavailable (every provider down, say) — treating
- * the failure as transient lets the retry loop do something sensible.
+ * Label a failure — from evidence when we have it, from a model call only
+ * when we do not.
+ *
+ * Measured on a real run before this existed: six diagnose calls cost 148 of
+ * 275 seconds of model time, every one failed schema validation (the model
+ * wrote its reasoning into `content` and never reached the JSON), and the
+ * loop silently fell back to 'transient_api'. So the system spent 54% of its
+ * time buying a label it then threw away, and mislabelled every failure.
+ *
+ * Nearly every failure is already unambiguous by the time we get here: a loop
+ * detected in code IS `wrong_approach`, a 429 that callModel already labelled
+ * needs no second opinion, a red test suite IS `test_failure`. Only the
+ * executor's own "I am blocked because X" is genuinely open to interpretation,
+ * and that is the single case that now spends a call.
  */
 async function classifyFailure(
-  agent: Agent, task: Task, step: PlanStep, problem: string, parentId: number,
-): Promise<FailureClass> {
+  agent: Agent, task: Task, step: PlanStep, problem: string,
+  evidence: FailureEvidence, parentId: number,
+): Promise<Failure> {
+  const known = classifyInCode(evidence);
+  if (known) return { failureClass: known, problem, decidedBy: 'code' };
+
   try {
-    return await diagnoseFailure(agent, task, step, problem, parentId);
+    const failureClass = await diagnoseFailure(agent, task, step, problem, parentId);
+    return { failureClass, problem, decidedBy: 'model' };
   } catch {
-    return 'transient_api';
+    // Diagnosis is a convenience, never a dependency. If it is unavailable,
+    // treat the step as a wrong approach: that reverts and re-plans the step
+    // with feedback, which is the safer default than retrying identically.
+    return { failureClass: 'wrong_approach', problem, decidedBy: 'code' };
   }
 }
 

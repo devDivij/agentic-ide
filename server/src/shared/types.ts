@@ -34,6 +34,53 @@ export interface StepWire {
 }
 
 // ---------------------------------------------------------------------------
+// Failures, as explained to a human
+// ---------------------------------------------------------------------------
+
+/**
+ * Why a step or task ended badly, in terms the chat can show directly.
+ *
+ * This exists because a status of "failed" with no reason is the single worst
+ * thing this product can do to a person: the explanation was always in the
+ * event log, and nothing surfaced it.
+ */
+export interface FailureInfo {
+  /** The taxonomy label that decided the response. */
+  failureClass: string;
+  /** The concrete evidence, verbatim: verify output, blocked reason, error text. */
+  problem: string;
+  /** What the loop did about it. */
+  response: 'retry' | 'revert' | 'abort';
+  /**
+   * Whether the label was decided from evidence we already held, or by
+   * spending a model call. Shown so the cost of diagnosis is never invisible.
+   */
+  decidedBy: 'code' | 'model';
+  /** One sentence a person can act on. */
+  advice: string;
+}
+
+/** Payload of a `step_end` trace node. */
+export interface StepEndPayload {
+  outcome: 'done' | 'failed';
+  sha?: string;
+  attempts?: number;
+  failure?: FailureInfo;
+}
+
+/** Payload of a `task_end` trace node. */
+export interface TaskEndPayload {
+  status: TaskStatusWire;
+  stepsCompleted: number;
+  stepsTotal: number;
+  abortReason?: string | null;
+  /** Human-readable outcome line, ready to render. */
+  summary: string;
+  /** What the user can do next, when the task did not simply succeed. */
+  advice?: string;
+}
+
+// ---------------------------------------------------------------------------
 // The trace stream (observability dashboard)
 // ---------------------------------------------------------------------------
 

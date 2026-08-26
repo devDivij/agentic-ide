@@ -3,7 +3,9 @@
  * Everything it knows arrives through these calls and the event stream.
  */
 
-import type { AsideBubble, ProvidersResponse, ReviewBundle, ServerEvent } from './types.ts';
+import type {
+  AsideBubble, ProvidersResponse, ReviewBundle, ServerEvent, TraceNode,
+} from './types.ts';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -71,6 +73,15 @@ export const api = {
     request<{ ok: boolean }>('/api/approvals', {
       method: 'POST', body: JSON.stringify({ projectRoot, eventId, approved }),
     }),
+
+  /**
+   * A finished task's trace. Used to explain a failure that happened before
+   * this page was loaded — otherwise a refresh loses the only account of what
+   * went wrong.
+   */
+  trace: (projectRoot: string, taskId: string) =>
+    request<{ events: TraceNode[] }>(
+      `/api/tasks/${encodeURIComponent(taskId)}/trace?projectRoot=${encodeURIComponent(projectRoot)}`),
 
   review: (projectRoot: string, taskId: string) =>
     request<ReviewBundle>(

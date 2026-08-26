@@ -35,25 +35,33 @@ export function App(): JSX.Element {
     () => localStorage.getItem('agentzero.projectRoot') ?? '');
   const [draft, setDraft] = useState('');
   const [toast, setToast] = useState<string | null>(null);
-  const [resumable, setResumable] = useState<TaskRow | null>(null);
+  /** Every task this project has run — the chat's conversation history. */
+  const [history, setHistory] = useState<TaskRow[]>([]);
 
   const running = state.task?.status === 'running';
 
-  // Re-open the stored project server-side (the authorised set lives in the
-  // server process and does not survive its restart), and check whether an
-  // interrupted task is waiting to be resumed.
+  const refreshHistory = useCallback((root: string): void => {
+    void api.tasks(root)
+      .then((r) => setHistory(r.tasks))
+      .catch(() => setHistory([]));
+  }, []);
+
+  // Re-open the stored project server-side: the authorised set lives in the
+  // server process and does not survive its restart.
   useEffect(() => {
     if (!projectRoot) { setPicking(true); return; }
     void api.openProject(projectRoot)
-      .then(() => refreshResumable(projectRoot))
+      .then(() => refreshHistory(projectRoot))
       .catch((e: Error) => setToast(e.message));
   }, []);
 
-  const refreshResumable = (root: string): void => {
-    void api.tasks(root)
-      .then((r) => setResumable(r.tasks.find((t) => t.resumable) ?? null))
-      .catch(() => setResumable(null));
-  };
+  // A finished task's totals and resumability live server-side; pull them once
+  // it stops running so the conversation shows its real final state.
+  useEffect(() => {
+    if (projectRoot && state.task && state.task.status !== 'running') {
+      refreshHistory(projectRoot);
+    }
+  }, [state.task?.status, state.task?.id, projectRoot, refreshHistory]);
 
   const openProject = useCallback((path: string): void => {
     // Tell the server first: opening is what authorises the file endpoints.
@@ -63,13 +71,12 @@ export function App(): JSX.Element {
         localStorage.setItem('agentzero.projectRoot', r.path);
         setPicking(false);
         setToast(`Project: ${r.path}`);
-        refreshResumable(r.path);
+        refreshHistory(r.path);
       })
       .catch((e: Error) => setToast(e.message));
-  }, []);
+  }, [refreshHistory]);
 
   const submit = (prompt: string): void => {
-    setResumable(null);
     void api.startTask(projectRoot, prompt).catch((e: Error) => {
       pushLog('error', e.message);
       setToast(e.message);
@@ -77,7 +84,6 @@ export function App(): JSX.Element {
   };
 
   const resume = (taskId: string): void => {
-    setResumable(null);
     void api.resumeTask(projectRoot, taskId).catch((e: Error) => {
       pushLog('error', e.message);
       setToast(e.message);
@@ -148,6 +154,7 @@ export function App(): JSX.Element {
           <div className="workspace">
             <Files
               projectRoot={projectRoot}
+              filesChangedAt={state.filesChangedAt}
               onPin={(ref) => {
                 setDraft((d) => (d ? `${d} ${ref}` : ref));
                 setTab('chat');
@@ -160,18 +167,19 @@ export function App(): JSX.Element {
                   projectRoot={projectRoot}
                   task={state.task}
                   steps={state.steps}
+                  trace={state.trace}
                   logs={state.logs}
                   approvals={state.approvals}
                   asides={state.asides}
-                  resumable={resumable}
+                  history={history}
                   running={running}
                   onSubmit={submit}
                   onBytheway={bytheway}
                   onResume={resume}
                   onApprove={approve}
+                  onReview={() => setTab('review')}
                   draft={draft}
                   setDraft={setDraft}
-                  onReview={() => setTab('review')}
                 />
               )}
               {tab === 'review' && (

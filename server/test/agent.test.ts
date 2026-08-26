@@ -11,7 +11,9 @@ import { join } from 'node:path';
 
 import { coerceTurn, extractJson } from '../src/agent/parse.ts';
 import { normalisePlan } from '../src/agent/workers.ts';
-import { orderSteps, parsePinTags, toToolCall } from '../src/agent/orchestrator.ts';
+import {
+  classifyInCode, orderSteps, parsePinTags, toToolCall,
+} from '../src/agent/orchestrator.ts';
 import {
   BUDGETS, RateBucket, Router, isPayingWorthIt, scoreTask, SECONDS_PER_USD,
 } from '../src/agent/router.ts';
@@ -429,4 +431,54 @@ test('store: events keep parentId, and totals sum tokens and cost', async () => 
   } finally {
     db.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Failure classification without a model call
+//
+// The behaviour these lock down was measured on a real run: six diagnose
+// calls cost 148 of 275 seconds, all failed validation, and the loop silently
+// mislabelled every failure as transient_api.
+// ---------------------------------------------------------------------------
+
+test('classifyInCode: a detected loop is a wrong approach, no model needed', () => {
+  assert.equal(classifyInCode({ looping: true }), 'wrong_approach');
+  assert.equal(classifyInCode({ turnLimit: true }), 'wrong_approach');
+});
+
+test('classifyInCode: a call failure keeps the label callModel already assigned', () => {
+  assert.equal(classifyInCode({ callKind: 'transient_api' }), 'transient_api');
+  assert.equal(classifyInCode({ callKind: 'malformed_output' }), 'malformed_output');
+});
+
+test('classifyInCode: a red gate is a test failure', () => {
+  assert.equal(classifyInCode({ verifyFailed: true }), 'test_failure');
+});
+
+test('classifyInCode: only the executor\'s own claim is ambiguous', () => {
+  // No evidence we hold ourselves → null → and only then is a call spent.
+  assert.equal(classifyInCode({}), null);
+});
+
+test('classifyInCode: code evidence outranks a bare model block', () => {
+  // A step that both looped and failed verification is a loop first: the
+  // loop is why the work never happened.
+  assert.equal(classifyInCode({ looping: true, verifyFailed: true }), 'wrong_approach');
+});
+
+test('buildContext: the previous attempt is pinned and survives eviction', () => {
+  const built = buildContext({
+    role: 'execute',
+    prompt: 'fix the thing',
+    projectRules: null,
+    previousAttempt: 'Attempt 1 FAILED (wrong_approach): called list_files 3 times.',
+    // Enough filler to force eviction of everything droppable.
+    facts: Array.from({ length: 400 }, (_, i) => ({
+      id: i, taskId: 't', text: `fact number ${i} `.repeat(20),
+      stepId: 's1', createdAt: 0, purgedAt: null,
+    })),
+  });
+  const user = built.messages[1]!.content;
+  assert.ok(built.compacted, 'should have had to drop something');
+  assert.ok(user.includes('Attempt 1 FAILED'), 'retry feedback must never be evicted');
 });

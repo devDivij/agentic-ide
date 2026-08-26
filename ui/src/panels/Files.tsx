@@ -16,9 +16,15 @@ import { api } from '../api.ts';
 interface Entry { name: string; directory: boolean }
 
 export function Files({
-  projectRoot, onPin, onOpenProject,
+  projectRoot, filesChangedAt, onPin, onOpenProject,
 }: {
   projectRoot: string;
+  /**
+   * Bumped by the event stream each time the agent writes a file. Without it
+   * the tree showed whatever was on disk when you last navigated, so files
+   * the agent had just created were simply invisible.
+   */
+  filesChangedAt: number;
   onPin: (ref: string) => void;
   onOpenProject: (absolutePath: string) => void;
 }): JSX.Element {
@@ -36,7 +42,18 @@ export function Files({
     api.listFiles(projectRoot, dir)
       .then((r) => { setEntries(r.entries); setError(null); })
       .catch((e: Error) => { setError(e.message); setEntries([]); });
-  }, [projectRoot, dir]);
+  }, [projectRoot, dir, filesChangedAt]);
+
+  // Re-read the open file after a write, replacing only its text: `selected`
+  // is separate state, so the reader's line selection survives. Deliberately
+  // keyed on the change signal alone — including `openFile` here would make
+  // this effect retrigger itself on every fetch.
+  useEffect(() => {
+    if (!projectRoot || !openFile || filesChangedAt === 0) return;
+    api.readFile(projectRoot, openFile.path)
+      .then((fresh) => setOpenFile((cur) => (cur?.path === fresh.path ? fresh : cur)))
+      .catch(() => undefined);
+  }, [filesChangedAt]);
 
   const open = (entry: Entry): void => {
     const next = dir === '.' ? entry.name : `${dir}/${entry.name}`;

@@ -26,6 +26,12 @@ export interface ChatResult {
   text: string;
   /** The model's separate chain-of-thought, when reported. Logged as its "thought process". */
   reasoning?: string;
+  /**
+   * Why the model stopped. 'length' means it was cut off mid-sentence, which
+   * the caller must not mistake for a malformed answer: the remedy is a
+   * bigger budget, not a repair prompt.
+   */
+  finishReason?: string;
   tokensIn: number;
   tokensOut: number;
   costUsd: number;
@@ -132,6 +138,7 @@ export async function chatComplete(
   return {
     text,
     ...(reasoning ? { reasoning } : {}),
+    ...(choice?.finish_reason ? { finishReason: String(choice.finish_reason) } : {}),
     tokensIn,
     tokensOut,
     costUsd: estimateCostUsd(model, tokensIn, tokensOut),

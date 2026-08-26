@@ -147,6 +147,24 @@ export async function callModel<T>(
       const parsed = opts.schema.safeParse(opts.coerce ? opts.coerce(raw) : raw);
       if (parsed.success) return { value: parsed.data, eventId };
 
+      // Cut off mid-answer, not misbehaving. A model that writes its thinking
+      // into `content` and runs out of room leaves prose that fails validation
+      // and looks identical to a malformed reply — but repairing it cannot
+      // converge, because the model will simply run out of room again.
+      // Measured: three such calls, ~25s, all discarded. Buy room instead.
+      if (result.finishReason === 'length' && budgetBumps < 2) {
+        budgetBumps++;
+        maxTokens = Math.max(maxTokens * 2, 4096);
+        db.appendEvent({
+          taskId, parentId: opts.parentId ?? null, kind: 'error',
+          role: opts.role, stepId: opts.stepId ?? null,
+          payload: { failureClass: 'truncated_output', tokensOut: result.tokensOut,
+                     action: `retrying with maxTokens=${maxTokens}` },
+          status: 'error',
+        });
+        continue;
+      }
+
       // Malformed → repair on the same model, with the specific error attached.
       lastError = describeZodError(parsed.error);
       if (repairs >= MAX_REPAIRS) {

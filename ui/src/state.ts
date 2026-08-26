@@ -11,11 +11,14 @@ import type {
   TaskSummary, TraceNode,
 } from './types.ts';
 import { subscribe } from './api.ts';
+import { touchedFiles } from './activity.ts';
 
 export interface LogLine {
   level: 'info' | 'warn' | 'error';
   message: string;
   ts: number;
+  /** Which task produced this line, so the chat can attribute it. */
+  taskId: string | null;
 }
 
 export interface AppState {
@@ -28,10 +31,17 @@ export interface AppState {
   approvals: ApprovalRequest[];
   /** Answered /bytheway questions, in order. */
   asides: AsideBubble[];
+  /**
+   * Bumped whenever the agent writes a file (and once when a task ends, to
+   * catch anything missed). The file tree watches this to refresh itself
+   * instead of showing a stale listing.
+   */
+  filesChangedAt: number;
 }
 
 const EMPTY: AppState = {
-  task: null, steps: [], trace: [], routing: [], logs: [], approvals: [], asides: [],
+  task: null, steps: [], trace: [], routing: [], logs: [], approvals: [],
+  asides: [], filesChangedAt: 0,
 };
 
 type Action =
@@ -44,7 +54,7 @@ function reduce(state: AppState, action: Action): AppState {
     // Client-side failures join the same stream as server ones, so the user
     // never has to open a console to find out why nothing happened.
     return { ...state, logs: pushCapped(state.logs, {
-      level: action.level, message: action.message, ts: Date.now() }) };
+      level: action.level, message: action.message, ts: Date.now(), taskId: null }) };
   }
   if (action.type === 'approval_resolved') {
     return { ...state, approvals: state.approvals.filter((a) => a.eventId !== action.eventId) };
@@ -52,11 +62,17 @@ function reduce(state: AppState, action: Action): AppState {
 
   const event = action.event;
   switch (event.type) {
-    case 'trace':
+    case 'trace': {
       // The stream replays history on connect, so guard against duplicates.
-      return state.trace.some((n) => n.id === event.node.id)
-        ? state
-        : { ...state, trace: [...state.trace, event.node] };
+      if (state.trace.some((n) => n.id === event.node.id)) return state;
+      const wrote = touchedFiles(event.node).length > 0;
+      const ended = event.node.kind === 'task_end';
+      return {
+        ...state,
+        trace: [...state.trace, event.node],
+        ...(wrote || ended ? { filesChangedAt: event.node.ts } : {}),
+      };
+    }
     case 'task':
       return { ...state, task: event.task };
     case 'steps':
@@ -73,7 +89,7 @@ function reduce(state: AppState, action: Action): AppState {
         : { ...state, asides: [...state.asides, event.aside] };
     case 'log':
       return { ...state, logs: pushCapped(state.logs, {
-        level: event.level, message: event.message, ts: Date.now() }) };
+        level: event.level, message: event.message, ts: Date.now(), taskId: event.taskId }) };
     default:
       return state;
   }

@@ -121,7 +121,10 @@ export async function makePlan(
     role: 'plan',
     parentId,
     schema: PlanSchema,
-    maxTokens: 2500,
+    // Generous on purpose: a reasoning model spends most of this thinking,
+    // and a plan truncated mid-JSON costs a whole repair cycle. Measured at
+    // 2500 the planner used the budget exactly — i.e. it was being clipped.
+    maxTokens: 4000,
     difficulty: 'hairy',   // always route planning to the strongest tier
     context: buildContext({
       role: 'plan', prompt: task.prompt,
@@ -225,7 +228,7 @@ export async function executeTurn(
   task: Task, plan: Plan, step: PlanStep,
   facts: Fact[], chunks: CodeChunk[], pinned: CodeChunk[],
   recentOutcomes: string[], stepTranscript: string[],
-  projectFiles: string[], parentId: number,
+  projectFiles: string[], parentId: number, previousAttempt?: string,
 ): Promise<{ turn: ExecutorTurn; eventId: number }> {
   const { value, eventId } = await callModel(ctx, {
     taskId: task.id,
@@ -241,6 +244,7 @@ export async function executeTurn(
       projectRules: ctx.projectRules, projectFiles,
       plan, step, facts, chunks, pinned,
       recentOutcomes, stepTranscript,
+      ...(previousAttempt ? { previousAttempt } : {}),
       outputContract: `${renderToolCatalog()}\n\n${EXECUTE_CONTRACT}`,
     }),
   });
@@ -285,8 +289,14 @@ export async function diagnoseFailure(
     parentId,
     stepId: step.id,
     schema: DiagnosisSchema,
-    maxTokens: 400,
-    suppressReasoning: true,   // picking one label from seven is classification
+    // Picking one label from seven is classification, so we ask for no
+    // reasoning — but budget as if the model ignores us, because some do.
+    // Measured: a model that disregards `/no_think` spent all 400 tokens of
+    // an earlier budget thinking, never reached the JSON, and burned three
+    // calls (~25s) failing validation. Room to think and answer is far
+    // cheaper than a repair loop that cannot converge.
+    maxTokens: 1200,
+    suppressReasoning: true,
     context: buildContext({
       role: 'diagnose', prompt: task.prompt,
       projectRules: ctx.projectRules,

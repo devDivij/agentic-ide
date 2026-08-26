@@ -44,6 +44,16 @@ export interface ContextRequest {
    * Never evicted: dropping it makes the model repeat its own edits.
    */
   stepTranscript?: string[];
+  /**
+   * What went wrong on the previous attempt at this step.
+   *
+   * Retrying with an identical window reproduces the identical failure — a
+   * measured run looped on `list_files`, was correctly detected as stuck, and
+   * then looped the same way on retry for another 90 seconds. Telling the
+   * next attempt what just failed is the difference between a retry and a
+   * blind retry.
+   */
+  previousAttempt?: string;
   /** Exact JSON shape this call must return. Rendered LAST — small models
    *  follow the most recent instruction most reliably. */
   outputContract?: string;
@@ -137,6 +147,9 @@ export function buildContext(req: ContextRequest): BuiltContext {
   }
 
   // --- pinned tail ---------------------------------------------------------
+  if (req.previousAttempt) {
+    add('retry', 'previous-attempt', req.previousAttempt, 'pinned');
+  }
   if ((req.stepTranscript ?? []).length > 0) {
     add('transcript', 'this-step',
       `What you have ALREADY done in this step:\n` +
