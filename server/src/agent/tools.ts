@@ -216,22 +216,49 @@ async function doSearchCode(ctx: ToolContext, query: string): Promise<ToolResult
  */
 async function doWriteFile(ctx: ToolContext, path: string, content: string): Promise<ToolResult> {
   const abs = await confinePath(ctx.projectRoot, path);
+  const rel = relative(ctx.projectRoot, abs);
+
+  // Was there a working file here before? If so it is worth more than
+  // whatever we are about to put in its place, until proven otherwise.
+  const previous = await readFile(abs, 'utf8').catch(() => null);
+  const previousParsed =
+    previous !== null && (await checkFileSyntax(ctx.projectRoot, rel)) === null;
+
   await mkdir(dirname(abs), { recursive: true });
   await writeFile(abs, content, 'utf8');
-  const rel = relative(ctx.projectRoot, abs);
   ctx.onFilesChanged?.([rel]);
 
   const lines = content.split('\n').length;
   const problem = await checkFileSyntax(ctx.projectRoot, rel);
-  if (problem) {
+  if (!problem) {
+    return { ok: true, output: `Wrote ${rel} (${lines} lines); it parses.`, filesTouched: [rel] };
+  }
+
+  // DO NO HARM: a write may not turn a file that parsed into one that does
+  // not. Observed live — the model wrote a correct 17-line file, its next
+  // turn was malformed, and the schema-repair emitted a one-line write that
+  // destroyed it. Every remaining turn was then spent flailing against a file
+  // the agent had corrupted itself, until the step died. Keeping the broken
+  // version only makes sense when there was nothing good to lose.
+  if (previousParsed && previous !== null) {
+    await writeFile(abs, previous, 'utf8');
+    ctx.onFilesChanged?.([rel]);
     return {
       ok: false,
-      output: `Wrote ${rel} (${lines} lines), but it does NOT parse:\n${problem}\n\n` +
-              `Fix it now with another write_file containing the corrected file.`,
-      filesTouched: [rel],
+      output:
+        `REJECTED the write to ${rel}: your ${lines}-line version does not parse\n` +
+        `${problem}\n\n` +
+        `The previous version, which was valid, has been kept. Send the COMPLETE ` +
+        `corrected file — do not send a fragment.`,
     };
   }
-  return { ok: true, output: `Wrote ${rel} (${lines} lines); it parses.`, filesTouched: [rel] };
+
+  return {
+    ok: false,
+    output: `Wrote ${rel} (${lines} lines), but it does NOT parse:\n${problem}\n\n` +
+            `Fix it now with another write_file containing the corrected file.`,
+    filesTouched: [rel],
+  };
 }
 
 /**

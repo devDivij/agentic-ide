@@ -193,6 +193,12 @@ const MAX_WAIT_MS = 90_000;
 
 export class Router {
   private buckets = new Map<string, RateBucket>();
+  /**
+   * Models that answered 404/410 in this session. A retired model is not
+   * rate-limited, it is gone — so it is dropped from ranking entirely rather
+   * than being rediscovered and re-excluded by every subsequent call.
+   */
+  private retired = new Set<string>();
 
   constructor(
     /** Provider ids that actually have a key configured. */
@@ -266,6 +272,16 @@ export class Router {
     this.bucket_(providerId).penalize(retryAfterMs);
   }
 
+  /** Stop routing to a model that no longer exists, for the rest of the session. */
+  retire(providerId: string, modelId: string): void {
+    this.retired.add(`${providerId}/${modelId}`);
+  }
+
+  /** Models retired this session, for the dashboard and for diagnostics. */
+  retiredModels(): string[] {
+    return [...this.retired];
+  }
+
   /** Live headroom per provider, for the dashboard. */
   snapshot(): Record<string, Record<string, number>> {
     return Object.fromEntries([...this.buckets].map(([id, b]) => [id, b.headroom()]));
@@ -285,6 +301,7 @@ export class Router {
     const exclude = new Set(req.exclude ?? []);
     const usable = candidatesForRole(req.role).filter((c) =>
       (c.provider.keyEnv === null || this.configured.has(c.provider.id)) &&
+      !this.retired.has(`${c.provider.id}/${c.model.id}`) &&
       !exclude.has(`${c.provider.id}/${c.model.id}`));
 
     const hasUserProvider = usable.some((c) => c.provider.preference === 'user');

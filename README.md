@@ -6,9 +6,14 @@ One deterministic loop in code drives many narrow, schema-checked model calls;
 every piece of task state lives in SQLite, so nothing is lost when a call, a
 provider, or the whole process dies.
 
-Read **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the design and a
-guided tour of the code (the agentic core is ~15 small files; budget 2–3
-hours to read all of it).
+Two documents, for two questions:
+
+- **[docs/ARCHITECTURE-MAP.md](docs/ARCHITECTURE-MAP.md)** — *what is here*: a
+  diagrammed map of the system as built, including a section on what is
+  deliberately not built yet. Start here.
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — *why it is shaped this
+  way*: the reasoning, the trade-offs, and a guided reading order for the
+  code (the agentic core is 15 small files; budget 2–3 hours for all of it).
 
 ## Setup (Linux, from scratch)
 

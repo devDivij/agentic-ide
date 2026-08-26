@@ -57,7 +57,11 @@ export async function classifyTask(
     role: 'classify',
     parentId,
     schema: ClassifySchema,
-    maxTokens: 200,
+    // Not 200. These models reason before answering even when told not to —
+    // measured, nemotron-3-nano spends ~200 tokens thinking, so a 200-token
+    // budget cut it off mid-thought and it never reached the JSON at all.
+    // One call per task: the headroom is far cheaper than the repair loop.
+    maxTokens: 900,
     // A difficulty label that takes 30s is not slow, it is broken — fail over
     // rather than spend a minute on one word.
     timeoutMs: 30_000,

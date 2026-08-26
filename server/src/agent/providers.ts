@@ -116,16 +116,11 @@ export const PROVIDERS: ProviderSpec[] = [
         roles: ['plan', 'execute', 'classify'],
         reasoning: { byDefault: true, disableDirective: '/no_think', minOutputTokens: 2000 },
       },
-      {
-        // Note the doubled prefix — 'nvidia/nemotron-nano-9b-v2' 404s.
-        id: 'nvidia/nvidia-nemotron-nano-9b-v2',
-        totalParamsB: 9,
-        paramsSource: 'NVIDIA model card: Nemotron-Nano-9B-v2',
-        contextTokens: 128_000,
-        costPerMTokIn: 0, costPerMTokOut: 0,
-        roles: ['classify', 'ask'],
-        reasoning: { byDefault: true, disableDirective: '/no_think', minOutputTokens: 1500 },
-      },
+      // REMOVED 2026-08-26: nvidia/nvidia-nemotron-nano-9b-v2 now returns
+      // HTTP 410 Gone and has disappeared from /models. It was serving
+      // classify and ask, so every task was spending a fallback on a retired
+      // model. Free line-ups rotate without notice — `npm run cli --
+      // providers` probes each model with a real call for exactly this reason.
       {
         // Different vendor on the same endpoint; useful as a diagnose/classify
         // fallback with an uncorrelated error distribution.
@@ -152,22 +147,32 @@ export const PROVIDERS: ProviderSpec[] = [
       requestsPerMinute: 30, tokensPerMinute: 12_000,
       requestsPerDay: 1_000, tokensPerDay: 100_000,
     },
+    // REMOVED 2026-08-26, both 404 on invocation: llama-3.3-70b-versatile and
+    // qwen/qwen3-32b. Groq's line-up rotated; the models below were verified
+    // against a live completion on the same day. Groq is by far the FASTEST
+    // option here (0.5-1.3s vs 1.4-8.8s on NIM), which matters because
+    // wall-clock is 35% of the score — but its 100k tokens/day ceiling means
+    // it runs out fast, and the bucket then falls back to NVIDIA. That
+    // hand-off is exactly what the rate buckets exist for.
     models: [
       {
-        id: 'llama-3.3-70b-versatile',
-        totalParamsB: 70,
-        paramsSource: 'Meta model card: Llama 3.3 70B',
+        id: 'qwen/qwen3.8-27b',
+        totalParamsB: 27,
+        paramsSource: "Groq catalogue id declares 27B ('qwen3.8-27b')",
         contextTokens: 128_000,
         costPerMTokIn: 0, costPerMTokOut: 0,
-        roles: ['plan', 'diagnose', 'ask'],
+        roles: ['plan', 'execute', 'classify', 'diagnose', 'ask'],
       },
       {
-        id: 'qwen/qwen3-32b',
-        totalParamsB: 32,
-        paramsSource: 'Qwen3 model card: 32B dense',
+        id: 'qwen/qwen3.6-27b',
+        totalParamsB: 27,
+        paramsSource: "Groq catalogue id declares 27B ('qwen3.6-27b')",
         contextTokens: 128_000,
         costPerMTokIn: 0, costPerMTokOut: 0,
-        roles: ['classify', 'execute', 'ask'],
+        roles: ['execute', 'ask'],
+        // Emits its thinking inline as <think>…</think>; stripThinkBlocks
+        // removes it, which is why this model is usable at all.
+        reasoning: { byDefault: true },
       },
       {
         id: 'openai/gpt-oss-20b',
@@ -175,7 +180,7 @@ export const PROVIDERS: ProviderSpec[] = [
         paramsSource: 'gpt-oss model card: 21B total / 3.6B active',
         contextTokens: 128_000,
         costPerMTokIn: 0, costPerMTokOut: 0,
-        roles: ['classify', 'ask'],
+        roles: ['classify', 'diagnose', 'ask'],
       },
     ],
   },

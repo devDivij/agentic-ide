@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { mkdtemp, mkdir, symlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -604,4 +605,45 @@ test('collectLinks: recovers the address the agent reported, deduplicated', () =
     collectLinks(['see http://localhost:3000,', 'again http://localhost:3000']),
     ['http://localhost:3000']);
   assert.deepEqual(collectLinks(['no url at all']), []);
+});
+
+// ---------------------------------------------------------------------------
+// Do no harm: a write may not turn a working file into a broken one.
+// Observed live — a good 17-line file was destroyed by a malformed turn's
+// repair, and every later turn was spent flailing against the corruption.
+// ---------------------------------------------------------------------------
+
+test('write_file rejects a regression and keeps the version that worked', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'az-regress-'));
+  const ctx = { projectRoot: root, approval: async () => true };
+  const good = 'def perms(n):\n    return list(range(1, n + 1))\n';
+
+  const first = await runTool(ctx, {
+    name: 'write_file', args: { path: 'p.py', content: good },
+  });
+  assert.equal(first.ok, true);
+
+  // The shape the repair loop actually produced: collapsed, unparseable.
+  const clobber = await runTool(ctx, {
+    name: 'write_file',
+    args: { path: 'p.py', content: 'def perms(n): def perms(n): def perms(n):' },
+  });
+  assert.equal(clobber.ok, false);
+  assert.match(clobber.output, /REJECTED/);
+  assert.equal(await readFile(join(root, 'p.py'), 'utf8'), good,
+    'the working version must survive a bad write');
+  // Nothing was changed, so nothing should be reported as touched.
+  assert.equal(clobber.filesTouched, undefined);
+});
+
+test('write_file still keeps a broken NEW file, since nothing good was lost', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'az-newbad-'));
+  const ctx = { projectRoot: root, approval: async () => true };
+  const bad = await runTool(ctx, {
+    name: 'write_file', args: { path: 'fresh.py', content: 'def (:\n' },
+  });
+  assert.equal(bad.ok, false);
+  assert.match(bad.output, /does NOT parse/);
+  assert.equal(existsSync(join(root, 'fresh.py')), true,
+    'a broken first draft stays so the model can repair it');
 });

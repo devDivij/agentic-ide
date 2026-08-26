@@ -42,6 +42,24 @@ export interface ChatResult {
   provider: string;
 }
 
+/**
+ * The model does not exist any more (404/410).
+ *
+ * Distinct from a transient failure because the remedy is different and
+ * permanent: retire it for the session instead of retrying it. Free line-ups
+ * rotate constantly — NVIDIA's 49B and 70B entries began 404-ing, its 9B
+ * entry later returned 410 Gone, and two Groq models 404-ed the same week.
+ * Without this, every task rediscovers each corpse and spends a fallback on it.
+ */
+export class ModelGoneError extends Error {
+  constructor(readonly providerId: string, readonly modelId: string,
+              readonly statusCode: number) {
+    super(`${providerId}/${modelId} no longer exists (HTTP ${statusCode}). ` +
+          `Run 'npm run cli -- providers' to see what still answers.`);
+    this.name = 'ModelGoneError';
+  }
+}
+
 /** 429/5xx/timeout: the model never answered. Remedy: another provider. */
 export class TransientProviderError extends Error {
   constructor(message: string, readonly providerId: string,
@@ -124,6 +142,9 @@ export async function chatComplete(
       throw new TransientProviderError(
         `${provider.label} returned ${res.status}: ${text.slice(0, 200)}`,
         providerId, parseRetryAfter(res.headers.get('retry-after')), res.status);
+    }
+    if (res.status === 404 || res.status === 410) {
+      throw new ModelGoneError(providerId, modelId, res.status);
     }
     throw new Error(`${provider.label} returned ${res.status}: ${text.slice(0, 400)}`);
   }

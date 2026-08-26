@@ -26,7 +26,9 @@ import type { Role } from './types.ts';
 import type { Store } from './store.ts';
 import type { RouteDecision, Router } from './router.ts';
 import type { BuiltContext } from './context.ts';
-import { chatComplete, TransientProviderError, TruncatedReasoningError } from './llm.ts';
+import {
+  chatComplete, ModelGoneError, TransientProviderError, TruncatedReasoningError,
+} from './llm.ts';
 import { describeZodError, extractJson } from './parse.ts';
 
 /** What callModel needs from the agent context (orchestrator.ts provides it). */
@@ -211,14 +213,23 @@ export async function callModel<T>(
       const transient = err instanceof TransientProviderError;
       if (transient) router.penalize(err.providerId, err.retryAfterMs);
 
+      // A retired model is not a flaky one: take it out of rotation entirely,
+      // so the rest of this run stops paying a fallback to rediscover it.
+      const gone = err instanceof ModelGoneError;
+      if (gone) router.retire(err.providerId, err.modelId);
+
       db.appendEvent({
         taskId, parentId: opts.parentId ?? null, kind: 'error',
         role: opts.role, stepId: opts.stepId ?? null,
         payload: {
-          failureClass: transient ? 'transient_api' : 'provider_error',
+          failureClass: gone ? 'model_gone'
+            : transient ? 'transient_api' : 'provider_error',
           provider: route.providerId,
+          model: route.modelId,
           message: (err as Error).message,
-          action: 'switching provider; task state untouched',
+          action: gone
+            ? 'model retired for this session; routing elsewhere'
+            : 'switching provider; task state untouched',
         },
         status: 'error',
       });

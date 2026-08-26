@@ -30,7 +30,7 @@ async function main(): Promise<void> {
   switch (command) {
     case 'run':       return runCommand(rest);
     case 'resume':    return resumeCommand(rest);
-    case 'providers': return showProviders();
+    case 'providers': return showProviders(rest);
     case 'trace':     return showTrace(rest);
     default:          return usage();
   }
@@ -46,7 +46,8 @@ agentzero — headless agent runtime
     --test "CMD"         Command that runs the test suite, used by verification
 
   resume [<taskId>]    Resume an interrupted task (latest one if no id given)
-  providers            Show which providers are configured and reachable
+  providers            Probe every model with a real call; show what answers
+    --quick              Skip the probe, just ping the endpoints
   trace <taskId>       Print the call hierarchy for a task
 
 Keys come from ~/.agentzero/settings.json (the UI's Settings screen) or the
@@ -173,13 +174,22 @@ const terminalApproval: ApprovalFn = async (call: ToolCall) => {
 
 // ---------------------------------------------------------------------------
 
-/** Free model line-ups rotate without notice; "it worked yesterday" is not evidence. */
-async function showProviders(): Promise<void> {
+/**
+ * Report which models will actually answer, by asking each one.
+ *
+ * A provider's /models list is not evidence: NVIDIA advertised
+ * nemotron-super-49b and llama-3.3-70b that returned 404 on invocation, and
+ * nemotron-nano-9b-v2 later started returning 410 Gone while still being
+ * routed to. Free line-ups rotate without notice, so the only honest check
+ * is a real completion. Pass --quick to skip it and just ping the endpoint.
+ */
+async function showProviders(args: string[] = []): Promise<void> {
   assertLegalCatalogue();
   const keys = effectiveKeys();
+  const deep = !args.includes('--quick');
 
-  console.log('\nprovider          key      models  status');
-  console.log('-'.repeat(62));
+  console.log('\nprovider          key      models  endpoint');
+  console.log('-'.repeat(64));
   for (const provider of PROVIDERS) {
     const configured = provider.keyEnv === null || keys.has(provider.id);
     const state = !provider.enabled ? 'disabled'
@@ -190,12 +200,40 @@ async function showProviders(): Promise<void> {
       `${String(provider.models.length).padEnd(7)} ${state}`);
   }
 
-  console.log('\nlegal models (<=80B total parameters):');
+  console.log(`\nmodels (all <=80B total parameters)${deep ? ' — probed with a real call' : ''}:`);
+  const usable: string[] = [];
   for (const provider of PROVIDERS) {
+    const configured = provider.keyEnv === null || keys.has(provider.id);
     for (const model of provider.models) {
+      // Most model ids already carry a vendor prefix; do not prepend another.
+      const qualified = model.id.startsWith(`${provider.id}/`)
+        ? model.id : `${provider.id}/${model.id}`;
+      const name = qualified.padEnd(44);
+      const size = `${String(model.totalParamsB).padStart(3)}B`;
+      if (!provider.enabled || !configured || !deep) {
+        const why = !provider.enabled ? 'disabled' : !configured ? 'no key' : '';
+        console.log(`  ${name} ${size}  ${why.padEnd(22)} ${model.roles.join(',')}`);
+        continue;
+      }
+      const verdict = await probeModel(provider.baseUrl, model.id, keys.get(provider.id));
+      if (verdict.ok) usable.push(name.trim());
+      console.log(`  ${name} ${size}  ${verdict.text.padEnd(22)} ${model.roles.join(',')}`);
+    }
+  }
+
+  if (deep) {
+    console.log(`\n${usable.length} model(s) actually answered.`);
+    // One provider means no fallback: when it is slow or exhausted, every
+    // role fails together, which is how a whole task dies on one bad minute.
+    const live = new Set(usable.map((u) => u.split('/')[0]));
+    if (live.size === 1) {
       console.log(
-        `  ${`${provider.id}/${model.id}`.padEnd(46)} ` +
-        `${String(model.totalParamsB).padStart(3)}B  ${model.roles.join(',')}`);
+        `WARNING: every usable model is on '${[...live][0]}'. There is nowhere to\n` +
+        `fall back to when it is slow or rate-limited. Add a second provider key\n` +
+        `(Groq and OpenRouter are free) in Settings or the environment.`);
+    }
+    if (usable.length === 0) {
+      console.log('Nothing is usable right now — no task can run. Check keys and network.');
     }
   }
   console.log();
@@ -212,6 +250,47 @@ async function ping(baseUrl: string, key?: string): Promise<string> {
     return res.ok ? 'reachable' : `http ${res.status}`;
   } catch (err) {
     return `unreachable (${(err as Error).message.slice(0, 30)})`;
+  }
+}
+
+/** Ask one model for a trivial answer, and time it. This is the real test. */
+async function probeModel(
+  baseUrl: string, modelId: string, key?: string,
+): Promise<{ ok: boolean; text: string }> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (key) headers.Authorization = `Bearer ${key}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 45_000);
+  const startedAt = Date.now();
+  try {
+    const res = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST', headers, signal: controller.signal,
+      // Enough room that a model which reasons first still reaches its answer;
+      // starving the probe would report a working model as broken.
+      body: JSON.stringify({
+        model: modelId,
+        messages: [{ role: 'user', content: 'Reply with only the word: ok' }],
+        max_tokens: 1200,
+      }),
+    });
+    const ms = Date.now() - startedAt;
+    if (!res.ok) {
+      const hint = res.status === 410 ? ' retired' : res.status === 404 ? ' not found' : '';
+      return { ok: false, text: `HTTP ${res.status}${hint}` };
+    }
+    const json = await res.json() as any;
+    const answered = Boolean(json?.choices?.[0]?.message?.content?.trim());
+    return answered
+      ? { ok: true, text: `ok ${(ms / 1000).toFixed(1)}s` }
+      : { ok: false, text: `empty reply ${(ms / 1000).toFixed(1)}s` };
+  } catch (err) {
+    return {
+      ok: false,
+      text: controller.signal.aborted ? 'no response in 45s'
+        : `unreachable (${(err as Error).message.slice(0, 12)})`,
+    };
+  } finally {
+    clearTimeout(timer);
   }
 }
 

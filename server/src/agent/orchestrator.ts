@@ -289,7 +289,11 @@ export async function runTask(
     const salvagedSteps = db.getEvents(task.id)
       .filter((e) => e.kind === 'step_end' && (e.payload as StepEndPayload).salvaged).length;
     const report_ = composeReport(stepNotes);
+    // Scan the step notes too, not just facts: the agent reported its server
+    // as "GET http://localhost:8000/ returns the page" inside a summary, and
+    // a facts-only scan missed the one thing the user actually asked for.
     const links = collectLinks([
+      ...stepNotes.map((s) => s.summary ?? ''),
       ...stepNotes.flatMap((s) => s.facts),
       ...db.getLiveFacts(task.id).map((f) => f.text),
     ]);

@@ -4,6 +4,10 @@ This document is the deep "why" behind the code. The code itself carries only
 short constraint notes; when a design choice needs a paragraph of defence, that
 paragraph lives here.
 
+For *what exists* rather than *why* — the layered diagrams, the exact lifecycle
+with its failure branches, every constant and provider, and an explicit list of
+what is not built — see **[ARCHITECTURE-MAP.md](ARCHITECTURE-MAP.md)**.
+
 ## The problem shape
 
 The problem statement asks for an agentic coding IDE tuned for models of

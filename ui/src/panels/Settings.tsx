@@ -41,9 +41,25 @@ export function Settings(): JSX.Element {
   if (error) return <div className="panel error">{error}</div>;
   if (!data) return <div className="panel">Loading…</div>;
 
+  // One provider means no fallback: when it is slow, rate-limited or has
+  // retired a model, every role fails together and the task dies with it.
+  // This is the single highest-value thing a user can fix here.
+  const configured = data.providers.filter((p) => p.configured && p.enabled);
+
   return (
     <div className="panel settings">
       <h2>API keys</h2>
+
+      {configured.length <= 1 && (
+        <div className="warn-banner">
+          {configured.length === 0
+            ? 'No provider is configured, so no task can run. Add a key below.'
+            : `Only ${configured[0]!.label} is configured. When it is slow or ` +
+              `rate-limited there is nowhere to fall back to, and the whole task ` +
+              `fails. Groq and OpenRouter both have free tiers — a second key is ` +
+              `the single biggest reliability win available here.`}
+        </div>
+      )}
       <p className="muted">
         Keys are stored in <code>{data.settingsPath}</code> with 0600
         permissions and are never sent back to this screen. The corresponding
