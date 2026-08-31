@@ -4,7 +4,8 @@
  */
 
 import type {
-  AsideBubble, ProvidersResponse, ReviewBundle, ServerEvent, TraceNode,
+  AsideBubble, ConversationWire, ProvidersResponse, ReviewBundle, ServerEvent,
+  TraceNode,
 } from './types.ts';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -27,6 +28,7 @@ export interface BrowseResponse {
 
 export interface TaskRow {
   id: string;
+  conversationId: string;
   prompt: string;
   status: string;
   complexity: string;
@@ -51,12 +53,31 @@ export const api = {
       method: 'POST', body: JSON.stringify({ path }),
     }),
 
-  tasks: (projectRoot: string) =>
-    request<{ tasks: TaskRow[] }>(`/api/tasks?projectRoot=${encodeURIComponent(projectRoot)}`),
+  /** Every chat in this project, most recently active first. */
+  conversations: (projectRoot: string) =>
+    request<{ conversations: ConversationWire[] }>(
+      `/api/conversations?projectRoot=${encodeURIComponent(projectRoot)}`),
 
-  startTask: (projectRoot: string, prompt: string) =>
-    request<{ accepted: boolean }>('/api/tasks', {
-      method: 'POST', body: JSON.stringify({ projectRoot, prompt }),
+  renameConversation: (projectRoot: string, id: string, title: string) =>
+    request<{ ok: boolean }>(`/api/conversations/${encodeURIComponent(id)}`, {
+      method: 'PUT', body: JSON.stringify({ projectRoot, title }),
+    }),
+
+  /** The tasks of one chat. No chat named yields none — a new chat is empty. */
+  tasks: (projectRoot: string, conversationId: string | null) =>
+    request<{ tasks: TaskRow[] }>(
+      `/api/tasks?projectRoot=${encodeURIComponent(projectRoot)}` +
+      (conversationId ? `&conversationId=${encodeURIComponent(conversationId)}` : '')),
+
+  /**
+   * Start a task. `conversationId` is null for a chat that has not been
+   * started yet; the server opens one and names it after this prompt, and the
+   * response says which — that id is how the UI stops showing an empty chat.
+   */
+  startTask: (projectRoot: string, prompt: string, conversationId: string | null) =>
+    request<{ accepted: boolean; conversationId: string }>('/api/tasks', {
+      method: 'POST',
+      body: JSON.stringify({ projectRoot, prompt, ...(conversationId ? { conversationId } : {}) }),
     }),
 
   resumeTask: (projectRoot: string, taskId: string) =>
@@ -121,6 +142,11 @@ export const api = {
   readFile: (projectRoot: string, path: string) =>
     request<{ path: string; content: string }>(
       `/api/file?projectRoot=${encodeURIComponent(projectRoot)}&path=${encodeURIComponent(path)}`),
+
+  writeFile: (projectRoot: string, path: string, content: string) =>
+    request<{ path: string; bytes: number }>('/api/file', {
+      method: 'PUT', body: JSON.stringify({ projectRoot, path, content }),
+    }),
 };
 
 /** Subscribe to the event stream. EventSource reconnects on its own. */

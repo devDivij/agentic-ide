@@ -6,7 +6,7 @@
  * state without its reason. A ✕ with no explanation is worse than no ✕.
  */
 
-import { useEffect, useReducer, useState } from 'react';
+import { useEffect, useMemo, useReducer, useState } from 'react';
 
 import type {
   ApprovalRequest, AsideBubble, FailureInfo, StepEndPayload, StepWire,
@@ -16,6 +16,9 @@ import {
   activityFeed, currentActivity, failuresByStep, notesByStep, shortModel,
   stepDurations, taskEndOf,
 } from '../activity.ts';
+import { api } from '../api.ts';
+import { diffFiles } from '../diff.ts';
+import { DiffLines } from './DiffLines.tsx';
 
 /** One task in the conversation, whether it is live, finished, or historical. */
 export interface ChatTask {
@@ -64,8 +67,10 @@ function useTick(active: boolean, everyMs = 500): void {
 // ---------------------------------------------------------------------------
 
 export function TaskEntry({
-  task, approvals, actions, explaining,
+  projectRoot, task, approvals, actions, explaining,
 }: {
+  /** Needed only to diff a proposed write against what is on disk now. */
+  projectRoot: string;
   task: ChatTask;
   approvals: ApprovalRequest[];
   actions: TaskActions;
@@ -181,6 +186,7 @@ export function TaskEntry({
       {approvals.map((a) => (
         <Approval
           key={a.eventId}
+          projectRoot={projectRoot}
           request={a}
           onDecide={(ok, feedback) => actions.onApprove(a.eventId, ok, feedback)}
         />
@@ -376,17 +382,21 @@ export function Aside({ aside }: { aside: AsideBubble }): JSX.Element {
  * An approval prompt. Shows the exact command, verbatim and unabridged: a
  * paraphrased or truncated command is not something anyone can meaningfully
  * consent to, and this prompt is the only control on what a command may do.
+ *
+ * A proposed write is shown as a diff against what is actually on disk, not
+ * as a wall of the new content: the question this prompt answers is "what is
+ * about to change", and a plain listing of 25 lines answers a different,
+ * less useful question when only one of them is new.
  */
 export function Approval({
-  request, onDecide,
+  projectRoot, request, onDecide,
 }: {
+  projectRoot: string;
   request: ApprovalRequest;
   onDecide: (approved: boolean, feedback?: string) => void;
 }): JSX.Element {
   const [showAll, setShowAll] = useState(false);
   const [note, setNote] = useState('');
-  const contentLines = (request.content ?? '').split('\n');
-  const preview = showAll ? contentLines : contentLines.slice(0, 24);
   const decide = (approved: boolean): void => onDecide(approved, note.trim() || undefined);
 
   return (
@@ -399,22 +409,13 @@ export function Approval({
           <pre className="approval-command">$ {request.command}</pre>
         </>
       ) : request.path !== undefined ? (
-        <>
-          <div className="approval-effect">
-            Write <code>{request.path}</code>
-            <span className="muted small"> — {contentLines.length} lines</span>
-          </div>
-          <pre className="approval-args">
-            {preview.map((line, i) => (
-              <div key={i}><span className="lineno">{i + 1}</span>{line || ' '}</div>
-            ))}
-          </pre>
-          {contentLines.length > 24 && (
-            <button className="ghost" onClick={() => setShowAll((v) => !v)}>
-              {showAll ? 'show less' : `show all ${contentLines.length} lines`}
-            </button>
-          )}
-        </>
+        <WriteDiff
+          projectRoot={projectRoot}
+          path={request.path}
+          proposed={request.content ?? ''}
+          showAll={showAll}
+          onShowAll={() => setShowAll((v) => !v)}
+        />
       ) : (
         <pre className="approval-args">
           {JSON.stringify(request.args, null, 2).slice(0, 1500)}
@@ -452,6 +453,81 @@ export function Approval({
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * The proposed content, diffed against what is on disk right now.
+ *
+ * Fetched once per approval (keyed on `path` — a fresh approval on the same
+ * path re-fetches, since the file may have moved since the last one). A
+ * missing file is not an error here: it means this write creates the file,
+ * so every line is shown added and nothing is fetched a second time to find
+ * that out.
+ */
+function WriteDiff({
+  projectRoot, path, proposed, showAll, onShowAll,
+}: {
+  projectRoot: string;
+  path: string;
+  proposed: string;
+  showAll: boolean;
+  onShowAll: () => void;
+}): JSX.Element {
+  const [existing, setExisting] = useState<{ path: string; content: string | null } | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    setExisting(null);
+    api.readFile(projectRoot, path)
+      .then((f) => { if (live) setExisting({ path, content: f.content }); })
+      // No such file (or it is outside the confined tree, though an approval
+      // never proposes that): treated as "does not exist yet", not a failure
+      // to report — a create is a perfectly normal reason a read would 404.
+      .catch(() => { if (live) setExisting({ path, content: null }); });
+    return () => { live = false; };
+  }, [projectRoot, path]);
+
+  const proposedLines = proposed === '' ? [] : proposed.split('\n');
+  const loading = existing === null || existing.path !== path;
+
+  const rows = useMemo(
+    () => (loading ? null : diffFiles(existing!.content, proposed)),
+    [loading, existing, proposed]);
+
+  const visibleRows = rows && !showAll ? rows.slice(0, 40) : rows;
+  const truncated = rows !== null && rows.length > 40;
+
+  return (
+    <>
+      <div className="approval-effect">
+        Write <code>{path}</code>
+        <span className="muted small">
+          {' — '}
+          {loading
+            ? `${proposedLines.length} lines`
+            : existing!.content === null
+              ? `new file, ${proposedLines.length} lines`
+              : `${proposedLines.length} lines`}
+        </span>
+      </div>
+      {loading ? (
+        <pre className="approval-args">
+          {proposedLines.slice(0, 24).map((line, i) => (
+            <div key={i}><span className="lineno">{i + 1}</span>{line || ' '}</div>
+          ))}
+        </pre>
+      ) : (
+        <div className="approval-diff">
+          <DiffLines rows={visibleRows!} path={path} />
+        </div>
+      )}
+      {truncated && (
+        <button className="ghost" onClick={onShowAll}>
+          {showAll ? 'show less' : `show all ${rows!.length} lines`}
+        </button>
+      )}
+    </>
   );
 }
 

@@ -1,7 +1,11 @@
 /**
- * The conversation. Every task this project has run, in order, with the live
- * one at the bottom — not a single status panel that forgets the moment you
- * send something else.
+ * The conversation. Every task in the open chat, in order, with the live one
+ * at the bottom — not a single status panel that forgets the moment you send
+ * something else.
+ *
+ * A project holds many chats and shows one. "New chat" is free: it costs
+ * nothing and creates nothing until you send into it, so the picker never
+ * fills up with empty threads.
  *
  * Composer behaviours:
  *   - a plain message starts a coding task;
@@ -14,7 +18,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import type {
-  ApprovalRequest, AsideBubble, StepWire, TaskSummary, TraceNode,
+  ApprovalRequest, AsideBubble, ConversationWire, StepWire, TaskSummary,
+  TraceNode,
 } from '../types.ts';
 import { api, type TaskRow } from '../api.ts';
 import type { LogLine } from '../state.ts';
@@ -22,10 +27,17 @@ import { nodesFor, stepsFromTrace } from '../activity.ts';
 import { Aside, TaskEntry, type ChatTask, type TaskActions } from './Timeline.tsx';
 
 export function Chat({
-  projectRoot, task, steps, trace, logs, approvals, asides, history, running,
+  projectRoot, conversationId, conversations, onSelectConversation,
+  onRenameConversation,
+  task, steps, trace, logs, approvals, asides, history, running,
   onSubmit, onBytheway, onResume, onStop, onApprove, onReview, draft, setDraft,
 }: {
   projectRoot: string;
+  /** The open chat; null while a new one has not been sent into yet. */
+  conversationId: string | null;
+  conversations: ConversationWire[];
+  onSelectConversation: (id: string | null) => void;
+  onRenameConversation: (id: string, title: string) => void;
   task: TaskSummary | null;
   steps: StepWire[];
   trace: TraceNode[];
@@ -52,8 +64,8 @@ export function Chat({
   const composer = useRef<HTMLTextAreaElement>(null);
 
   const tasks = useMemo(
-    () => buildTasks(history, task, steps, trace, fetched),
-    [history, task, steps, trace, fetched]);
+    () => buildTasks(history, task, steps, trace, fetched, conversationId),
+    [history, task, steps, trace, fetched, conversationId]);
 
   // Follow the conversation, but never yank the view away from someone who has
   // scrolled up to read something. Starts pinned so opening a project lands on
@@ -112,6 +124,14 @@ export function Chat({
 
   return (
     <div className="chat">
+      <ConversationBar
+        conversationId={conversationId}
+        conversations={conversations}
+        disabled={!projectRoot}
+        onSelect={onSelectConversation}
+        onRename={onRenameConversation}
+      />
+
       <div
         className="chat-scroll"
         ref={scroll}
@@ -122,9 +142,11 @@ export function Chat({
       >
         {entries.length === 0 && (
           <div className="empty pad">
-            {projectRoot
-              ? 'Describe a change. The agent will plan it, carry it out step by step, and show you a diff to review.'
-              : 'Open a project folder to begin.'}
+            {!projectRoot
+              ? 'Open a project folder to begin.'
+              : conversationId
+                ? 'This chat is empty. Describe a change to start it off.'
+                : 'New chat. Describe a change — the agent will plan it, carry it out step by step, and show you a diff to review.'}
           </div>
         )}
 
@@ -133,6 +155,7 @@ export function Chat({
           : (
             <TaskEntry
               key={entry.key}
+              projectRoot={projectRoot}
               task={entry.task}
               approvals={entry.task.id === liveId ? approvals : []}
               actions={actions}
@@ -199,6 +222,127 @@ export function Chat({
 }
 
 /**
+ * Which chat you are in, and how to get to another one.
+ *
+ * The list is a popover rather than a permanent sidebar: switching chats is
+ * something you do occasionally, and the file tree already owns the left edge
+ * of a window that has to fit a diff.
+ */
+function ConversationBar({
+  conversationId, conversations, disabled, onSelect, onRename,
+}: {
+  conversationId: string | null;
+  conversations: ConversationWire[];
+  disabled: boolean;
+  onSelect: (id: string | null) => void;
+  onRename: (id: string, title: string) => void;
+}): JSX.Element {
+  const [open, setOpen] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [title, setTitle] = useState('');
+
+  const current = conversations.find((c) => c.id === conversationId) ?? null;
+
+  // Close the popover on any click outside it, the way a menu should.
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const away = (e: MouseEvent): void => {
+      if (!box.current?.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', away);
+    return () => document.removeEventListener('mousedown', away);
+  }, [open]);
+
+  const commitRename = (): void => {
+    const next = title.trim();
+    if (current && next && next !== current.title) onRename(current.id, next);
+    setRenaming(false);
+  };
+
+  return (
+    <div className="chat-bar" ref={box}>
+      {renaming && current ? (
+        <input
+          className="chat-title-input"
+          autoFocus
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          onBlur={commitRename}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') commitRename();
+            if (e.key === 'Escape') setRenaming(false);
+          }}
+        />
+      ) : (
+        <button
+          className="chat-title"
+          disabled={disabled || !current}
+          title={current ? 'Rename this chat' : undefined}
+          onClick={() => { setTitle(current?.title ?? ''); setRenaming(true); }}
+        >
+          {current ? current.title : <span className="muted">New chat</span>}
+        </button>
+      )}
+
+      <div className="row">
+        <button
+          className="ghost"
+          disabled={disabled || conversationId === null}
+          title="Start a fresh chat — nothing is created until you send a message"
+          onClick={() => { onSelect(null); setOpen(false); }}
+        >
+          + New chat
+        </button>
+        <button
+          className="ghost"
+          disabled={disabled}
+          onClick={() => setOpen((v) => !v)}
+        >
+          Previous {open ? '▴' : '▾'}
+          {conversations.length > 0 && (
+            <span className="muted small">&nbsp;{conversations.length}</span>
+          )}
+        </button>
+      </div>
+
+      {open && (
+        <div className="chat-menu">
+          {conversations.length === 0 && (
+            <div className="muted small pad">
+              No earlier chats in this project yet.
+            </div>
+          )}
+          {conversations.map((c) => (
+            <div
+              key={c.id}
+              className={`chat-menu-row ${c.id === conversationId ? 'active' : ''}`}
+              onClick={() => { onSelect(c.id); setOpen(false); }}
+            >
+              <span className="chat-menu-title">{c.title}</span>
+              <span className="muted small">
+                {c.taskCount} task{c.taskCount === 1 ? '' : 's'} · {ago(c.lastActivityAt)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Coarse on purpose: nobody needs a chat list to the second. */
+function ago(ts: number): string {
+  const seconds = Math.max(0, (Date.now() - ts) / 1000);
+  if (seconds < 90) return 'just now';
+  const minutes = seconds / 60;
+  if (minutes < 60) return `${Math.round(minutes)}m ago`;
+  const hours = minutes / 60;
+  if (hours < 24) return `${Math.round(hours)}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
+/**
  * One entry per task, merging what we know from three places: the project's
  * task list, the live event stream, and any trace we fetched to explain an
  * older failure. The live stream wins — it is the freshest.
@@ -209,6 +353,7 @@ function buildTasks(
   liveSteps: StepWire[],
   trace: TraceNode[],
   fetched: Record<string, TraceNode[]>,
+  conversationId: string | null,
 ): ChatTask[] {
   const byId = new Map<string, ChatTask>();
 
@@ -232,7 +377,10 @@ function buildTasks(
     });
   }
 
-  if (live) {
+  // A task running in another chat is still on the event stream — it just
+  // does not belong in this one. The header's "running" tag is what says it
+  // exists; putting it here would make two chats look like the same chat.
+  if (live && live.conversationId === conversationId) {
     const nodes = pickNodes(live.id, trace, fetched);
     const previous = byId.get(live.id);
     const steps = liveSteps.length > 0 ? liveSteps : stepsFromTrace(nodes);

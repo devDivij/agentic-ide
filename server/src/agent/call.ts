@@ -54,6 +54,16 @@ export interface CallOptions<T> {
   maxTokens?: number;
   temperature?: number;
   difficulty?: 'routine' | 'hairy';
+  /**
+   * "provider/model" ids this call must avoid, so a retry lands somewhere new.
+   *
+   * Distinct from the fallback exclusions built up inside the loop below:
+   * those react to a provider failing mid-call, this one carries knowledge
+   * from a PREVIOUS call that already failed. Ignored when honouring it would
+   * leave no candidate at all — a retry on the same model still beats a retry
+   * on nothing.
+   */
+  exclude?: string[];
   /** Skip chain-of-thought (mechanical roles: ~20x cheaper, same answer). */
   suppressReasoning?: boolean;
   /** Hang timeout. Short for mechanical roles: a slow one is a broken one. */
@@ -72,7 +82,7 @@ export class CallFailedError extends Error {
 
 export async function callModel<T>(
   deps: CallDeps, opts: CallOptions<T>,
-): Promise<{ value: T; eventId: number }> {
+): Promise<{ value: T; eventId: number; usedModel: string }> {
   const { db, router, keys } = deps;
   const { taskId, context } = opts;
 
@@ -95,7 +105,13 @@ export async function callModel<T>(
     });
   }
 
-  const excluded: string[] = [];
+  // Seeded from the caller, then grown by fallbacks. Dropped wholesale if the
+  // seed would starve the router: `rank` returning nothing here means every
+  // model that can serve this role is already spent.
+  const seedExclusions = opts.exclude ?? [];
+  const excluded: string[] = router.rank({
+    role: opts.role, estimatedTokens: context.estimatedTokens, exclude: seedExclusions,
+  }).length > 0 ? [...seedExclusions] : [];
   let messages = context.messages;
   let repairs = 0;
   let fallbacks = 0;
@@ -154,7 +170,10 @@ export async function callModel<T>(
 
       const raw = extractJsonSafe(result.text);
       const parsed = opts.schema.safeParse(opts.coerce ? opts.coerce(raw) : raw);
-      if (parsed.success) return { value: parsed.data, eventId };
+      if (parsed.success) {
+        return { value: parsed.data, eventId,
+                 usedModel: `${route.providerId}/${route.modelId}` };
+      }
 
       // Cut off mid-answer, not misbehaving. A model that writes its thinking
       // into `content` and runs out of room leaves prose that fails validation

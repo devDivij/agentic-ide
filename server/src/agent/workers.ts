@@ -288,8 +288,9 @@ export async function executeTurn(
   recentOutcomes: string[], stepTranscript: string[],
   projectFiles: string[], parentId: number,
   previousAttempt?: string, directive?: string,
-): Promise<{ turn: ExecutorTurn; eventId: number }> {
-  const { value, eventId } = await callModel(ctx, {
+  exclude?: string[],
+): Promise<{ turn: ExecutorTurn; eventId: number; usedModel: string }> {
+  const { value, eventId, usedModel } = await callModel(ctx, {
     taskId: task.id,
     role: 'execute',
     parentId,
@@ -298,6 +299,7 @@ export async function executeTurn(
     coerce: coerceTurn,
     maxTokens: 3000,
     difficulty: step.difficulty,
+    ...(exclude && exclude.length > 0 ? { exclude } : {}),
     context: buildContext({
       role: 'execute', prompt: task.prompt,
       projectRules: ctx.projectRules, projectFiles,
@@ -308,7 +310,7 @@ export async function executeTurn(
       outputContract: `${renderToolCatalog()}\n\n${EXECUTE_CONTRACT}`,
     }),
   });
-  return { turn: value, eventId };
+  return { turn: value, eventId, usedModel };
 }
 
 // ---------------------------------------------------------------------------

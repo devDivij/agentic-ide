@@ -21,20 +21,34 @@
  */
 
 import { DatabaseSync } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import type {
-  AgentEvent, Fact, NewEvent, Plan, StepRecord, Task, TaskStatus,
+  AgentEvent, Conversation, Fact, NewEvent, Plan, StepRecord, Task, TaskStatus,
 } from './types.ts';
 
 const SCHEMA = `
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
+-- A chat: the thread of tasks a person thinks of as one conversation.
+-- Rows are created by the first task sent into them, so an abandoned
+-- "New chat" leaves nothing here.
+CREATE TABLE IF NOT EXISTS conversations (
+  id           TEXT PRIMARY KEY,
+  project_root TEXT NOT NULL,
+  title        TEXT NOT NULL,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversations_project
+  ON conversations(project_root, created_at);
+
 CREATE TABLE IF NOT EXISTS tasks (
   id             TEXT PRIMARY KEY,
   project_root   TEXT NOT NULL,
+  conversation_id TEXT,
   prompt         TEXT NOT NULL,
   status         TEXT NOT NULL,
   complexity     TEXT NOT NULL,
@@ -44,6 +58,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   base_sha       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_root, status);
+-- The index on conversation_id is NOT here: this whole block runs before
+-- migrate(), and against a database created by an older build the column does
+-- not exist yet, so CREATE INDEX would fail before the ALTER could add it.
+-- See migrate().
 
 CREATE TABLE IF NOT EXISTS steps (
   task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -99,6 +117,108 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, seq);
 `;
 
+/**
+ * `CREATE TABLE IF NOT EXISTS` is a no-op against a database an older build
+ * already created, so a schema change leaves those files behind on the shape
+ * they were born with. `tasks` is the one table whose shape actually moved:
+ * five NOT NULL budget columns collapsed into a single `budget_json`. Opening
+ * such a project used to fail on the first insert with
+ * `table tasks has no column named budget_json`.
+ *
+ * ADD COLUMN then DROP COLUMN rather than a table rebuild: `steps`, `facts`,
+ * `pins` and `events` all carry `REFERENCES tasks(id)`, and dropping and
+ * renaming the parent table under those foreign keys is the risky way to do
+ * this. Adding and dropping plain columns leaves `tasks(id)` untouched, so
+ * every reference stays valid.
+ */
+function migrate(db: DatabaseSync, projectRoot: string): void {
+  const columns = new Set(
+    (db.prepare('PRAGMA table_info(tasks)').all() as { name: string }[])
+      .map((c) => c.name),
+  );
+
+  // Pre-0.2 databases: budget lived in five columns instead of one JSON blob.
+  if (!columns.has('budget_json')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN budget_json TEXT');
+    db.exec(`
+      UPDATE tasks SET budget_json = json_object(
+        'maxUsd',            budget_usd,
+        'maxSeconds',        budget_seconds,
+        'maxTokens',         budget_tokens,
+        'maxSteps',          budget_steps,
+        'maxRetriesPerStep', budget_retries
+      )
+    `);
+  }
+
+  // The old columns are NOT NULL with no default, so they reject every insert
+  // the current code writes. They have to go, not just be ignored.
+  for (const dead of [
+    'budget_usd', 'budget_seconds', 'budget_tokens', 'budget_steps',
+    'budget_retries',
+  ]) {
+    if (columns.has(dead)) db.exec(`ALTER TABLE tasks DROP COLUMN ${dead}`);
+  }
+
+  // Pre-0.3 databases: every task belonged to one endless chat.
+  //
+  // Plain nullable TEXT with no REFERENCES clause. `foreign_keys` is ON and
+  // the whole reason this function adds and drops columns rather than
+  // rebuilding tables is the reference chain hanging off `tasks(id)`; a title
+  // lookup is not worth adding another edge to it.
+  if (!columns.has('conversation_id')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN conversation_id TEXT');
+  }
+  // Only now can this exist — see the note in SCHEMA.
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_tasks_conversation ON tasks(conversation_id, created_at)');
+  backfillConversations(db, projectRoot);
+}
+
+/**
+ * Give every task a conversation.
+ *
+ * Existing history is gathered into one "Earlier work" chat rather than one
+ * chat per task: those tasks were run when there was only one thread, and
+ * inventing boundaries after the fact would be a guess.
+ *
+ * Filed under the root this database was OPENED with, not under the
+ * `project_root` its rows happen to record. This file is per project — that
+ * layout is the isolation guarantee — so every task in it belongs here by
+ * construction, while the recorded string is only as good as whatever spelled
+ * it. A row written under a path that no longer matches the one the UI asks
+ * about would otherwise be adopted into a conversation nothing can look up,
+ * which is the same as losing it.
+ *
+ * Runs on every open, not just the migration, so a row that somehow arrives
+ * without a conversation still reaches the picker instead of vanishing.
+ */
+function backfillConversations(db: DatabaseSync, projectRoot: string): void {
+  const orphaned = db.prepare(
+    'SELECT MIN(created_at) AS first, COUNT(*) AS n FROM tasks WHERE conversation_id IS NULL',
+  ).get() as { first: number | null; n: number };
+  if (orphaned.n === 0) return;
+
+  const id = randomUUID();
+  db.prepare(
+    'INSERT INTO conversations (id, project_root, title, created_at) VALUES (?, ?, ?, ?)',
+  ).run(id, projectRoot, 'Earlier work', orphaned.first ?? Date.now());
+  db.prepare('UPDATE tasks SET conversation_id = ? WHERE conversation_id IS NULL').run(id);
+}
+
+/**
+ * A chat's name, taken from the prompt that opened it.
+ *
+ * Titling from the first message rather than asking a model: naming a chat is
+ * not worth a call to anything, and the first sentence of what you asked for
+ * is what you would have typed anyway.
+ */
+export function conversationTitle(prompt: string): string {
+  const firstLine = prompt.trim().split('\n')[0]?.trim() ?? '';
+  if (!firstLine) return 'Untitled chat';
+  return firstLine.length > 64 ? `${firstLine.slice(0, 63)}\u2026` : firstLine;
+}
+
 export function stateDbPath(projectRoot: string): string {
   return join(projectRoot, '.agentzero', 'state.db');
 }
@@ -111,6 +231,7 @@ export class Store {
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec(SCHEMA);
+    migrate(this.db, projectRoot);
   }
 
   close(): void {
@@ -121,10 +242,11 @@ export class Store {
 
   createTask(task: Task): void {
     this.db.prepare(`
-      INSERT INTO tasks (id, project_root, prompt, status, complexity, created_at, budget_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(task.id, task.projectRoot, task.prompt, task.status, task.complexity,
-           task.createdAt, JSON.stringify(task.budget));
+      INSERT INTO tasks (id, project_root, conversation_id, prompt, status, complexity,
+                         created_at, budget_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(task.id, task.projectRoot, task.conversationId, task.prompt, task.status,
+           task.complexity, task.createdAt, JSON.stringify(task.budget));
   }
 
   getTask(id: string): Task | null {
@@ -158,6 +280,21 @@ export class Store {
     return rows.map(rowToTask);
   }
 
+  /**
+   * The tasks of one chat, newest first.
+   *
+   * Deliberately a separate method rather than an optional argument to
+   * `listTasks`: that one is also how the live session discovers the id of the
+   * task it just started (`listTasks(root, 1)`), and that lookup must keep
+   * seeing every task regardless of which chat is on screen.
+   */
+  listConversationTasks(conversationId: string, limit = 100): Task[] {
+    const rows = this.db.prepare(
+      'SELECT * FROM tasks WHERE conversation_id = ? ORDER BY created_at DESC LIMIT ?',
+    ).all(conversationId, limit) as any[];
+    return rows.map(rowToTask);
+  }
+
   /** Tasks left mid-flight (crash, closed IDE) that resume can pick up. */
   listResumable(projectRoot: string): Task[] {
     const rows = this.db.prepare(`
@@ -165,6 +302,48 @@ export class Store {
       ORDER BY created_at DESC
     `).all(projectRoot) as any[];
     return rows.map(rowToTask);
+  }
+
+  // -- conversations -------------------------------------------------------
+
+  /** Start a chat and return its id. Called by the first task sent into it. */
+  createConversation(projectRoot: string, title: string): string {
+    const id = randomUUID();
+    this.db.prepare(
+      'INSERT INTO conversations (id, project_root, title, created_at) VALUES (?, ?, ?, ?)',
+    ).run(id, projectRoot, title || 'Untitled chat', Date.now());
+    return id;
+  }
+
+  /**
+   * Every chat in this project, most recently active first — which is the
+   * order someone looking for "the one I was just in" expects, and is not the
+   * order they were created in once you resume an old thread.
+   */
+  listConversations(projectRoot: string, limit = 200): Conversation[] {
+    const rows = this.db.prepare(`
+      SELECT c.id, c.title, c.created_at,
+             COUNT(t.id)                        AS task_count,
+             COALESCE(MAX(t.created_at), c.created_at) AS last_activity
+      FROM conversations c
+      LEFT JOIN tasks t ON t.conversation_id = c.id
+      WHERE c.project_root = ?
+      GROUP BY c.id
+      ORDER BY last_activity DESC
+      LIMIT ?
+    `).all(projectRoot, limit) as any[];
+    return rows.map((r) => ({
+      id: r.id, title: r.title, createdAt: r.created_at,
+      taskCount: r.task_count, lastActivityAt: r.last_activity,
+    }));
+  }
+
+  hasConversation(id: string): boolean {
+    return this.db.prepare('SELECT 1 FROM conversations WHERE id = ?').get(id) !== undefined;
+  }
+
+  renameConversation(id: string, title: string): void {
+    this.db.prepare('UPDATE conversations SET title = ? WHERE id = ?').run(title, id);
   }
 
   // -- plan and steps ------------------------------------------------------
@@ -321,6 +500,7 @@ function rowToTask(row: any): Task {
   return {
     id: row.id,
     projectRoot: row.project_root,
+    conversationId: row.conversation_id ?? '',
     prompt: row.prompt,
     status: row.status,
     complexity: row.complexity,

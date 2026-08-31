@@ -55,6 +55,22 @@ export async function confinePath(root: string, candidate: string): Promise<stri
   return lexical;
 }
 
+/**
+ * A project-relative path spelled the one way everything downstream expects:
+ * with forward slashes.
+ *
+ * node:path hands back `src\app.ts` on Windows, while the scanner's output,
+ * git's pathspecs, and every path the model has ever seen in its life use
+ * `src/app.ts`. Without this, `write_file` and `search_code` describe the same
+ * file two different ways in the same conversation.
+ *
+ * Only Windows is rewritten: on POSIX a backslash is an ordinary character in
+ * a filename, and "normalising" it would invent a directory that is not there.
+ */
+export function toPosix(path: string): string {
+  return sep === '\\' ? path.split(/[\\/]/).join('/') : path;
+}
+
 /** Variant for callers that treat an escape as "no result" (e.g. retrieval). */
 export async function confinePathOrNull(root: string, candidate: string): Promise<string | null> {
   try {

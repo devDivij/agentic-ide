@@ -29,12 +29,13 @@ import type {
 import type {
   FailureInfo, StepEndPayload, TaskEndPayload,
 } from '../shared/types.ts';
-import { Store } from './store.ts';
+import { conversationTitle, Store } from './store.ts';
 import { Router, BUDGETS, type RouteDecision } from './router.ts';
 import { Retriever } from './retrieval.ts';
 import { Checkpoints, assertGitAvailable } from './checkpoints.ts';
 import { assertLegalCatalogue, PROVIDERS } from './providers.ts';
 import { runTool } from './tools.ts';
+import { assertShellAvailable, terminate } from './shell.ts';
 import { verifyChanges } from './verify.ts';
 import { CallFailedError } from './call.ts';
 import { TaskCancelledError } from './llm.ts';
@@ -111,6 +112,7 @@ export interface AgentOptions {
 export async function createAgent(opts: AgentOptions): Promise<Agent> {
   assertLegalCatalogue();          // refuse to run a non-compliant build
   await assertGitAvailable();
+  await assertShellAvailable();    // both, before a task can half-start
 
   const retriever = new Retriever(opts.projectRoot);
   const cancel = new AbortController();
@@ -148,9 +150,7 @@ export function requestStop(agent: Agent): void {
  * task that started a dev server does not leak it for the rest of the day.
  */
 export function stopBackground(agent: Agent): void {
-  for (const child of agent.background.splice(0)) {
-    try { child.kill('SIGTERM'); } catch { /* already gone */ }
-  }
+  for (const child of agent.background.splice(0)) terminate(child);
 }
 
 /** AGENTS.md if present (conventional filenames, in preference order). */
@@ -200,7 +200,8 @@ export interface TaskOutcome {
  * continue from the first step that is not already done.
  */
 export async function runTask(
-  agent: Agent, prompt: string, opts: { resumeTaskId?: string } = {},
+  agent: Agent, prompt: string,
+  opts: { resumeTaskId?: string; conversationId?: string } = {},
 ): Promise<TaskOutcome> {
   const startedAt = Date.now();
   const { db } = agent;
@@ -219,6 +220,12 @@ export async function runTask(
     task = {
       id: randomUUID(),
       projectRoot: agent.projectRoot,
+      // The web UI creates the chat up front (it has to answer the browser
+      // with an id before the task has run). Everything else — the CLI, the
+      // eval harness — gets one made for it here, so no task is ever orphaned
+      // from the conversation list.
+      conversationId: opts.conversationId
+        ?? db.createConversation(agent.projectRoot, conversationTitle(prompt)),
       prompt,
       status: 'running',
       complexity: 'medium',            // provisional until classified
@@ -264,8 +271,10 @@ export async function runTask(
       const seedChunks = await agent.retriever.retrieve(task.prompt, [], 10);
       db.appendEvent({
         taskId: task.id, parentId: rootId, kind: 'tool_call',
-        payload: { tool: 'retrieve',
-                   chunks: seedChunks.map((c) => `${c.path}:${c.startLine}-${c.endLine}`) },
+        payload: {
+          tool: 'retrieve',
+          chunks: seedChunks.map((c) => `${c.path}:${c.startLine}-${c.endLine}`)
+        },
       });
       // The planner gets the real file list: without it, a model confidently
       // names a plausible path that does not exist, and the executor then
@@ -274,8 +283,10 @@ export async function runTask(
       plan = await makePlan(agent, task, seedChunks, pinned, projectFiles, rootId);
       db.savePlan(task.id, plan);
       for (const step of plan.steps) {
-        db.upsertStep({ taskId: task.id, stepId: step.id, spec: step,
-                        status: 'pending', checkpointSha: null, attempts: 0 });
+        db.upsertStep({
+          taskId: task.id, stepId: step.id, spec: step,
+          status: 'pending', checkpointSha: null, attempts: 0
+        });
       }
       report(agent, `Plan: ${plan.steps.length} steps — ${plan.summary}`);
     } else {
@@ -341,7 +352,7 @@ export async function runTask(
         ...(report_ ? { report: report_ } : {}),
         ...(links.length > 0 ? { links } : {}),
         ...describeOutcome(status, done, plan.steps.length, abortReason, db, task.id,
-                           diff.trim().length > 0, salvagedSteps),
+          diff.trim().length > 0, salvagedSteps),
       } satisfies TaskEndPayload,
     });
 
@@ -407,9 +418,28 @@ async function runSteps(
     const overBudget = checkBudget(agent, task, startedAt, stepsRun);
     if (overBudget) return overBudget;
 
-    if (!step.dependsOn.every((d) => completed.has(d))) {
+    const missingDeps = step.dependsOn.filter((d) => !completed.has(d));
+    if (missingDeps.length > 0) {
       markStep(db, task.id, step, 'skipped', null, 0);
-      report(agent, `Skipping ${step.id}: a dependency did not complete`);
+      // Start-then-skip, both recorded: the loop genuinely considered this
+      // step and reached a decision about it, and `step_start` is what
+      // carries the spec the UI rebuilds the plan from. Emitting only the
+      // end would leave the step unrenderable; emitting neither is what the
+      // loop used to do.
+      const skipEventId = db.appendEvent({
+        taskId: task.id, parentId: rootId, kind: 'step_start',
+        stepId: step.id, payload: { step },
+      });
+      db.appendEvent({
+        taskId: task.id, parentId: skipEventId, kind: 'step_end',
+        stepId: step.id,
+        payload: {
+          outcome: 'skipped', attempts: 0, blockedBy: missingDeps,
+        } satisfies StepEndPayload,
+        status: 'error',
+      });
+      report(agent,
+        `Skipping ${step.id}: ${missingDeps.join(', ')} did not complete`);
       continue;
     }
 
@@ -435,18 +465,18 @@ async function runSteps(
  */
 export const TAXONOMY: Record<FailureClass, 'retry' | 'revert' | 'abort'> = {
   malformed_output: 'retry',   // repair already happened inside callModel
-  transient_api:    'retry',   // provider swapped underneath; step untouched
-  patch_conflict:   'retry',   // re-read the files and try again
-  missing_context:  'retry',   // wider retrieval on the next attempt
+  transient_api: 'retry',   // provider swapped underneath; step untouched
+  patch_conflict: 'retry',   // re-read the files and try again
+  missing_context: 'retry',   // wider retrieval on the next attempt
   // Fail FORWARD, not back. A red check means something identifiable is
   // wrong with work that mostly exists — reverting deletes the correct files
   // along with the broken one and makes the next attempt redo all of it
   // blind, unable to even see the code that failed. Keeping the tree lets the
   // retry read the failure, read the file, and fix the line.
-  test_failure:     'retry',
+  test_failure: 'retry',
   // Reverting is for a tree we no longer trust: the model was flailing, so
   // what it left behind is not a foundation to build on.
-  wrong_approach:   'revert',
+  wrong_approach: 'revert',
   budget_exhausted: 'abort',
 };
 
@@ -534,6 +564,19 @@ async function runOneStep(
   // than identical. Without this the executor that looped on `list_files`
   // simply looped again, doubling the wall-clock for the same failure.
   let lastFailure: Failure | null = null;
+  /**
+   * Models that have already failed this step.
+   *
+   * The doc's rule is that no recovery edge repeats an identical action, and
+   * of the four things an edge may change — model, provider, context, or
+   * approach — `retryHint` only ever changed context. A model that produced
+   * unusable JSON, or talked itself into a loop, tends to do it again on the
+   * same input; sending the retry somewhere else is what makes the attempt
+   * genuinely different. `callModel` drops this hint rather than starve the
+   * router, so the last attempt can still reuse a spent model if it is the
+   * only one left.
+   */
+  const spentModels = new Set<string>();
 
   for (let attempt = 1; attempt <= task.budget.maxRetriesPerStep; attempt++) {
     markStep(db, task.id, step, 'running', null, attempt);
@@ -546,7 +589,12 @@ async function runOneStep(
     try {
       const result = await executeStepTurns(
         agent, task, plan, step, pinned, stepEventId,
-        attempt > 1 && lastFailure ? retryHint(attempt, lastFailure) : undefined);
+        attempt > 1 && lastFailure ? retryHint(attempt, lastFailure) : undefined,
+        // A snapshot to avoid, and the same set as the sink to grow. They are
+        // deliberately not the same object: exclusions must hold still for the
+        // whole attempt, or the executor would swap models between turns of a
+        // step that is going fine.
+        [...spentModels], spentModels);
       evidence.looping = result.blockedKind === 'looping';
       evidence.turnLimit = result.blockedKind === 'turn_limit';
 
@@ -581,7 +629,7 @@ async function runOneStep(
           const salvaged = result.outcome === 'blocked';
           const note = salvaged
             ? `Did not finish cleanly (${result.blockedReason ?? 'the executor gave up'}), ` +
-              `but what it had already written passes verification.`
+            `but what it had already written passes verification.`
             : result.summary;
 
           markStep(db, task.id, step, 'done', sha, attempt);
@@ -667,11 +715,11 @@ function describeOutcome(
     // does not support.
     return {
       summary: `Finished all ${total} step${total === 1 ? '' : 's'}, but ` +
-               `${salvagedSteps} did not complete cleanly — the agent stopped early ` +
-               `and what it had written was kept because it passes basic checks.`,
+        `${salvagedSteps} did not complete cleanly — the agent stopped early ` +
+        `and what it had written was kept because it passes basic checks.`,
       advice: 'Read the diff carefully: this is more likely than usual to be ' +
-              'incomplete. Re-running the unfinished part as its own request often ' +
-              'works better than one broad instruction.',
+        'incomplete. Re-running the unfinished part as its own request often ' +
+        'works better than one broad instruction.',
     };
   }
   if (status === 'awaiting_review') {
@@ -682,15 +730,15 @@ function describeOutcome(
     if (!changedAnything) {
       return {
         summary: `Completed all ${total} step${total === 1 ? '' : 's'} without ` +
-                 `changing any files — the agent judged the requested change to be ` +
-                 `already present.`,
+          `changing any files — the agent judged the requested change to be ` +
+          `already present.`,
         advice: 'There is nothing to review. If you expected an edit, say more ' +
-                'specifically what should differ, and pin the file with an @path tag.',
+          'specifically what should differ, and pin the file with an @path tag.',
       };
     }
     return {
       summary: `Done — all ${total} step${total === 1 ? '' : 's'} completed. ` +
-               `Review the diff to accept or reject the changes.`,
+        `Review the diff to accept or reject the changes.`,
     };
   }
 
@@ -702,7 +750,7 @@ function describeOutcome(
         : `Stopped early after ${done} of ${total} steps: ${abortReason}.`,
       advice: changedAnything
         ? 'Everything finished before the stop is still on disk and in the diff — ' +
-          'review it, or resume to carry on from the next unfinished step.'
+        'review it, or resume to carry on from the next unfinished step.'
         : 'Nothing had been changed yet, so nothing was lost.',
     };
   }
@@ -713,13 +761,13 @@ function describeOutcome(
   const where = failed ? ` at step ${failed.stepId} (${failed.spec.intent})` : '';
   return {
     summary: `Failed${where} after ${done} of ${total} steps completed` +
-             (skipped > 0 ? `; ${skipped} later step${skipped === 1 ? '' : 's'} skipped ` +
-                            `because they depended on it` : '') + '.',
+      (skipped > 0 ? `; ${skipped} later step${skipped === 1 ? '' : 's'} skipped ` +
+        `because they depended on it` : '') + '.',
     advice: done > 0
       ? 'The completed steps are still in the diff — review them, then resume or ' +
-        're-phrase the failing part.'
+      're-phrase the failing part.'
       : 'Nothing was changed. Re-phrasing the request more concretely, or pinning ' +
-        'the relevant file with an @path tag, usually helps.',
+      'the relevant file with an @path tag, usually helps.',
   };
 }
 
@@ -788,6 +836,7 @@ function firstLine(text: string): string {
 async function executeStepTurns(
   agent: Agent, task: Task, plan: Plan, step: PlanStep,
   pinned: CodeChunk[], parentId: number, retryHint?: string,
+  exclude?: string[], spent?: Set<string>,
 ): Promise<{
   outcome: 'completed' | 'blocked';
   summary: string;
@@ -822,10 +871,15 @@ async function executeStepTurns(
     // finished and nothing is half-applied.
     if (agent.cancel.signal.aborted) throw new TaskCancelledError();
 
-    const { turn: action, eventId } = await executeTurn(
+    const { turn: action, eventId, usedModel } = await executeTurn(
       agent, task, plan, step, facts, chunks, pinned,
       recentOutcomes, transcript, projectFiles, parentId, retryHint,
-      exploring >= EXPLORE_BUDGET ? mustActNow(exploring) : undefined);
+      exploring >= EXPLORE_BUDGET ? mustActNow(exploring) : undefined,
+      exclude);
+    // Recorded on the SINK, not the return value: `callModel` throws past
+    // every return below when a model exhausts its repairs, and that is
+    // exactly the model the next attempt most needs to avoid.
+    spent?.add(usedModel);
 
     if (action.thought) report(agent, `  ${action.thought}`);
 
@@ -980,8 +1034,10 @@ function markStep(
   db: Store, taskId: string, step: PlanStep,
   status: StepRecord['status'], sha: string | null, attempts: number,
 ): void {
-  db.upsertStep({ taskId, stepId: step.id, spec: step, status,
-                  checkpointSha: sha, attempts });
+  db.upsertStep({
+    taskId, stepId: step.id, spec: step, status,
+    checkpointSha: sha, attempts
+  });
 }
 
 function report(agent: Agent, message: string): void {
@@ -1029,6 +1085,17 @@ export function parsePinTags(
  * anything left over, so a malformed dependency graph degrades to "run it as
  * written" instead of deadlocking.
  */
+/**
+ * Topological order over `dependsOn`.
+ *
+ * The cycle fallback below is defensive, not load-bearing: `normalisePlan`
+ * keeps a dependency only when it points STRICTLY BACKWARD in the step list,
+ * and a strictly-backward graph cannot contain a cycle. Every plan reaches
+ * here through `normalisePlan` (`makePlan` returns one, `singleStepPlan` is a
+ * single step, and a resumed plan was normalised before it was stored), so
+ * the degradation is unreachable today. It is kept because the cost is three
+ * lines and the alternative — a deadlocked loop — is unrecoverable.
+ */
 export function orderSteps(steps: PlanStep[]): PlanStep[] {
   const byId = new Map(steps.map((s) => [s.id, s]));
   const done = new Set<string>();
@@ -1065,8 +1132,10 @@ export function toToolCall(action: {
     case 'search_code':
       return { name: action.action, args: { query: action.query ?? '' } };
     case 'write_file':
-      return { name: action.action,
-               args: { path: action.path ?? '', content: action.content ?? '' } };
+      return {
+        name: action.action,
+        args: { path: action.path ?? '', content: action.content ?? '' }
+      };
     case 'run_command':
     case 'start_server':
       return { name: action.action, args: { command: action.command ?? '' } };

@@ -31,7 +31,7 @@ function str(value: unknown): string | null {
 export function asStepEnd(payload: unknown): StepEndPayload | null {
   if (!isObject(payload)) return null;
   const outcome = payload.outcome;
-  if (outcome !== 'done' && outcome !== 'failed') return null;
+  if (outcome !== 'done' && outcome !== 'failed' && outcome !== 'skipped') return null;
   return payload as unknown as StepEndPayload;
 }
 
@@ -124,7 +124,9 @@ export function stepsFromTrace(nodes: TraceNode[]): StepWire[] {
       const payload = asStepEnd(node.payload);
       byId.set(node.stepId, {
         ...existing,
-        status: payload?.outcome === 'done' ? 'done' : 'failed',
+        status: payload?.outcome === 'done' ? 'done'
+          : payload?.outcome === 'skipped' ? 'skipped'
+          : 'failed',
         attempts: payload?.attempts ?? existing.attempts,
       });
     }

@@ -5,12 +5,20 @@
  * Edits to existing test files are called out separately: accuracy is
  * measured by tests passing, so an agent that rewrites a failing test has
  * defeated the measurement rather than done the work.
+ *
+ * The diff itself is rendered the way a code host renders one — line numbers
+ * from both sides, the +/- marker in the gutter rather than in the code,
+ * syntax colour, and the changed part of an edited line picked out inside the
+ * red and green rows. That last one is the point: without it a typo fix and a
+ * rewritten line are the same picture. See `ui/src/diff.ts`.
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
 import type { DiffHunk, ReviewBundle } from '../types.ts';
 import { api } from '../api.ts';
+import { parseHunk } from '../diff.ts';
+import { DiffLines } from './DiffLines.tsx';
 
 export function Review({
   projectRoot, taskId, onApplied,
@@ -121,31 +129,28 @@ function HunkView({
 }: {
   hunk: DiffHunk; accepted: boolean; onToggle: () => void;
 }): JSX.Element {
+  const rows = useMemo(() => parseHunk(hunk.patch), [hunk.patch]);
+  const added = rows.filter((r) => r.kind === 'add').length;
+  const removed = rows.filter((r) => r.kind === 'del').length;
+
   return (
     <div className={`hunk ${accepted ? '' : 'rejected'}`}>
       <div className="hunk-head" onClick={onToggle}>
         <input type="checkbox" checked={accepted} readOnly />
         <code>{hunk.file}</code>
+        <span className="hunk-stat">
+          <span className="stat-add">+{added}</span>
+          <span className="stat-del">−{removed}</span>
+        </span>
         {hunk.touchesTests && <span className="tag warn">test file</span>}
         {hunk.stepId && (
           <span className="tag" title="Plan step that produced this">{hunk.stepId}</span>
         )}
         {!accepted && <span className="tag">rejected</span>}
       </div>
-      <pre className="diff">
-        {hunk.patch.split('\n').map((line, i) => (
-          <div key={i} className={diffLineClass(line)}>{line || ' '}</div>
-        ))}
-      </pre>
+      <DiffLines rows={rows} path={hunk.file} />
     </div>
   );
-}
-
-function diffLineClass(line: string): string {
-  if (line.startsWith('@@')) return 'dl-meta';
-  if (line.startsWith('+')) return 'dl-add';
-  if (line.startsWith('-')) return 'dl-del';
-  return 'dl-ctx';
 }
 
 function Empty({ children }: { children: React.ReactNode }): JSX.Element {

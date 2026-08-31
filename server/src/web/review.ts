@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
+import { SHADOW_GIT_CONFIG } from '../agent/checkpoints.ts';
 import { Store } from '../agent/store.ts';
 import type { DiffHunk, ReviewBundle } from '../shared/types.ts';
 
@@ -254,11 +255,7 @@ async function gitDiff(root: string, from: string, to: string): Promise<string> 
 /** Same shadow-repo invocation the runtime uses; see agent/checkpoints.ts. */
 function git(root: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
   return exec('git', [
-    '-c', 'user.name=Agent Zero',
-    '-c', 'user.email=agent@localhost',
-    '-c', 'commit.gpgsign=false',
-    '-c', 'gc.auto=0',
-    '-c', 'core.hooksPath=/dev/null',
+    ...SHADOW_GIT_CONFIG,
     '--git-dir', join(root, '.agentzero', 'shadow.git'),
     '--work-tree', root,
     ...args,

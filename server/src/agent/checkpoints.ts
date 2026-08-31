@@ -25,6 +25,24 @@ import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
 
+/**
+ * Every flag here removes a way this fails on a machine we don't control: no
+ * git identity, commit signing enabled, background gc, user hooks — and, on
+ * Windows, git's default line-ending rewriting, which would report every line
+ * of every file as changed and bury the agent's actual diff.
+ *
+ * Exported because the review screen re-enters the same shadow repo
+ * (web/review.ts); two copies of this list would drift.
+ */
+export const SHADOW_GIT_CONFIG = [
+  '-c', 'user.name=Agent Zero',
+  '-c', 'user.email=agent@localhost',
+  '-c', 'commit.gpgsign=false',
+  '-c', 'gc.auto=0',
+  '-c', 'core.hooksPath=/dev/null',
+  '-c', 'core.autocrlf=false',
+];
+
 /** Never snapshot these: huge, regenerable, and not the agent's work. */
 const EXCLUDES = [
   '.git/', '.agentzero/', 'node_modules/', '.venv/', 'venv/', '__pycache__/',
@@ -84,20 +102,9 @@ export class Checkpoints {
     }
   }
 
-  /**
-   * Every -c flag removes a way this fails on a machine we don't control:
-   * no git identity, commit signing enabled, background gc, user hooks.
-   */
   private git(args: string[], opts: { bare?: boolean } = {}) {
-    const config = [
-      '-c', 'user.name=Agent Zero',
-      '-c', 'user.email=agent@localhost',
-      '-c', 'commit.gpgsign=false',
-      '-c', 'gc.auto=0',
-      '-c', 'core.hooksPath=/dev/null',
-    ];
     const location = opts.bare ? [] : ['--git-dir', this.gitDir, '--work-tree', this.projectRoot];
-    return exec('git', [...config, ...location, ...args], {
+    return exec('git', [...SHADOW_GIT_CONFIG, ...location, ...args], {
       cwd: this.projectRoot,
       maxBuffer: 64 * 1024 * 1024,
     });
@@ -109,9 +116,15 @@ export async function assertGitAvailable(): Promise<void> {
   try {
     await exec('git', ['--version']);
   } catch {
+    const hints: Partial<Record<NodeJS.Platform, string>> = {
+      darwin: 'xcode-select --install   (or: brew install git)',
+      win32:  'https://git-scm.com/download/win',
+      linux:  'sudo apt install git',
+    };
+    const install = hints[process.platform] ?? 'https://git-scm.com/downloads';
     throw new Error(
       'git is required for checkpointing but was not found on PATH.\n' +
-      'Install it with:  sudo apt install git\n' +
+      `Install it with:  ${install}\n` +
       'Only the local binary is needed — no GitHub account or network.');
   }
 }

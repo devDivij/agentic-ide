@@ -15,10 +15,18 @@ Two documents, for two questions:
   way*: the reasoning, the trade-offs, and a guided reading order for the
   code (the agentic core is 15 small files; budget 2–3 hours for all of it).
 
-## Setup (Linux, from scratch)
+## Setup (Linux, macOS or Windows, from scratch)
 
 Requirements: **Node ≥ 22.5** (`node:sqlite` is built in — no native builds)
 and **git** on PATH. Nothing else.
+
+On **Windows**, that git should be [Git for
+Windows](https://git-scm.com/download/win): the commands a model writes are
+POSIX shell, so the agent runs them through the bash that ships alongside it,
+found automatically. WSL's `bash` is deliberately *not* used — it would run
+commands inside Linux, where the project's path does not exist. (Running the
+whole app inside WSL is fine; that is then just the Linux setup. To point at
+some other shell, set `AGENTZERO_SHELL` to the full path of a `bash.exe`.)
 
 ```bash
 git clone <this repo> && cd agentzero

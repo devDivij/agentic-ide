@@ -16,7 +16,8 @@ import { dirname, relative } from 'node:path';
 import { promisify } from 'node:util';
 
 import type { ApprovalFn, ToolCall, ToolResult } from './types.ts';
-import { confinePath } from './paths.ts';
+import { confinePath, toPosix } from './paths.ts';
+import { shellInvocation } from './shell.ts';
 import { IGNORED_DIRS, findMatches, scanProject, toRegions } from './retrieval.ts';
 import { checkFileSyntax } from './verify.ts';
 
@@ -232,7 +233,7 @@ async function doSearchCode(ctx: ToolContext, query: string): Promise<ToolResult
  */
 async function doWriteFile(ctx: ToolContext, path: string, content: string): Promise<ToolResult> {
   const abs = await confinePath(ctx.projectRoot, path);
-  const rel = relative(ctx.projectRoot, abs);
+  const rel = toPosix(relative(ctx.projectRoot, abs));
 
   // Was there a working file here before? If so it is worth more than
   // whatever we are about to put in its place, until proven otherwise.
@@ -286,10 +287,13 @@ async function doWriteFile(ctx: ToolContext, path: string, content: string): Pro
  */
 async function doRunCommand(ctx: ToolContext, command: string): Promise<ToolResult> {
   if (!command.trim()) return { ok: false, output: 'Empty command' };
+  const sh = await shellInvocation(command);
   try {
-    const { stdout, stderr } = await exec('bash', ['-lc', command], {
+    const { stdout, stderr } = await exec(sh.file, sh.args, {
       cwd: ctx.projectRoot,
-      env: scrubEnvironment(),
+      // The shell's own variables go on last: they are what makes it run in
+      // the project directory at all (see shell.ts), so nothing may shadow them.
+      env: { ...scrubEnvironment(), ...sh.env },
       timeout: 120_000,
       maxBuffer: 8 * 1024 * 1024,
     });
@@ -317,9 +321,10 @@ async function doRunCommand(ctx: ToolContext, command: string): Promise<ToolResu
 async function doStartServer(ctx: ToolContext, command: string): Promise<ToolResult> {
   if (!command.trim()) return { ok: false, output: 'Empty command' };
 
-  const child = spawn('bash', ['-lc', command], {
+  const sh = await shellInvocation(command);
+  const child = spawn(sh.file, sh.args, {
     cwd: ctx.projectRoot,
-    env: scrubEnvironment(),
+    env: { ...scrubEnvironment(), ...sh.env },
     detached: false,
     stdio: ['ignore', 'pipe', 'pipe'],
   });

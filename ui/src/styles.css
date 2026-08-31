@@ -14,7 +14,33 @@
   --del-bg: #331b1b;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   --radius: 7px;
+
+  /* Syntax colours. Deliberately few: this is a reading surface, not a
+     theme. Comments recede, strings and numbers are data, keywords are
+     structure, and names being called stand out — that is the whole scale. */
+  --syn-com: #6b7686;
+  --syn-str: #9ecb7d;
+  --syn-num: #e0a86a;
+  --syn-kw:  #c792ea;
+  --syn-typ: #6fd3c4;
+  --syn-fn:  #82aaff;
+  --syn-key: #79c0ff;
+  --syn-var: #e0a9dd;
+
+  /* Within-line diff. Strong enough to find at a glance on top of the row
+     tint, transparent so the syntax colour underneath still reads. */
+  --word-add: rgba(63, 185, 80, .38);
+  --word-del: rgba(248, 81, 73, .34);
 }
+
+.syn-com { color: var(--syn-com); font-style: italic; }
+.syn-str { color: var(--syn-str); }
+.syn-num { color: var(--syn-num); }
+.syn-kw  { color: var(--syn-kw); }
+.syn-typ { color: var(--syn-typ); }
+.syn-fn  { color: var(--syn-fn); }
+.syn-key { color: var(--syn-key); }
+.syn-var { color: var(--syn-var); }
 
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; }
@@ -73,9 +99,32 @@ main { flex: 1; overflow: hidden; min-height: 0; }
 .workspace { display: flex; height: 100%; min-height: 0; }
 .right { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
 
+/* The files pane's width is state, set inline by App; the chat takes the
+   rest. Only the pane is sized here — `.files` fills whatever it is given. */
+.files-pane { flex-shrink: 0; min-width: 0; display: flex; }
+
+/* A four-pixel target is too small to hit, so the handle is padded outward
+   with a transparent hit area and only the middle is painted. */
+.splitter {
+  flex: 0 0 9px; margin: 0 -3px; z-index: 3;
+  cursor: col-resize; position: relative;
+  background: transparent; touch-action: none;
+}
+.splitter::after {
+  content: ''; position: absolute; top: 0; bottom: 0; left: 4px; width: 1px;
+  background: var(--line);
+}
+.splitter:hover::after, .splitter.dragging::after {
+  background: var(--accent); width: 2px; left: 3.5px;
+}
+/* While dragging, the pointer is captured — stop the text under it from
+   selecting as the cursor sweeps across the panes. */
+.splitter.dragging { cursor: col-resize; }
+body:has(.splitter.dragging) { user-select: none; }
+
 /* --- files ------------------------------------------------------------- */
 .files {
-  display: flex; width: 44%; min-width: 340px; max-width: 620px;
+  display: flex; width: 100%; min-width: 0;
   border-right: 1px solid var(--line); min-height: 0;
 }
 .tree {
@@ -118,8 +167,82 @@ main { flex: 1; overflow: hidden; min-height: 0; }
 .lineno { color: var(--muted); min-width: 36px; text-align: right; user-select: none; flex-shrink: 0; }
 .linetext { white-space: pre; }
 
+/* --- the editor --------------------------------------------------------- */
+/* A textarea with transparent text sitting exactly on top of a highlighted
+   copy of the same text. The two layers agree only because every metric
+   below is shared: font, size, line-height, padding, tab size. Changing one
+   of them in one place and not the other is how this drifts out of
+   alignment, so they are written together, here. */
+.editor { flex: 1; display: flex; min-height: 0; overflow: hidden; }
+.editor-gutter {
+  flex-shrink: 0; width: 48px; overflow: hidden;
+  padding: 6px 8px 6px 0; text-align: right;
+  font-family: var(--mono); font-size: 12px; line-height: 1.5;
+  color: var(--muted); user-select: none;
+  background: var(--panel); border-right: 1px solid var(--line-soft);
+}
+.editor-body { position: relative; flex: 1; min-width: 0; }
+.editor-highlight,
+.editor-input {
+  position: absolute; inset: 0;
+  margin: 0; padding: 6px 10px; border: 0;
+  font-family: var(--mono); font-size: 12px; line-height: 1.5;
+  white-space: pre; tab-size: 2;
+}
+.editor-highlight { overflow: hidden; pointer-events: none; color: var(--text); }
+/* No min-height here on purpose: a row's height must come from the same
+   line-height the textarea uses, never from a number repeated next to it. An
+   empty line still renders a space (see `Painted`), so it has a row. */
+.editor-input {
+  width: 100%; height: 100%; resize: none; overflow: auto;
+  background: transparent; color: transparent; caret-color: var(--accent);
+}
+.editor-input:focus { outline: none; }
+/* The text is transparent, but the selection layer is not — this is what a
+   selection looks like when there is no visible text to invert. */
+.editor-input::selection { background: #2c4f7c; }
+
+.dirty-dot { color: var(--warn); }
+.warn-banner.small { display: flex; align-items: center; gap: 8px; margin: 8px 10px; }
+
 /* --- chat -------------------------------------------------------------- */
 .chat { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+
+/* Which chat you are in, and the way to another one. A popover rather than a
+   sidebar: switching threads is occasional, and the left edge is spoken for. */
+.chat-bar {
+  position: relative; flex-shrink: 0;
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px 6px 14px;
+  background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.chat-title {
+  flex: 1; min-width: 0; text-align: left;
+  background: transparent; border-color: transparent;
+  font-weight: 600; font-size: 12.5px;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.chat-title:disabled { opacity: 1; }
+.chat-title-input {
+  flex: 1; min-width: 0; font-family: inherit !important; font-weight: 600;
+}
+.chat-menu {
+  position: absolute; top: calc(100% + 4px); right: 8px; z-index: 20;
+  width: min(360px, calc(100% - 16px));
+  max-height: 340px; overflow: auto;
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 4px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.5);
+}
+.chat-menu-row {
+  display: flex; flex-direction: column; gap: 1px;
+  padding: 6px 9px; border-radius: 5px; cursor: pointer;
+}
+.chat-menu-row:hover { background: var(--panel); }
+.chat-menu-row.active { background: var(--panel); box-shadow: inset 2px 0 0 var(--accent); }
+.chat-menu-title {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .chat-scroll { flex: 1; overflow: auto; padding: 14px; display: flex; flex-direction: column; gap: 12px; }
 
 .bubble {
@@ -171,6 +294,17 @@ main { flex: 1; overflow: hidden; min-height: 0; }
   padding: 8px; border-radius: 5px; font-family: var(--mono); font-size: 11.5px;
 }
 .approval-args .lineno { display: inline-block; width: 30px; }
+
+/* The proposed write, as a diff against disk. Boxed and capped the way the
+   plain preview it replaced was — this sits inside a chat bubble, not a full
+   review pane, and a wide diff must scroll inside its own box rather than
+   push the composer off the bottom of the screen. */
+.approval-diff {
+  max-height: 320px; overflow: auto; border-radius: 5px;
+  border: 1px solid var(--line-soft); margin: 6px 0;
+}
+.approval-diff .diff { font-size: 11px; }
+
 .approval-confinement { margin: 8px 0; }
 
 .logbox { border-top: 1px solid var(--line-soft); padding-top: 8px; }
@@ -214,12 +348,44 @@ main { flex: 1; overflow: hidden; min-height: 0; }
   border-bottom: 1px solid var(--line);
 }
 .hunk-head:hover { background: var(--panel-2); }
+/* The diff reads like a code host's: numbers from both sides, the marker in
+   its own column, and syntax colour on a tinted row rather than one flat
+   green or red — the tint says what happened to the line, the colour still
+   says what the line is. */
 .diff { margin: 0; font-family: var(--mono); font-size: 11.5px; overflow-x: auto; }
-.diff > div { padding: 0 10px; white-space: pre; }
-.dl-add { background: var(--add-bg); color: #9fe3ba; }
-.dl-del { background: var(--del-bg); color: #f0a8a4; }
+.dl { display: flex; min-width: max-content; }
+.dl-no {
+  width: 44px; flex-shrink: 0; padding: 0 8px 0 0;
+  text-align: right; color: var(--muted); opacity: .75;
+  /* Not part of the code: dragging across a diff and copying must give the
+     lines, not a column of numbers welded to the front of each one. */
+  user-select: none;
+}
+.dl-mark {
+  width: 16px; flex-shrink: 0; text-align: center;
+  user-select: none; opacity: .8;
+}
+.dl-text { white-space: pre; padding-right: 12px; }
+
+.dl-add { background: var(--add-bg); }
+.dl-del { background: var(--del-bg); }
+.dl-add .dl-mark { color: var(--ok); }
+.dl-del .dl-mark { color: var(--bad); }
+.dl-add .dl-no { background: rgba(63, 185, 80, .10); }
+.dl-del .dl-no { background: rgba(248, 81, 73, .10); }
 .dl-meta { color: var(--accent); background: var(--panel); }
-.dl-ctx { color: var(--muted); }
+.dl-meta .dl-text { color: var(--accent); opacity: .85; }
+.dl-ctx .dl-text { opacity: .82; }
+
+/* Exactly what changed inside a line that was edited rather than replaced.
+   A background, not a colour, so it composes with the syntax colour instead
+   of overwriting it. */
+.word-add { background: var(--word-add); border-radius: 2px; }
+.word-del { background: var(--word-del); border-radius: 2px; }
+
+.hunk-stat { display: flex; gap: 6px; font-family: var(--mono); font-size: 11px; }
+.stat-add { color: var(--ok); }
+.stat-del { color: var(--bad); }
 
 /* --- trace / routing --------------------------------------------------- */
 .totals { display: flex; gap: 18px; padding-bottom: 10px; border-bottom: 1px solid var(--line); margin-bottom: 10px; }

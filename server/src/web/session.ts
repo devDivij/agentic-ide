@@ -16,6 +16,7 @@ import {
   type Agent, type TaskOutcome,
 } from '../agent/orchestrator.ts';
 import { scoreTask } from '../agent/router.ts';
+import { terminate } from '../agent/shell.ts';
 import { describeEffect } from '../agent/tools.ts';
 import type { ApprovalDecision, ToolCall } from '../agent/types.ts';
 import type { ApprovalRequest, ServerEvent, StepWire } from '../shared/types.ts';
@@ -47,8 +48,12 @@ export class Session {
    * handler does not await this — the client learns the outcome from the
    * event stream, so a long task never holds a request open.
    */
-  async run(prompt: string, resumeTaskId?: string): Promise<TaskOutcome> {
+  async run(
+    prompt: string,
+    opts: { resumeTaskId?: string; conversationId?: string } = {},
+  ): Promise<TaskOutcome> {
     if (this.isRunning) throw new Error('A task is already running in this project.');
+    const { resumeTaskId } = opts;
 
     this.bus.reset();
     this.streamed.clear();
@@ -73,8 +78,11 @@ export class Session {
 
     this.startPump();
     try {
-      const outcome = await runTask(this.agent, prompt,
-        resumeTaskId ? { resumeTaskId } : {});
+      const outcome = await runTask(this.agent, prompt, resumeTaskId
+        ? { resumeTaskId }
+        // Resume reads the conversation back off the task row, so it must not
+        // be told one here: the chat a task belongs to is decided once.
+        : { ...(opts.conversationId ? { conversationId: opts.conversationId } : {}) });
       this.currentTaskId = outcome.taskId;
       this.flush();
       this.publish({
@@ -157,9 +165,7 @@ export class Session {
   close(): void {
     this.stopPump();
     if (this.agent) stopBackground(this.agent);
-    for (const child of this.background.splice(0)) {
-      try { child.kill('SIGTERM'); } catch { /* already gone */ }
-    }
+    for (const child of this.background.splice(0)) terminate(child);
     this.agent?.db.close();
     this.agent = null;
   }
@@ -213,7 +219,8 @@ export class Session {
       this.publish({
         type: 'task',
         task: {
-          id: task.id, prompt: task.prompt, status: task.status,
+          id: task.id, conversationId: task.conversationId,
+          prompt: task.prompt, status: task.status,
           complexity: task.complexity, createdAt: task.createdAt,
           costUsd: totals.costUsd, tokens: totals.tokens,
           elapsedMs: Date.now() - task.createdAt,
@@ -222,7 +229,15 @@ export class Session {
     }
   }
 
+  /**
+   * Stamp every event with the project it came from.
+   *
+   * The bus is one process-wide fan-out shared by every open project, so a
+   * task still running in the folder you just left publishes into the same
+   * stream as the one you just opened. The browser drops what does not match
+   * the project on screen; without the stamp it could not tell.
+   */
   private publish(event: ServerEvent): void {
-    this.bus.publish(event);
+    this.bus.publish({ ...event, projectRoot: this.projectRoot });
   }
 }

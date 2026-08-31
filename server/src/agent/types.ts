@@ -31,9 +31,24 @@ export type Complexity = 'easy' | 'medium' | 'hard';
 
 export type TaskStatus = 'running' | 'awaiting_review' | 'done' | 'aborted' | 'failed';
 
+/** A chat: the thread of tasks a person thinks of as one conversation. */
+export interface Conversation {
+  id: string;
+  title: string;
+  createdAt: number;
+  taskCount: number;
+  lastActivityAt: number;
+}
+
 export interface Task {
   id: string;
   projectRoot: string;
+  /**
+   * The chat this task belongs to. Read back from the row on resume, so an
+   * interrupted task rejoins the conversation it started in without the
+   * caller having to remember which one that was.
+   */
+  conversationId: string;
   prompt: string;
   status: TaskStatus;
   complexity: Complexity;

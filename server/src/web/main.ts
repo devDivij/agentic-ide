@@ -14,13 +14,13 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { existsSync } from 'node:fs';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, extname, join, resolve, sep } from 'node:path';
 
 import { PROVIDERS, assertLegalCatalogue } from '../agent/providers.ts';
 import { Router } from '../agent/router.ts';
-import { Store } from '../agent/store.ts';
+import { conversationTitle, Store } from '../agent/store.ts';
 import { confinePath } from '../agent/paths.ts';
 import { IGNORED_DIRS } from '../agent/retrieval.ts';
 import { askAside } from '../agent/workers.ts';
@@ -125,7 +125,8 @@ const routes: Array<{ method: string; pattern: RegExp; handle: Handler }> = [
   {
     method: 'POST', pattern: /^\/api\/tasks$/,
     handle: async (req, res) => {
-      const body = await readJson(req) as { projectRoot?: string; prompt?: string };
+      const body = await readJson(req) as
+        { projectRoot?: string; prompt?: string; conversationId?: string };
       if (!body.projectRoot || !body.prompt) {
         return json(res, 400, { error: 'projectRoot and prompt are required' });
       }
@@ -136,11 +137,19 @@ const routes: Array<{ method: string; pattern: RegExp; handle: Handler }> = [
       const session = sessionFor(root);
       if (session.isRunning) return json(res, 409, { error: 'A task is already running.' });
 
+      // The chat is settled here rather than inside the task, because the
+      // browser needs its id in this response: it has to know which
+      // conversation to show long before the task produces its first event.
+      const conversationId = resolveConversation(root, body.conversationId, body.prompt);
+
       // Not awaited: the client follows progress on the event stream.
-      session.run(body.prompt).catch((err: Error) => {
-        bus.publish({ type: 'log', taskId: null, level: 'error', message: err.message });
+      session.run(body.prompt, { conversationId }).catch((err: Error) => {
+        bus.publish({
+          type: 'log', projectRoot: root, taskId: null,
+          level: 'error', message: err.message,
+        });
       });
-      json(res, 202, { accepted: true });
+      json(res, 202, { accepted: true, conversationId });
     },
   },
   {
@@ -153,8 +162,11 @@ const routes: Array<{ method: string; pattern: RegExp; handle: Handler }> = [
       const session = sessionFor(root);
       if (session.isRunning) return json(res, 409, { error: 'A task is already running.' });
 
-      session.run('', decodeURIComponent(m[1]!)).catch((err: Error) => {
-        bus.publish({ type: 'log', taskId: null, level: 'error', message: err.message });
+      session.run('', { resumeTaskId: decodeURIComponent(m[1]!) }).catch((err: Error) => {
+        bus.publish({
+          type: 'log', projectRoot: root, taskId: null,
+          level: 'error', message: err.message,
+        });
       });
       json(res, 202, { accepted: true });
     },
@@ -164,15 +176,20 @@ const routes: Array<{ method: string; pattern: RegExp; handle: Handler }> = [
     handle: async (_req, res, _m, url) => {
       const projectRoot = url.searchParams.get('projectRoot');
       if (!projectRoot) return json(res, 400, { error: 'projectRoot required' });
+      const conversationId = url.searchParams.get('conversationId');
       const root = resolve(projectRoot);
       const db = new Store(root);
       try {
         const running = sessions.get(root)?.isRunning ?? false;
-        const tasks = db.listTasks(root).map((t) => {
+        // No conversation named means a chat that has not been started yet:
+        // an empty timeline, not the whole project's history.
+        const rows = conversationId ? db.listConversationTasks(conversationId) : [];
+        const tasks = rows.map((t) => {
           const totals = db.totals(t.id);
           const steps = db.getSteps(t.id);
           return {
-            id: t.id, prompt: t.prompt, status: t.status,
+            id: t.id, conversationId: t.conversationId,
+            prompt: t.prompt, status: t.status,
             complexity: t.complexity, createdAt: t.createdAt,
             costUsd: totals.costUsd, tokens: totals.tokens,
             elapsedMs: totals.durationMs,
@@ -197,6 +214,38 @@ const routes: Array<{ method: string; pattern: RegExp; handle: Handler }> = [
       try {
         const taskId = decodeURIComponent(m[1]!);
         json(res, 200, { events: db.getEvents(taskId), totals: db.totals(taskId) });
+      } finally {
+        db.close();
+      }
+    },
+  },
+
+  // -- conversations (chats) -------------------------------------------------
+  {
+    method: 'GET', pattern: /^\/api\/conversations$/,
+    handle: async (_req, res, _m, url) => {
+      const projectRoot = url.searchParams.get('projectRoot');
+      if (!projectRoot) return json(res, 400, { error: 'projectRoot required' });
+      const root = resolve(projectRoot);
+      const db = new Store(root);
+      try {
+        json(res, 200, { conversations: db.listConversations(root) });
+      } finally {
+        db.close();
+      }
+    },
+  },
+  {
+    method: 'PUT', pattern: /^\/api\/conversations\/([^/]+)$/,
+    handle: async (req, res, m) => {
+      const body = await readJson(req) as { projectRoot?: string; title?: string };
+      if (!body.projectRoot || !body.title?.trim()) {
+        return json(res, 400, { error: 'projectRoot and title are required' });
+      }
+      const db = new Store(resolve(body.projectRoot));
+      try {
+        db.renameConversation(decodeURIComponent(m[1]!), body.title.trim().slice(0, 120));
+        json(res, 200, { ok: true });
       } finally {
         db.close();
       }
@@ -255,7 +304,8 @@ const routes: Array<{ method: string; pattern: RegExp; handle: Handler }> = [
         const result = await applySelection(
           resolve(body.projectRoot), decodeURIComponent(m[1]!), body.acceptedHunkIds ?? []);
         bus.publish({
-          type: 'log', taskId: decodeURIComponent(m[1]!), level: 'info',
+          type: 'log', projectRoot: resolve(body.projectRoot),
+          taskId: decodeURIComponent(m[1]!), level: 'info',
           message: `Applied ${result.applied} hunk(s), rejected ${result.rejected}.`,
         });
         json(res, 200, result);
@@ -335,6 +385,40 @@ const routes: Array<{ method: string; pattern: RegExp; handle: Handler }> = [
       if (!projectRoot) return json(res, 400, { error: 'projectRoot required' });
       try {
         json(res, 200, await listDirectory(resolve(projectRoot), path));
+      } catch (err) {
+        json(res, 400, { error: (err as Error).message });
+      }
+    },
+  },
+  {
+    /**
+     * Save an edit made in the built-in editor.
+     *
+     * Confined exactly like reading is: an opened project, never `.agentzero`.
+     * One honest caveat, which the UI shows rather than hides — a file saved
+     * while a task is running lands inside that task's `base..head` diff, so
+     * the review screen will offer your own edit back to you as if the agent
+     * had made it.
+     */
+    method: 'PUT', pattern: /^\/api\/file$/,
+    handle: async (req, res) => {
+      const body = await readJson(req) as
+        { projectRoot?: string; path?: string; content?: string };
+      if (!body.projectRoot || !body.path || typeof body.content !== 'string') {
+        return json(res, 400, { error: 'projectRoot, path and content are required' });
+      }
+      const root = resolve(body.projectRoot);
+      try {
+        const abs = await confine(root, body.path);
+        await mkdir(dirname(abs), { recursive: true });
+        await writeFile(abs, body.content, 'utf8');
+        // Same signal the agent's own writes raise, so the tree and any other
+        // open view refresh themselves.
+        bus.publish({
+          type: 'log', projectRoot: root, taskId: null, level: 'info',
+          message: `Saved ${body.path}`,
+        });
+        json(res, 200, { path: body.path, bytes: Buffer.byteLength(body.content) });
       } catch (err) {
         json(res, 400, { error: (err as Error).message });
       }
@@ -434,6 +518,28 @@ function serveStatic(pathname: string, res: ServerResponse): void {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * The chat a new task belongs to: the one named, or a fresh one titled after
+ * the prompt. An unknown id is treated as absent rather than as an error —
+ * a browser holding the id of a chat from a database that has since been
+ * deleted should start a new chat, not fail to send.
+ */
+function resolveConversation(
+  root: string, requested: string | undefined, prompt: string,
+): string {
+  // Unlike its read-only neighbours, this opens a connection in order to
+  // WRITE, and closes it before the session opens its own and starts
+  // inserting tasks. Sequential by construction, which is what keeps one
+  // SQLite file with two connections uneventful.
+  const db = new Store(root);
+  try {
+    if (requested && db.hasConversation(requested)) return requested;
+    return db.createConversation(root, conversationTitle(prompt));
+  } finally {
+    db.close();
+  }
+}
 
 function rememberProject(root: string): void {
   openedProjects.add(root);

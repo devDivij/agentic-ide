@@ -15,6 +15,8 @@ export type TaskStatusWire =
 
 export interface TaskSummary {
   id: string;
+  /** The chat this task belongs to. */
+  conversationId: string;
   prompt: string;
   status: TaskStatusWire;
   complexity: 'easy' | 'medium' | 'hard';
@@ -62,7 +64,16 @@ export interface FailureInfo {
 
 /** Payload of a `step_end` trace node. */
 export interface StepEndPayload {
-  outcome: 'done' | 'failed';
+  outcome: 'done' | 'failed' | 'skipped';
+  /**
+   * For a skipped step: the dependencies that never completed.
+   *
+   * A skipped step used to leave no event at all — it was marked in the steps
+   * table and mentioned in the progress log, so the trace the UI rebuilds
+   * from simply had a hole where the step should be, and a task could report
+   * fewer steps than it planned with nothing saying where they went.
+   */
+  blockedBy?: string[];
   sha?: string;
   attempts?: number;
   failure?: FailureInfo;
@@ -115,6 +126,30 @@ export interface TaskEndPayload {
    * answer is otherwise buried in a fact table.
    */
   links?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Conversations (chats)
+// ---------------------------------------------------------------------------
+
+/**
+ * One chat: an ordered group of tasks the user considers a single thread of
+ * work. A project accumulates many, and the chat panel shows one at a time —
+ * "everything this project has ever run" stopped being a conversation and
+ * started being an archive at about the fifth task.
+ *
+ * A conversation is created by the first task sent into it, never by the
+ * button that starts it. Pressing "New chat" and then changing your mind
+ * therefore leaves nothing behind to clean up.
+ */
+export interface ConversationWire {
+  id: string;
+  /** Derived from the first prompt; what the picker lists it under. */
+  title: string;
+  createdAt: number;
+  taskCount: number;
+  /** When its newest task started — the order people actually look for. */
+  lastActivityAt: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +300,7 @@ export interface AsideBubble {
 // The event envelope pushed over the SSE stream
 // ---------------------------------------------------------------------------
 
-export type ServerEvent =
+type ServerEventBody =
   | { type: 'trace'; node: TraceNode }
   | { type: 'task'; task: TaskSummary }
   | { type: 'steps'; taskId: string; steps: StepWire[] }
@@ -275,3 +310,17 @@ export type ServerEvent =
   | { type: 'approval_resolved'; eventId: number }
   | { type: 'aside'; aside: AsideBubble }
   | { type: 'log'; taskId: string | null; level: 'info' | 'warn' | 'error'; message: string };
+
+/**
+ * Every event carries the project it came from.
+ *
+ * The event bus is one process-wide fan-out, so a task still running in the
+ * project you just closed keeps publishing into the same stream as the one
+ * you just opened. Without this stamp the browser had no way to tell the two
+ * apart, and the old project's task, trace and approvals reappeared in the
+ * new project's chat seconds after switching.
+ *
+ * `projectRoot` is absent on events that genuinely belong to no project — a
+ * /bytheway answer, a startup error — and those are shown wherever you are.
+ */
+export type ServerEvent = ServerEventBody & { projectRoot?: string };

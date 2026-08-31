@@ -22,6 +22,15 @@ export interface LogLine {
 }
 
 export interface AppState {
+  /**
+   * The project this state describes. Every event is checked against it: the
+   * server's event bus is one process-wide stream shared by every open
+   * project, so a task still running in the folder you just left keeps
+   * publishing into it. Without this the old project's task, trace and
+   * approvals reappeared in the new project's chat within a second of
+   * switching, and the chat looked like it had never changed directory.
+   */
+  projectRoot: string;
   task: TaskSummary | null;
   steps: StepWire[];
   trace: TraceNode[];
@@ -39,17 +48,35 @@ export interface AppState {
   filesChangedAt: number;
 }
 
-const EMPTY: AppState = {
+const EMPTY: Omit<AppState, 'projectRoot'> = {
   task: null, steps: [], trace: [], routing: [], logs: [], approvals: [],
   asides: [], filesChangedAt: 0,
 };
 
-type Action =
+/** A project's state before anything has happened in it. */
+export function initialState(projectRoot: string): AppState {
+  return { ...EMPTY, projectRoot };
+}
+
+export type Action =
   | { type: 'event'; event: ServerEvent }
+  | { type: 'project'; projectRoot: string }
   | { type: 'approval_resolved'; eventId: number }
   | { type: 'local_log'; level: LogLine['level']; message: string };
 
-function reduce(state: AppState, action: Action): AppState {
+/**
+ * Exported for the test suite: which events reach the screen and what
+ * survives a change of project is the whole behaviour of this module, and it
+ * is decided here, in a pure function, on purpose.
+ */
+export function reduce(state: AppState, action: Action): AppState {
+  if (action.type === 'project') {
+    // Opening a different project starts from nothing. Keeping the previous
+    // project's timeline while pointing at new files is the bug this fixes.
+    return action.projectRoot === state.projectRoot
+      ? state
+      : { ...EMPTY, projectRoot: action.projectRoot };
+  }
   if (action.type === 'local_log') {
     // Client-side failures join the same stream as server ones, so the user
     // never has to open a console to find out why nothing happened.
@@ -61,6 +88,10 @@ function reduce(state: AppState, action: Action): AppState {
   }
 
   const event = action.event;
+  // Events with no project belong to no project — a /bytheway answer, a
+  // startup error — and are shown wherever you happen to be.
+  if (event.projectRoot !== undefined && event.projectRoot !== state.projectRoot) return state;
+
   switch (event.type) {
     case 'trace': {
       // The stream replays history on connect, so guard against duplicates.
@@ -106,13 +137,20 @@ function pushCapped(logs: LogLine[], line: LogLine): LogLine[] {
   return [...logs, line].slice(-500);
 }
 
-export function useAgentStream(): {
+export function useAgentStream(projectRoot: string): {
   state: AppState;
   clearApproval: (eventId: number) => void;
   pushLog: (level: LogLine['level'], message: string) => void;
 } {
-  const [state, dispatch] = useReducer(reduce, EMPTY);
+  // Seeded with the project rather than reset into it, so there is no first
+  // render during which every incoming event is judged against an empty root.
+  const [state, dispatch] = useReducer(reduce, projectRoot, initialState);
 
+  useEffect(() => { dispatch({ type: 'project', projectRoot }); }, [projectRoot]);
+
+  // One subscription for the life of the page: the reducer does the filtering
+  // from state, so the callback never closes over a project root that goes
+  // stale underneath it.
   useEffect(() => subscribe((event) => dispatch({ type: 'event', event })), []);
 
   return {
