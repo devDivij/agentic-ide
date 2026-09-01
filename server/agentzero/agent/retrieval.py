@@ -193,17 +193,31 @@ def build_locagent_graph(files: list[SourceFile]) -> CodeGraph:
                 continue
 
             func_match = _FUNC_RE.match(line)
+            is_indented = line.startswith(" ") or line.startswith("\t")
+
             if func_match:
-                if current_entity is not None:
-                    current_entity.end_line = i
-                func_name = func_match.group(1) or func_match.group(2)
-                func_id = f"{file.path}:{func_name}"
-                current_entity = GraphNode(
-                    id=func_id, type="function", name=func_name, file_path=file.path,
-                    start_line=i + 1, end_line=len(file.lines), code="")
-                graph.add_node(current_entity)
-                graph.add_edge(file.path, func_id, "contains")
-                continue
+                if is_indented and current_entity is not None and current_entity.type == "class":
+                    # It's an indented function inside a class, treat as a method
+                    method_name = func_match.group(1) or func_match.group(2)
+                    method_id = f"{file.path}:{current_entity.name}.{method_name}"
+                    graph.add_node(GraphNode(
+                        id=method_id, type="function", name=method_name,
+                        file_path=file.path, start_line=i + 1,
+                        end_line=i + 10,
+                        code=""))
+                    graph.add_edge(current_entity.id, method_id, "contains")
+                    continue
+                else:
+                    if current_entity is not None:
+                        current_entity.end_line = i
+                    func_name = func_match.group(1) or func_match.group(2)
+                    func_id = f"{file.path}:{func_name}"
+                    current_entity = GraphNode(
+                        id=func_id, type="function", name=func_name, file_path=file.path,
+                        start_line=i + 1, end_line=len(file.lines), code="")
+                    graph.add_node(current_entity)
+                    graph.add_edge(file.path, func_id, "contains")
+                    continue
 
             method_match = _METHOD_RE.match(line)
             if method_match and current_entity is not None and current_entity.type == "class":
@@ -240,6 +254,67 @@ STOPWORDS = {
     "of", "is", "be", "can", "will", "just", "also", "some", "any", "all",
 }
 
+TASK_INSTRUCTION = """
+Given the following GitHub problem description, your objective is to localize the specific files, classes or functions, and lines of code that need modification or contain key information to resolve the issue.
+
+Follow these steps to localize the issue:
+## Step 1: Categorize and Extract Key Problem Information
+ - Classify the problem statement into the following categories:
+    Problem description, error trace, code to reproduce the bug, and additional context.
+ - Identify modules in the '{package_name}' package mentioned in each category.
+ - Use extracted keywords and line numbers to search for relevant code references for additional context.
+
+## Step 2: Locate Referenced Modules
+- Accurately determine specific modules
+    - Explore the repo to familiarize yourself with its structure.
+    - Analyze the described execution flow to identify specific modules or components being referenced.
+- Pay special attention to distinguishing between modules with similar names using context and described execution flow.
+- Output Format for collected relevant modules:
+    - Use the format: 'file_path:QualifiedName'
+    - E.g., for a function `calculate_sum` in the `MathUtils` class located in `src/helpers/math_helpers.py`, represent it as: 'src/helpers/math_helpers.py:MathUtils.calculate_sum'.
+
+## Step 3: Analyze and Reproducing the Problem
+- Clarify the Purpose of the Issue
+    - If expanding capabilities: Identify where and how to incorporate new behavior, fields, or modules.
+    - If addressing unexpected behavior: Focus on localizing modules containing potential bugs.
+- Reconstruct the execution flow
+    - Identify main entry points triggering the issue.
+    - Trace function calls, class interactions, and sequences of events.
+    - Identify potential breakpoints causing the issue.
+    Important: Keep the reconstructed flow focused on the problem, avoiding irrelevant details.
+
+## Step 4: Locate Areas for Modification
+- Locate specific files, functions, or lines of code requiring changes or containing critical information for resolving the issue.
+- Consider upstream and downstream dependencies that may affect or be affected by the issue.
+- If applicable, identify where to introduce new fields, functions, or variables.
+- Think Thoroughly: List multiple potential solutions and consider edge cases that could impact the resolution.
+
+## Output Format for Final Results:
+Your final output should list the locations requiring modification, wrapped with triple backticks ```
+Each location should include the file path, class name (if applicable), function name, or line numbers, ordered by importance.
+Your answer would better include about 5 files.
+
+### Examples:
+```
+full_path1/file1.py
+line: 10
+class: MyClass1
+function: my_function1
+
+full_path2/file2.py
+line: 76
+function: MyClass2.my_function2
+
+full_path3/file3.py
+line: 24
+line: 156
+function: my_function3
+```
+
+Return just the location(s)
+
+Note: Your thinking should be thorough and so it's fine if it's very long.
+"""
 
 class LineMatch(Data):
     path: str
@@ -399,23 +474,19 @@ class Retriever:
         initial = self.search_entity(terms)
         expanded = self.traverse_graph([e.id for e in initial], 1)
 
+        if not expanded:
+            return chunks
+
         if getattr(self, "agent", None) is not None:
-            import sys
-            import os
-            locagent_path = os.path.join(self.project_root, "LocAgent")
-            if locagent_path not in sys.path:
-                sys.path.append(locagent_path)
-            from util.prompts.pipelines.auto_search_prompt import TASK_INSTRUECTION
-            
-            from agentzero.agent.call import call_model
-            from agentzero.agent.context import BuiltContext
-            from agentzero.agent.llm import ChatMessage
+            from .call import call_model
+            from .context import BuiltContext
+            from .llm import ChatMessage
             from pydantic import BaseModel, Field
 
             class RankedEntities(BaseModel):
                 entity_ids: list[str] = Field(description="The IDs of the entities most relevant to the query.")
 
-            prompt = TASK_INSTRUECTION.format(package_name="project") + "\n\n"
+            prompt = TASK_INSTRUCTION.format(package_name="project") + "\n\n"
             prompt += f"Issue:\n{query}\n\nCandidate locations:\n"
             for node in expanded:
                 prompt += f"- {node.id}\n"
@@ -430,7 +501,7 @@ class Retriever:
                 result = call_model(
                     self.agent,
                     task_id=task_id or "locagent_retrieval",
-                    role="planner",
+                    role="plan",
                     context=context,
                     schema=RankedEntities,
                     max_tokens=2048,
