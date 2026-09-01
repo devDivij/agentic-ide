@@ -119,7 +119,7 @@ def create_agent(
     assert_git_available()
     assert_shell_available()          # both, before a task can half-start
 
-    return Agent(
+    agent = Agent(
         project_root=project_root,
         db=Store(project_root),
         router=Router(set(keys.keys()), on_route),
@@ -135,6 +135,8 @@ def create_agent(
         # ended rather than waited out -- otherwise Stop could take 75 seconds.
         cancel=CancelToken(),
     )
+    agent.retriever.agent = agent
+    return agent
 
 
 def request_stop(agent: Agent) -> None:
@@ -295,7 +297,7 @@ def run_task(agent: Agent, prompt: str, *, resume_task_id: str | None = None,
                 # is headroom, not a real constraint -- but a lookup answer
                 # needs less code in view than a plan does, and there is no
                 # reason to spend the extra tokens.
-                chunks = agent.retriever.retrieve(task.prompt, [], 6)
+                chunks = agent.retriever.retrieve(task.prompt, [], 6, task_id=task.id)
                 db.append_event(NewEvent(
                     task_id=task.id, parent_id=root_id, kind="tool_call",
                     payload={"tool": "retrieve",
@@ -348,7 +350,7 @@ def run_task(agent: Agent, prompt: str, *, resume_task_id: str | None = None,
                     "summary": f"A direct, single-step change: {task.prompt}"})
                 _report(agent, "Single-step change — skipping planning.")
             else:
-                seed_chunks = agent.retriever.retrieve(task.prompt, [], 10)
+                seed_chunks = agent.retriever.retrieve(task.prompt, [], 10, task_id=task.id)
                 db.append_event(NewEvent(
                     task_id=task.id, parent_id=root_id, kind="tool_call",
                     payload={"tool": "retrieve",
@@ -637,7 +639,7 @@ def _replan(agent: Agent, task: Task, old_plan: Plan, failed_step: PlanStep,
         f"{problem}\n\nBreak down what remains differently — smaller steps, or a "
         "different approach to the part that failed.")
 
-    seed_chunks = agent.retriever.retrieve(replan_prompt, [], 10)
+    seed_chunks = agent.retriever.retrieve(replan_prompt, [], 10, task_id=task.id)
     db.append_event(NewEvent(
         task_id=task.id, parent_id=root_id, kind="tool_call",
         payload={"tool": "replan",
@@ -1072,7 +1074,7 @@ def _execute_step_turns(agent: Agent, task: Task, plan: Plan, step: PlanStep,
     db = agent.db
     facts = db.get_live_facts(task.id)
     chunks = agent.retriever.retrieve(
-        f"{step.intent} {' '.join(step.acceptance_criteria)}", step.target_files, 8)
+        f"{step.intent} {' '.join(step.acceptance_criteria)}", step.target_files, 8, task_id=task.id)
     project_files = agent.retriever.list_paths()
     recent_outcomes = [
         f"{s.step_id}: {s.spec.intent} — done"

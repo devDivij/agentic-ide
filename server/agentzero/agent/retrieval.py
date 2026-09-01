@@ -324,6 +324,7 @@ class Retriever:
         self.project_root = project_root
         self._cache: list[SourceFile] | None = None
         self._graph_cache: CodeGraph | None = None
+        self.agent = None
 
     def search_entity(self, keywords: list[str]) -> list[GraphNode]:
         """LocAgent: SearchEntity."""
@@ -378,7 +379,7 @@ class Retriever:
         return chunks
 
     def retrieve(self, query: str, hint_paths: list[str] | None = None,
-                 max_chunks: int = 10) -> list[CodeChunk]:
+                 max_chunks: int = 10, task_id: str = "") -> list[CodeChunk]:
         chunks: list[CodeChunk] = []
         seen: set[str] = set()
 
@@ -398,13 +399,58 @@ class Retriever:
         initial = self.search_entity(terms)
         expanded = self.traverse_graph([e.id for e in initial], 1)
 
-        lowered = [t.lower() for t in terms]
+        if getattr(self, "agent", None) is not None:
+            import sys
+            import os
+            locagent_path = os.path.join(self.project_root, "LocAgent")
+            if locagent_path not in sys.path:
+                sys.path.append(locagent_path)
+            from util.prompts.pipelines.auto_search_prompt import TASK_INSTRUECTION
+            
+            from agentzero.agent.call import call_model
+            from agentzero.agent.context import BuiltContext
+            from agentzero.agent.llm import ChatMessage
+            from pydantic import BaseModel, Field
 
-        def closeness(node: GraphNode) -> int:
-            name = node.name.lower()
-            return -sum(1 for term in lowered if term in name)
+            class RankedEntities(BaseModel):
+                entity_ids: list[str] = Field(description="The IDs of the entities most relevant to the query.")
 
-        expanded.sort(key=closeness)
+            prompt = TASK_INSTRUECTION.format(package_name="project") + "\n\n"
+            prompt += f"Issue:\n{query}\n\nCandidate locations:\n"
+            for node in expanded:
+                prompt += f"- {node.id}\n"
+            
+            messages = [
+                ChatMessage(role="system", content="You are a code localization agent."),
+                ChatMessage(role="user", content=prompt)
+            ]
+            context = BuiltContext(messages=messages, estimated_tokens=1000, compacted=False, dropped_kinds=[], manifest=[])
+            
+            try:
+                result = call_model(
+                    self.agent,
+                    task_id=task_id or "locagent_retrieval",
+                    role="planner",
+                    context=context,
+                    schema=RankedEntities,
+                    max_tokens=2048,
+                    temperature=0.2
+                )
+                ranked_ids = result.value.entity_ids
+                id_to_node = {n.id: n for n in expanded}
+                expanded = [id_to_node[eid] for eid in ranked_ids if eid in id_to_node]
+            except Exception as e:
+                lowered = [t.lower() for t in terms]
+                def closeness(node: GraphNode) -> int:
+                    name = node.name.lower()
+                    return -sum(1 for term in lowered if term in name)
+                expanded.sort(key=closeness)
+        else:
+            lowered = [t.lower() for t in terms]
+            def closeness(node: GraphNode) -> int:
+                name = node.name.lower()
+                return -sum(1 for term in lowered if term in name)
+            expanded.sort(key=closeness)
 
         for chunk in self.retrieve_entity([e.id for e in expanded]):
             if len(chunks) >= max_chunks:
