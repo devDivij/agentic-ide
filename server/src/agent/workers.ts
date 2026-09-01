@@ -37,13 +37,38 @@ export interface WorkerCtx extends CallDeps {
 const ClassifySchema = z.object({
   complexity: z.enum(['easy', 'medium', 'hard']),
   reason: z.string().default(''),
+  /**
+   * TRIAGE's front door (docs/02a-orchestration-flow.md §3a), all four lanes:
+   *   chat       a greeting, thanks, or question with no implied file change
+   *   lookup     a question ABOUT the code — grounded in retrieval, read-only
+   *   micro_edit a single obvious edit — one ad hoc Step, no PLAN call
+   *   task       anything else — the full plan-then-execute path
+   * Defaults to 'task': the doc's own guard table (§22, "TRIAGE's
+   * misclassification cost is still asymmetric") is why — a false-negative
+   * here just wastes one plan; a false 'chat'/'lookup' silently drops a real
+   * request into a reply that never touches a file, and a false 'micro_edit'
+   * skips a decomposition a genuinely multi-file change needed.
+   */
+  mode: z.enum(['chat', 'lookup', 'micro_edit', 'task']).default('task'),
 });
 
 const CLASSIFY_CONTRACT = `
 Reply with ONLY this JSON object and nothing else:
-{"complexity": "easy" | "medium" | "hard", "reason": "one short sentence"}
+{"complexity": "easy" | "medium" | "hard", "reason": "one short sentence",
+ "mode": "chat" | "lookup" | "micro_edit" | "task"}
 
-Guidance:
+mode:
+  chat        a greeting, thanks, or question with no implied file change
+              (e.g. "hi", "thanks")
+  lookup      a read-only question ABOUT the code or project — answerable by
+              reading, with no file changed (e.g. "what does this function do",
+              "where is the retry logic")
+  micro_edit  one small, obvious, single-file edit that needs no real planning
+              (e.g. "rename this variable", "fix this typo")
+  task        anything else: several files, or the change is not obvious from
+              the request alone
+
+complexity (ignored when mode is "chat" or "lookup"):
   easy    a single obvious edit in one file
   medium  a few related edits, or one edit that needs looking around first
   hard    several files, or the change is not obvious from the request alone
@@ -51,7 +76,10 @@ Guidance:
 
 export async function classifyTask(
   ctx: WorkerCtx, task: Task, parentId: number,
-): Promise<{ complexity: Complexity; reason: string }> {
+): Promise<{
+  complexity: Complexity; reason: string;
+  mode: 'chat' | 'lookup' | 'micro_edit' | 'task';
+}> {
   const { value } = await callModel(ctx, {
     taskId: task.id,
     role: 'classify',
@@ -73,6 +101,66 @@ export async function classifyTask(
     }),
   });
   return value;
+}
+
+// ---------------------------------------------------------------------------
+// answer — TRIAGE's 'chat' and 'lookup' lanes: a direct reply, no plan.
+// The only difference between them is whether retrieved code comes along;
+// one call handles both rather than duplicating the schema and contract.
+// ---------------------------------------------------------------------------
+
+const AnswerSchema = z.object({
+  answer: z.string().min(1),
+  /**
+   * The model's own check on classifyTask's guess. "hi" is unambiguous, but
+   * "can you rename the calc function" is a code change wearing a question
+   * mark, and mode='chat'/'lookup' would answer it in prose instead of doing
+   * it. True promotes the SAME task straight into the plan path — a one-way
+   * edge, same as RESPOND -> SCOPE in the doc: classify is never re-entered.
+   */
+  requiresEdits: z.boolean().default(false),
+});
+
+const ANSWER_CONTRACT = `
+Reply with ONLY this JSON object and nothing else:
+{"answer": "your reply, in plain text", "requiresEdits": true | false}
+
+requiresEdits is true only if actually satisfying this message requires
+changing a file in the project. If it does, "answer" should still be a short
+line acknowledging that (e.g. "Let me make that change.") — it is shown
+before the work starts.
+`.trim();
+
+async function answer(
+  ctx: WorkerCtx, task: Task, parentId: number, chunks?: CodeChunk[],
+): Promise<{ answer: string; requiresEdits: boolean }> {
+  const { value } = await callModel(ctx, {
+    taskId: task.id,
+    role: 'ask',
+    parentId,
+    schema: AnswerSchema,
+    maxTokens: 600,
+    context: buildContext({
+      role: 'ask', prompt: task.prompt,
+      projectRules: ctx.projectRules, outputContract: ANSWER_CONTRACT,
+      ...(chunks && chunks.length > 0 ? { chunks } : {}),
+    }),
+  });
+  return value;
+}
+
+/** TRIAGE's 'chat' lane: no retrieval at all. */
+export async function answerChat(
+  ctx: WorkerCtx, task: Task, parentId: number,
+): Promise<{ answer: string; requiresEdits: boolean }> {
+  return answer(ctx, task, parentId);
+}
+
+/** TRIAGE's 'lookup' lane: grounded in retrieved code, still read-only. */
+export async function answerLookup(
+  ctx: WorkerCtx, task: Task, chunks: CodeChunk[], parentId: number,
+): Promise<{ answer: string; requiresEdits: boolean }> {
+  return answer(ctx, task, parentId, chunks);
 }
 
 // ---------------------------------------------------------------------------

@@ -298,16 +298,33 @@ const routes: Array<{ method: string; pattern: RegExp; handle: Handler }> = [
     method: 'POST', pattern: /^\/api\/tasks\/([^/]+)\/review$/,
     handle: async (req, res, m) => {
       const body = await readJson(req) as
-        { projectRoot?: string; acceptedHunkIds?: string[] };
+        { projectRoot?: string; acceptedHunkIds?: string[]; feedback?: string };
       if (!body.projectRoot) return json(res, 400, { error: 'projectRoot required' });
+      const root = resolve(body.projectRoot);
+      const taskId = decodeURIComponent(m[1]!);
       try {
         const result = await applySelection(
-          resolve(body.projectRoot), decodeURIComponent(m[1]!), body.acceptedHunkIds ?? []);
+          root, taskId, body.acceptedHunkIds ?? [], body.feedback);
         bus.publish({
-          type: 'log', projectRoot: resolve(body.projectRoot),
-          taskId: decodeURIComponent(m[1]!), level: 'info',
+          type: 'log', projectRoot: root, taskId,
+          level: 'info',
           message: `Applied ${result.applied} hunk(s), rejected ${result.rejected}.`,
         });
+        // A rejected hunk's step came back to life (HITL -> SCHEDULE, doc
+        // §15): pick the run back up the same way an interrupted-task resume
+        // does, so the redo streams over SSE like any other run instead of
+        // sitting there until the person separately hits "Resume".
+        if (result.requeuedSteps.length > 0) {
+          const session = sessionFor(root);
+          if (!session.isRunning) {
+            session.run('', { resumeTaskId: taskId }).catch((err: Error) => {
+              bus.publish({
+                type: 'log', projectRoot: root, taskId: null,
+                level: 'error', message: err.message,
+              });
+            });
+          }
+        }
         json(res, 200, result);
       } catch (err) {
         json(res, 400, { error: (err as Error).message });

@@ -40,7 +40,8 @@ import { verifyChanges } from './verify.ts';
 import { CallFailedError } from './call.ts';
 import { TaskCancelledError } from './llm.ts';
 import {
-  classifyTask, diagnoseFailure, executeTurn, makePlan,
+  answerChat, answerLookup, classifyTask, diagnoseFailure, executeTurn, makePlan,
+  normalisePlan, singleStepPlan,
 } from './workers.ts';
 
 /** Turns one executor step may take before we call it stuck. */
@@ -255,32 +256,104 @@ export async function runTask(
 
   try {
     // --- classify (skipped on resume: already done and paid for) ------------
+    // A resumed task is always mid-plan or mid-step by construction — chat
+    // and lookup finish inline, in this same call, and are never left
+    // interrupted. A resumed micro_edit IS a real, resumable step, but it
+    // conservatively resumes as plain 'task': see the REPLAN-eligibility
+    // comment below for what that costs.
+    let mode: 'chat' | 'lookup' | 'micro_edit' | 'task' = 'task';
     if (!opts.resumeTaskId) {
-      const { complexity, reason } = await classifyTask(agent, task, rootId);
+      const { complexity, reason, mode: classifiedMode } = await classifyTask(agent, task, rootId);
       task = { ...task, complexity, budget: BUDGETS[complexity] };
       db.setComplexity(task);
+      mode = classifiedMode;
       report(agent, `Task classified as ${complexity} (${reason})`);
+    }
+
+    // --- TRIAGE's chat and lookup lanes: a direct reply, no plan ------------
+    // Identical except for whether retrieved code comes along, and both
+    // promote through the same one-way edge on requiresEdits.
+    if (mode === 'chat' || mode === 'lookup') {
+      let chunks: CodeChunk[] = [];
+      if (mode === 'lookup') {
+        // Fewer than the planner's seed retrieval (10): every 'ask'-capable
+        // model has a context window from 32k up, so this is headroom, not a
+        // real constraint — but a lookup answer needs less code in view than
+        // a plan does, and there is no reason to spend the extra tokens.
+        chunks = await agent.retriever.retrieve(task.prompt, [], 6);
+        db.appendEvent({
+          taskId: task.id, parentId: rootId, kind: 'tool_call',
+          payload: {
+            tool: 'retrieve',
+            chunks: chunks.map((c) => `${c.path}:${c.startLine}-${c.endLine}`),
+          },
+        });
+      }
+      const { answer, requiresEdits } = mode === 'lookup'
+        ? await answerLookup(agent, task, chunks, rootId)
+        : await answerChat(agent, task, rootId);
+      if (!requiresEdits) {
+        db.setStatus(task.id, 'done');
+        db.appendEvent({
+          taskId: task.id, parentId: rootId, kind: 'task_end',
+          payload: {
+            status: 'done', stepsCompleted: 0, stepsTotal: 0, changedFiles: 0,
+            summary: answer,
+          } satisfies TaskEndPayload,
+        });
+        const totals = db.totals(task.id);
+        return {
+          taskId: task.id, status: 'done', diff: '',
+          stepsCompleted: 0, stepsTotal: 0,
+          costUsd: totals.costUsd, tokens: totals.tokens,
+          elapsedMs: Date.now() - startedAt,
+        };
+      }
+      // The model's own read disagrees with classify's: this needs an actual
+      // edit. Promote — one-way, straight into the plan path below, never
+      // back through classify (doc: RESPOND -> SCOPE, "INTAKE not re-entered").
+      report(agent, 'That needs an actual change — planning it now.');
     }
 
     // --- user pins: @path and @path:12-40 tags in the prompt ----------------
     const pinned = await loadPins(agent, task, opts.resumeTaskId !== undefined);
 
-    // --- plan (reused on resume) --------------------------------------------
+    // --- plan (reused on resume, synthesized ad hoc for micro_edit) --------
+    // TAXONOMY's REPLAN trigger differs by how the step got here: a task-mode
+    // step earns REPLAN by looping (row 8/9, `wrong_approach`); a micro_edit
+    // step has no MILESTONE to catch drift early, so its trigger is a REPEAT
+    // verification failure at the end instead (doc §3a, row 5 relocated).
+    // Only a JUST-classified micro_edit sets this — see the resume comment
+    // above for why a resumed one falls back to the task-mode trigger.
+    const fromMicroEdit = mode === 'micro_edit';
     let plan = resumedPlan;
     if (!plan) {
-      const seedChunks = await agent.retriever.retrieve(task.prompt, [], 10);
-      db.appendEvent({
-        taskId: task.id, parentId: rootId, kind: 'tool_call',
-        payload: {
-          tool: 'retrieve',
-          chunks: seedChunks.map((c) => `${c.path}:${c.startLine}-${c.endLine}`)
-        },
-      });
-      // The planner gets the real file list: without it, a model confidently
-      // names a plausible path that does not exist, and the executor then
-      // burns its turn budget chasing it.
-      const projectFiles = await agent.retriever.listPaths();
-      plan = await makePlan(agent, task, seedChunks, pinned, projectFiles, rootId);
+      if (mode === 'micro_edit') {
+        // No PLAN call: doc §3a — "the single step is built directly from
+        // Triage, not routed through PLAN." Reusing `singleStepPlan`'s step
+        // shape (tested, degrades safely) as the container the rest of the
+        // pipeline already expects — but NOT its summary, which claims
+        // planning failed. This step was never attempted, and that summary
+        // is rendered verbatim into the executor's own context window.
+        const base = singleStepPlan(task);
+        plan = { ...base, summary: `A direct, single-step change: ${task.prompt}` };
+        report(agent, 'Single-step change — skipping planning.');
+      } else {
+        const seedChunks = await agent.retriever.retrieve(task.prompt, [], 10);
+        db.appendEvent({
+          taskId: task.id, parentId: rootId, kind: 'tool_call',
+          payload: {
+            tool: 'retrieve',
+            chunks: seedChunks.map((c) => `${c.path}:${c.startLine}-${c.endLine}`)
+          },
+        });
+        // The planner gets the real file list: without it, a model confidently
+        // names a plausible path that does not exist, and the executor then
+        // burns its turn budget chasing it.
+        const projectFiles = await agent.retriever.listPaths();
+        plan = await makePlan(agent, task, seedChunks, pinned, projectFiles, rootId);
+        report(agent, `Plan: ${plan.steps.length} steps — ${plan.summary}`);
+      }
       db.savePlan(task.id, plan);
       for (const step of plan.steps) {
         db.upsertStep({
@@ -288,14 +361,52 @@ export async function runTask(
           status: 'pending', checkpointSha: null, attempts: 0
         });
       }
-      report(agent, `Plan: ${plan.steps.length} steps — ${plan.summary}`);
     } else {
       const done = db.getSteps(task.id).filter((s) => s.status === 'done').length;
       report(agent, `Reusing stored plan (${done}/${plan.steps.length} steps already done)`);
     }
 
-    // --- execute -------------------------------------------------------------
-    const abortReason = await runSteps(agent, task, plan, pinned, rootId, startedAt);
+    // --- execute, replanning at most MAX_REPLANS times ------------------------
+    let abortReason: string | null = null;
+    let replansUsed = 0;
+    for (;;) {
+      const outcome = await runSteps(
+        agent, task, plan, pinned, rootId, startedAt, replansUsed, fromMicroEdit);
+      if (outcome.kind === 'finished') break;
+      if (outcome.kind === 'aborted') { abortReason = outcome.reason; break; }
+
+      // outcome.kind === 'replan': the decomposition, not the attempt, was
+      // wrong. `plan` is reassigned in place so the finish block below (and
+      // the next loop iteration) see the revision — there is no separate
+      // "current plan" reference left stale anywhere in this function.
+      replansUsed++;
+      report(agent,
+        `${outcome.step.id} needs a different breakdown, not another attempt ` +
+        `— replanning (${replansUsed}/${MAX_REPLANS}).`);
+      const oldStepIds = new Set(plan.steps.map((s) => s.id));
+      plan = await replan(agent, task, plan, outcome.step, outcome.failure.problem, pinned, rootId);
+      db.savePlan(task.id, plan);
+      const activeIds = new Set(plan.steps.map((s) => s.id));
+      for (const step of plan.steps) {
+        const existing = db.getSteps(task.id).find((s) => s.stepId === step.id);
+        db.upsertStep({
+          taskId: task.id, stepId: step.id, spec: step,
+          status: existing?.status ?? 'pending',
+          checkpointSha: existing?.checkpointSha ?? null,
+          attempts: existing?.attempts ?? 0,
+        });
+      }
+      // Steps the OLD plan had that the revision dropped: only a step that
+      // was never even attempted gets relabelled. The one that just failed
+      // keeps its honest 'failed' status — it really did fail; a differently
+      // shaped replacement is taking over the work, not erasing the attempt.
+      for (const oldId of oldStepIds) {
+        if (activeIds.has(oldId)) continue;
+        const stale = db.getSteps(task.id).find((s) => s.stepId === oldId);
+        if (stale?.status === 'pending') db.upsertStep({ ...stale, status: 'skipped' });
+      }
+      report(agent, `Revised plan: ${plan.steps.length} steps — ${plan.summary}`);
+    }
 
     // --- finish --------------------------------------------------------------
     const headSha = await agent.checkpoints.commit('final state');
@@ -392,9 +503,14 @@ export async function runTask(
 // The step loop
 // ---------------------------------------------------------------------------
 
+/** How `runSteps` ended: ran to completion, hit a ceiling, or needs a new plan. */
+type StepsOutcome =
+  | { kind: 'finished' }
+  | { kind: 'aborted'; reason: string }
+  | { kind: 'replan'; step: PlanStep; failure: Failure };
+
 /**
  * Run the plan in dependency order; steps whose dependency failed are skipped.
- * Returns an abort reason, or null when the plan ran to its end.
  *
  * Sequential on purpose: parallelism buys wall-clock but spends coordination
  * and merge verification, and free-tier request limits cap useful concurrency
@@ -402,8 +518,8 @@ export async function runTask(
  */
 async function runSteps(
   agent: Agent, task: Task, plan: Plan, pinned: CodeChunk[],
-  rootId: number, startedAt: number,
-): Promise<string | null> {
+  rootId: number, startedAt: number, replansUsed: number, fromMicroEdit: boolean,
+): Promise<StepsOutcome> {
   const db = agent.db;
   // Resume support: steps already done stay done.
   const completed = new Set(
@@ -413,10 +529,10 @@ async function runSteps(
   for (const step of orderSteps(plan.steps)) {
     if (completed.has(step.id)) continue;
 
-    if (agent.cancel.signal.aborted) return 'stopped by you';
+    if (agent.cancel.signal.aborted) return { kind: 'aborted', reason: 'stopped by you' };
 
     const overBudget = checkBudget(agent, task, startedAt, stepsRun);
-    if (overBudget) return overBudget;
+    if (overBudget) return { kind: 'aborted', reason: overBudget };
 
     const missingDeps = step.dependsOn.filter((d) => !completed.has(d));
     if (missingDeps.length > 0) {
@@ -444,19 +560,84 @@ async function runSteps(
     }
 
     stepsRun++;
-    let ok: boolean;
+    let result: StepResult;
     try {
-      ok = await runOneStep(agent, task, plan, step, pinned, rootId);
+      result = await runOneStep(agent, task, plan, step, pinned, rootId);
     } catch (err) {
       // A stop is not a failure to diagnose and retry. Unwind to the normal
       // finish: commit, diff, and report 'aborted' with the work intact.
-      if (err instanceof TaskCancelledError) return 'stopped by you';
+      if (err instanceof TaskCancelledError) return { kind: 'aborted', reason: 'stopped by you' };
       throw err;
     }
-    if (ok) completed.add(step.id);
+    if (result.ok) { completed.add(step.id); continue; }
+
+    // Eligible for REPLAN when the decomposition itself looks wrong, not just
+    // this attempt: `wrong_approach` always qualifies (the step looped even
+    // after a revert and a retry); a micro_edit step has no MILESTONE to
+    // catch drift early, so its own signal is a `test_failure` that survived
+    // every retry — the doc's row 5, relocated (§3a).
+    const eligible = result.failure?.failureClass === 'wrong_approach'
+      || (fromMicroEdit && result.failure?.failureClass === 'test_failure');
+    if (eligible && replansUsed < MAX_REPLANS) {
+      return { kind: 'replan', step, failure: result.failure! };
+    }
   }
-  return null;
+  return { kind: 'finished' };
 }
+
+/**
+ * REPLAN: the doc's row-8/9 recovery — a step exhausted retries because the
+ * DECOMPOSITION was wrong, not because one attempt was unlucky. Keeps every
+ * already-done step exactly as it is (id, status, checkpoint) and asks the
+ * planner for a fresh breakdown of only what remains, seeded with why the
+ * old breakdown didn't work.
+ *
+ * Reuses `makePlan` rather than a bespoke call: the synthesized prompt below
+ * becomes `task.prompt` for that call, so its existing fallback — a plan
+ * that cannot fail the task — comes along for free, and there is exactly one
+ * place in the codebase that turns a prompt into a Plan.
+ */
+async function replan(
+  agent: Agent, task: Task, oldPlan: Plan, failedStep: PlanStep, problem: string,
+  pinned: CodeChunk[], rootId: number,
+): Promise<Plan> {
+  const db = agent.db;
+  const doneIds = new Set(
+    db.getSteps(task.id).filter((s) => s.status === 'done').map((s) => s.stepId));
+  const doneSteps = oldPlan.steps.filter((s) => doneIds.has(s.id));
+
+  const replanPrompt =
+    `${task.prompt}\n\n` +
+    `--- Replanning note ---\n` +
+    `These steps are already done — do not repeat or undo them:\n` +
+    (doneSteps.length > 0
+      ? doneSteps.map((s) => `- ${s.id}: ${s.intent}`).join('\n')
+      : '(none yet)') +
+    `\n\nThe step "${failedStep.id}: ${failedStep.intent}" could not be completed ` +
+    `after every retry, even after its changes were rolled back and tried again: ` +
+    `${problem}\n\nBreak down what remains differently — smaller steps, or a ` +
+    `different approach to the part that failed.`;
+
+  const seedChunks = await agent.retriever.retrieve(replanPrompt, [], 10);
+  db.appendEvent({
+    taskId: task.id, parentId: rootId, kind: 'tool_call',
+    payload: {
+      tool: 'replan',
+      chunks: seedChunks.map((c) => `${c.path}:${c.startLine}-${c.endLine}`),
+    },
+  });
+  const projectFiles = await agent.retriever.listPaths();
+  const revised = await makePlan(
+    agent, { ...task, prompt: replanPrompt }, seedChunks, pinned, projectFiles, rootId);
+
+  // doneSteps FIRST: normalisePlan resolves id collisions by input position,
+  // so a revised step that happens to reuse a done id gets renamed instead
+  // of overwriting it, and dependsOn on a done step stays validly backward.
+  return normalisePlan({ summary: oldPlan.summary, steps: [...doneSteps, ...revised.steps] });
+}
+
+/** REPLAN budget per task — doc §3, guard table: `replans_used < 2`. */
+const MAX_REPLANS = 2;
 
 /**
  * How the loop responds to each failure class. Something labels the failure;
@@ -548,11 +729,14 @@ export function classifyInCode(evidence: FailureEvidence): FailureClass | null {
   return null;
 }
 
+/** What a step attempt left behind — success, or a failure `runSteps` can act on. */
+type StepResult = { ok: true } | { ok: false; failure: Failure | null };
+
 /** Execute one step, with retries governed by the failure taxonomy. */
 async function runOneStep(
   agent: Agent, task: Task, plan: Plan, step: PlanStep,
   pinned: CodeChunk[], rootId: number,
-): Promise<boolean> {
+): Promise<StepResult> {
   const db = agent.db;
   const stepEventId = db.appendEvent({
     taskId: task.id, parentId: rootId, kind: 'step_start',
@@ -647,7 +831,7 @@ async function runOneStep(
             } satisfies StepEndPayload,
           });
           if (note) report(agent, `  ${salvaged ? '~' : '✓'} ${note}`);
-          return true;
+          return { ok: true };
         }
         evidence.verifyFailed = true;
         problem = [result.blockedReason, ...verdict.problems].filter(Boolean).join('\n');
@@ -695,7 +879,7 @@ async function runOneStep(
     } satisfies StepEndPayload,
     status: 'error',
   });
-  return false;
+  return { ok: false, failure: lastFailure };
 }
 
 /**

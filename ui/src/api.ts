@@ -119,10 +119,12 @@ export const api = {
     request<ReviewBundle>(
       `/api/tasks/${encodeURIComponent(taskId)}/review?projectRoot=${encodeURIComponent(projectRoot)}`),
 
-  applyReview: (projectRoot: string, taskId: string, acceptedHunkIds: string[]) =>
-    request<{ applied: number; rejected: number; files: string[] }>(
+  applyReview: (
+    projectRoot: string, taskId: string, acceptedHunkIds: string[], feedback?: string,
+  ) =>
+    request<{ applied: number; rejected: number; files: string[]; requeuedSteps: string[] }>(
       `/api/tasks/${encodeURIComponent(taskId)}/review`,
-      { method: 'POST', body: JSON.stringify({ projectRoot, acceptedHunkIds }) }),
+      { method: 'POST', body: JSON.stringify({ projectRoot, acceptedHunkIds, feedback }) }),
 
   providers: () => request<ProvidersResponse>('/api/providers'),
 

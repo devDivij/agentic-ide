@@ -340,6 +340,14 @@ body:has(.splitter.dragging) { user-select: none; }
   border: 1px solid var(--warn); border-radius: var(--radius);
   padding: 8px 10px; margin-bottom: 12px; background: #241f14; font-size: 12px;
 }
+.review-feedback { margin-bottom: 12px; }
+.review-feedback textarea {
+  width: 100%; min-height: 44px; resize: vertical; box-sizing: border-box;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px;
+  font-family: inherit; font-size: 13px;
+}
+.review-feedback textarea:focus { outline: none; border-color: var(--accent); }
 .hunk { border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 12px; overflow: hidden; }
 .hunk.rejected { opacity: .5; }
 .hunk-head {

@@ -89,6 +89,28 @@ export function TaskEntry({
   const end = taskEndOf(task.nodes);
   const elapsed = running ? Date.now() - task.createdAt : task.elapsedMs;
 
+  // TRIAGE's chat lane (orchestrator.ts, mode === 'chat'): finished with no
+  // plan at all. `status === 'done'` reached directly (not via HITL accept)
+  // combines with zero steps only on this path — a task-mode run is always
+  // 'awaiting_review' first, and PlanSchema forbids an empty step list — so
+  // this pair is a safe, if implicit, signal without a dedicated wire field.
+  // Rendered like a plain conversation turn: no status chip, no step list,
+  // no outcome box with buttons that only make sense for a considered edit.
+  if (task.status === 'done' && task.steps.length === 0) {
+    return (
+      <>
+        <div className="bubble user">
+          <div className="bubble-label">you</div>
+          {task.prompt || <span className="muted">(resumed task)</span>}
+        </div>
+        <div className="bubble agent">
+          <div className="bubble-label">agent</div>
+          <div className="aside-answer">{end?.summary}</div>
+        </div>
+      </>
+    );
+  }
+
   return (
     <>
       <div className="bubble user">
@@ -117,7 +139,9 @@ export function TaskEntry({
           </div>
         ) : (
           <div className="muted small">
-            {running ? 'Working out a plan…' : 'No plan was produced.'}
+            {/* True before classify resolves mode — could still turn out to
+                be a chat reply with no plan at all, so this stays neutral. */}
+            {running ? 'Thinking…' : 'No plan was produced.'}
           </div>
         )}
 

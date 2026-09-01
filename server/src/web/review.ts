@@ -17,6 +17,7 @@ import { promisify } from 'node:util';
 
 import { SHADOW_GIT_CONFIG } from '../agent/checkpoints.ts';
 import { Store } from '../agent/store.ts';
+import type { StepRecord } from '../agent/types.ts';
 import type { DiffHunk, ReviewBundle } from '../shared/types.ts';
 
 const exec = promisify(execFile);
@@ -160,6 +161,31 @@ function attributeToSteps(db: Store, taskId: string): Map<string, string> {
   return fileToStep;
 }
 
+/**
+ * Every step reachable from `seedIds` by following `dependsOn` forward — the
+ * steps built ON TOP of a rejected one, transitively. A step two levels down
+ * that assumed the rejected content is just as stale as the one right above
+ * it; `applySelection` decides which of these actually need resetting (only
+ * the ones currently 'done' represent committed work).
+ */
+export function blastRadius(steps: StepRecord[], seedIds: string[]): Set<string> {
+  const dependents = new Map<string, string[]>();
+  for (const s of steps) {
+    for (const dep of s.spec.dependsOn) {
+      if (!dependents.has(dep)) dependents.set(dep, []);
+      dependents.get(dep)!.push(s.stepId);
+    }
+  }
+  const radius = new Set(seedIds);
+  const queue = [...seedIds];
+  while (queue.length > 0) {
+    for (const dependent of dependents.get(queue.shift()!) ?? []) {
+      if (!radius.has(dependent)) { radius.add(dependent); queue.push(dependent); }
+    }
+  }
+  return radius;
+}
+
 export async function buildReview(
   projectRoot: string, taskId: string,
 ): Promise<ReviewBundle & { hunksRaw: ParsedHunk[] }> {
@@ -193,56 +219,99 @@ export async function buildReview(
  * to the pre-task baseline (only those files — the user's own new files are
  * none of our business), then apply the accepted hunks as a patch.
  */
+export interface ApplySelectionResult {
+  applied: number;
+  rejected: number;
+  files: string[];
+  /**
+   * Steps whose rejected hunk sent them back to 'pending' — what a resume
+   * will re-attempt. Empty when every hunk was accepted, or a rejected hunk
+   * could not be attributed back to a step (attributeToSteps found no
+   * matching tool_call — rare, and there is nothing to requeue in that case).
+   */
+  requeuedSteps: string[];
+}
+
 export async function applySelection(
-  projectRoot: string, taskId: string, acceptedIds: string[],
-): Promise<{ applied: number; rejected: number; files: string[] }> {
+  projectRoot: string, taskId: string, acceptedIds: string[], feedback?: string,
+): Promise<ApplySelectionResult> {
   const review = await buildReview(projectRoot, taskId);
   const db = new Store(projectRoot);
-  let range: Awaited<ReturnType<typeof checkpointRange>>;
   try {
-    range = await checkpointRange(db, projectRoot, taskId);
+    const range = await checkpointRange(db, projectRoot, taskId);
+    if (!range) throw new Error('That task has no reviewable checkpoint range.');
+
+    const accepted = new Set(acceptedIds);
+    const patch = buildPatch(review.hunksRaw, accepted);
+
+    // Reset only the files this task touched back to the baseline.
+    const touched = [...new Set(review.hunksRaw.map((h) => h.file))];
+    for (const file of touched) {
+      try {
+        await git(projectRoot, ['checkout', range.baseSha, '--', file]);
+      } catch {
+        // Absent at baseline (the task created it): reverting means removing it.
+        await git(projectRoot, ['rm', '-f', '--ignore-unmatch', '--', file])
+          .catch(() => undefined);
+      }
+    }
+
+    if (patch.trim()) {
+      const dir = await mkdtemp(join(tmpdir(), 'agentzero-patch-'));
+      try {
+        const patchFile = join(dir, 'selection.patch');
+        await writeFile(patchFile, patch, 'utf8');
+        // --3way lets git fall back to a merge when context has drifted, which
+        // is exactly the situation a partial selection creates.
+        await git(projectRoot, ['apply', '--3way', '--whitespace=nowarn', patchFile]);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    }
+
+    // A rejected hunk is not just a discarded diff — its step gets a real
+    // do-over. Reset to 'pending' so a resume re-attempts it, and carry the
+    // human's own words in as a fact if they left any: the same mechanic
+    // already proven for tool-call approvals (ApprovalDecision.feedback) — a
+    // bare rejection tells the model nothing, so it tends to redo the exact
+    // thing that was just turned down.
+    const rejectedSteps = [...new Set(
+      review.hunks.filter((h) => !accepted.has(h.id) && h.stepId).map((h) => h.stepId))];
+    // Doc §15's guard: "re-run blast radius". A step that already completed
+    // ON TOP of the rejected change is built on ground that is about to move
+    // — leaving it 'done' would let its checkpoint quietly outlive the work
+    // it depended on. Only 'done' dependents are pulled in: a 'pending' one
+    // hasn't run yet, and a 'skipped' one is already accounted for.
+    const allSteps = db.getSteps(taskId);
+    const requeuedSteps = [...blastRadius(allSteps, rejectedSteps)].filter((id) =>
+      rejectedSteps.includes(id) || allSteps.find((s) => s.stepId === id)?.status === 'done');
+    for (const stepId of requeuedSteps) {
+      const existing = allSteps.find((s) => s.stepId === stepId);
+      if (!existing) continue;
+      db.upsertStep({ ...existing, status: 'pending', checkpointSha: null, attempts: 0 });
+      // The feedback was about the specific rejected hunk, not generically
+      // about everything downstream of it — attach it only there.
+      if (feedback?.trim() && rejectedSteps.includes(stepId)) {
+        db.addFacts(
+          taskId, stepId, [`Human feedback on the rejected change: ${feedback.trim()}`]);
+      }
+    }
+    // Marks the task resumable even if nothing auto-resumes it: this is the
+    // same status the codebase already uses to mean "more to do, no live
+    // session running it" (see `resumable` on the task-list endpoint).
+    if (requeuedSteps.length > 0) db.setStatus(taskId, 'running');
+
+    const files = [...new Set(
+      review.hunksRaw.filter((h) => accepted.has(h.id)).map((h) => h.file))];
+    return {
+      applied: accepted.size,
+      rejected: review.hunksRaw.length - accepted.size,
+      files,
+      requeuedSteps,
+    };
   } finally {
     db.close();
   }
-  if (!range) throw new Error('That task has no reviewable checkpoint range.');
-
-  const accepted = new Set(acceptedIds);
-  const patch = buildPatch(review.hunksRaw, accepted);
-
-  // Reset only the files this task touched back to the baseline.
-  const touched = [...new Set(review.hunksRaw.map((h) => h.file))];
-  for (const file of touched) {
-    try {
-      await git(projectRoot, ['checkout', range.baseSha, '--', file]);
-    } catch {
-      // Absent at baseline (the task created it): reverting means removing it.
-      await git(projectRoot, ['rm', '-f', '--ignore-unmatch', '--', file])
-        .catch(() => undefined);
-    }
-  }
-
-  if (!patch.trim()) {
-    return { applied: 0, rejected: review.hunksRaw.length, files: [] };
-  }
-
-  const dir = await mkdtemp(join(tmpdir(), 'agentzero-patch-'));
-  try {
-    const patchFile = join(dir, 'selection.patch');
-    await writeFile(patchFile, patch, 'utf8');
-    // --3way lets git fall back to a merge when context has drifted, which is
-    // exactly the situation a partial selection creates.
-    await git(projectRoot, ['apply', '--3way', '--whitespace=nowarn', patchFile]);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-
-  const files = [...new Set(
-    review.hunksRaw.filter((h) => accepted.has(h.id)).map((h) => h.file))];
-  return {
-    applied: accepted.size,
-    rejected: review.hunksRaw.length - accepted.size,
-    files,
-  };
 }
 
 // ---------------------------------------------------------------------------

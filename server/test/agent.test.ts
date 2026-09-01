@@ -22,7 +22,7 @@ import {
   BUDGETS, RateBucket, Router, isPayingWorthIt, scoreTask, SECONDS_PER_USD,
 } from '../src/agent/router.ts';
 import { buildContext } from '../src/agent/context.ts';
-import { buildPatch, parseDiff } from '../src/web/review.ts';
+import { blastRadius, buildPatch, parseDiff } from '../src/web/review.ts';
 // The UI's pure modules: no DOM, no React, so they run here rather than
 // having no tests at all for the sake of which folder they live in.
 import { diffFiles, parseHunk, paintRow } from '../../ui/src/diff.ts';
@@ -1212,4 +1212,84 @@ test('checkFileSyntax: python is found under whichever name it has here', async 
   }
   assert.match(broken, /does not parse/);
   assert.equal(await checkFileSyntax(dir, 'fine.py'), null);
+});
+
+// ---------------------------------------------------------------------------
+// REPLAN's merge strategy — doneSteps first, revised steps after
+// ---------------------------------------------------------------------------
+
+test('normalisePlan: REPLAN merge keeps done steps, backward deps, renames a collision', () => {
+  // Mirrors exactly what `replan()` in orchestrator.ts builds: already-done
+  // steps from the OLD plan placed first, a freshly-planned tail after. This
+  // pins the property the whole REPLAN design leans on — that feeding that
+  // shape through the existing normalisePlan is enough to make it safe to
+  // execute, with no bespoke merge logic needed.
+  const doneSteps = [
+    { id: 's1', intent: 'create the file', targetFiles: ['a.py'],
+      acceptanceCriteria: [], dependsOn: [], difficulty: 'routine' as const },
+    { id: 's2', intent: 'add the import', targetFiles: ['a.py'],
+      acceptanceCriteria: [], dependsOn: ['s1'], difficulty: 'routine' as const },
+  ];
+  // A revised tail from a fresh planning call: the model has no idea what
+  // ids are already taken, so it starts again from "s1" — a real collision.
+  const revisedSteps = [
+    { id: 's1', intent: 'wire the new approach into a.py', targetFiles: ['a.py'],
+      acceptanceCriteria: [], dependsOn: ['s2'], difficulty: 'routine' as const },
+  ];
+
+  const merged = normalisePlan({
+    summary: 'original summary', steps: [...doneSteps, ...revisedSteps],
+  });
+
+  // Both done steps survive under their ORIGINAL ids — a resume or a second
+  // replan still recognises them as the same steps.
+  assert.equal(merged.steps[0]!.id, 's1');
+  assert.equal(merged.steps[0]!.intent, 'create the file');
+  assert.equal(merged.steps[1]!.id, 's2');
+  assert.equal(merged.steps[1]!.dependsOn.includes('s1'), true);
+
+  // The colliding new step was renamed, not dropped or overwritten.
+  assert.equal(merged.steps.length, 3);
+  const revised = merged.steps[2]!;
+  assert.notEqual(revised.id, 's1');
+  assert.equal(revised.intent, 'wire the new approach into a.py');
+  // Its dependency on 's2' — a real, earlier, done step — survives.
+  assert.equal(revised.dependsOn.includes('s2'), true);
+});
+
+// ---------------------------------------------------------------------------
+// blastRadius — HITL's "re-run blast radius" guard (doc §15)
+// ---------------------------------------------------------------------------
+
+test('blastRadius: follows dependsOn forward through a diamond, skips the unrelated', () => {
+  const step = (id: string, dependsOn: string[]) => ({
+    taskId: 't', stepId: id, status: 'done' as const, checkpointSha: null, attempts: 1,
+    spec: {
+      id, intent: id, targetFiles: [], acceptanceCriteria: [], dependsOn,
+      difficulty: 'routine' as const,
+    },
+  });
+  // s1 -> s2 -> s4
+  //   \-> s3 -/         s5 stands alone.
+  const steps = [
+    step('s1', []), step('s2', ['s1']), step('s3', ['s1']),
+    step('s4', ['s2', 's3']), step('s5', []),
+  ];
+
+  const radius = blastRadius(steps, ['s1']);
+  assert.deepEqual([...radius].sort(), ['s1', 's2', 's3', 's4']);
+  assert.equal(radius.has('s5'), false);
+});
+
+test('blastRadius: a leaf step with no dependents radiates only itself', () => {
+  const step = (id: string, dependsOn: string[]) => ({
+    taskId: 't', stepId: id, status: 'done' as const, checkpointSha: null, attempts: 1,
+    spec: {
+      id, intent: id, targetFiles: [], acceptanceCriteria: [], dependsOn,
+      difficulty: 'routine' as const,
+    },
+  });
+  const steps = [step('s1', []), step('s2', ['s1'])];
+
+  assert.deepEqual([...blastRadius(steps, ['s2'])], ['s2']);
 });

@@ -29,6 +29,7 @@ export function Review({
 }): JSX.Element {
   const [bundle, setBundle] = useState<ReviewBundle | null>(null);
   const [accepted, setAccepted] = useState<Set<string>>(new Set());
+  const [feedback, setFeedback] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -40,6 +41,7 @@ export function Review({
         // Default to accepting everything: approval is the common case, and
         // starting from nothing selected makes the safe path the tedious one.
         setAccepted(new Set(b.hunks.map((h) => h.id)));
+        setFeedback('');
         setError(null);
       })
       .catch((e: Error) => setError(e.message));
@@ -57,11 +59,18 @@ export function Review({
     if (!taskId) return;
     setBusy(true);
     try {
-      const result = await api.applyReview(projectRoot, taskId, [...accepted]);
+      const result = await api.applyReview(
+        projectRoot, taskId, [...accepted], feedback.trim() || undefined);
       onApplied(
         `Applied ${result.applied} hunk(s)` +
         (result.rejected > 0 ? `, rejected ${result.rejected}` : '') +
-        (result.files.length ? ` — ${result.files.join(', ')}` : ''));
+        (result.files.length ? ` — ${result.files.join(', ')}` : '') +
+        // The same feedback mechanic already proven on tool-call approvals:
+        // a rejection carries the reason back in, and the redo starts on
+        // its own rather than waiting for a separate "Resume" click.
+        (result.requeuedSteps.length > 0
+          ? ` — redoing ${result.requeuedSteps.join(', ')} now.`
+          : ''));
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -91,6 +100,7 @@ export function Review({
   }
 
   const testHunks = bundle.hunks.filter((h) => h.touchesTests).length;
+  const hasRejections = accepted.size < bundle.hunks.length;
 
   return (
     <div className="panel review">
@@ -101,9 +111,23 @@ export function Review({
         </button>
         <button onClick={() => setAccepted(new Set())}>Reject all</button>
         <button className="primary" disabled={busy} onClick={() => void apply()}>
-          {busy ? 'Applying…' : 'Apply to working tree'}
+          {busy ? 'Applying…' : hasRejections ? 'Apply and retry the rest' : 'Apply to working tree'}
         </button>
       </div>
+
+      {hasRejections && (
+        <div className="review-feedback">
+          {/* Mirrors the approval flow's feedback field: a rejection alone
+              tells the model nothing, so the rejected step's redo starts
+              from the same place unless something says what to do instead. */}
+          <textarea
+            value={feedback}
+            onChange={(e) => setFeedback(e.target.value)}
+            placeholder="Optional — what should the rejected part do instead? (carried into the redo)"
+            rows={2}
+          />
+        </div>
+      )}
 
       {testHunks > 0 && (
         <div className="warn-banner">
