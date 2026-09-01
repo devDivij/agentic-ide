@@ -105,7 +105,14 @@ export function reduce(state: AppState, action: Action): AppState {
       };
     }
     case 'task':
-      return { ...state, task: event.task };
+      // A chat/lookup-mode task never plans, so it never earns a 'steps'
+      // event to overwrite the last one — without this, its card showed the
+      // PREVIOUS task's step chip, done and all, as if it had just re-run.
+      return {
+        ...state,
+        task: event.task,
+        steps: event.task.id === state.task?.id ? state.steps : [],
+      };
     case 'steps':
       return { ...state, steps: event.steps };
     case 'routing':

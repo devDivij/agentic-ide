@@ -4,13 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch --clear-screen=false src/web/main.ts",
-    "start": "tsx src/web/main.ts",
-    "cli": "tsx src/cli.ts",
-    "typecheck": "tsc --noEmit",
-    "test": "tsx --test test/*.test.ts"
+    "dev": "node scripts/python.mjs -m agentzero.web.main",
+    "start": "node scripts/python.mjs -m agentzero.web.main",
+    "cli": "node scripts/python.mjs -m agentzero.cli",
+    "test": "node scripts/python.mjs -m pytest"
   },
-  "dependencies": {
-    "zod": "^3.23.8"
-  }
+  "description": "Python agent runtime; see pyproject.toml for dependencies."
 }

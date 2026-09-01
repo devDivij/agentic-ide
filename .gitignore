@@ -4,3 +4,8 @@ dist/
 *.log
 .agentzero/
 *.tsbuildinfo
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.egg-info/

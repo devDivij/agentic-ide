@@ -13,12 +13,13 @@ Two documents, for two questions:
   deliberately not built yet. Start here.
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — *why it is shaped this
   way*: the reasoning, the trade-offs, and a guided reading order for the
-  code (the agentic core is 15 small files; budget 2–3 hours for all of it).
+  code (the agentic core is 16 small files; budget 2–3 hours for all of it).
 
 ## Setup (Linux, macOS or Windows, from scratch)
 
-Requirements: **Node ≥ 22.5** (`node:sqlite` is built in — no native builds)
-and **git** on PATH. Nothing else.
+Requirements: **Python ≥ 3.12** (the runtime), **Node ≥ 22.5** (the UI's build
+tooling) and **git** on PATH. Nothing else — the server's only dependencies are
+pydantic, httpx, FastAPI and uvicorn, and SQLite ships with Python.
 
 On **Windows**, that git should be [Git for
 Windows](https://git-scm.com/download/win): the commands a model writes are
@@ -30,8 +31,9 @@ some other shell, set `AGENTZERO_SHELL` to the full path of a `bash.exe`.)
 
 ```bash
 git clone <this repo> && cd agentzero
-npm install
-npm test               # offline test suite; no API key needed
+npm install            # installs the UI, then creates server/.venv and
+                       # installs the Python runtime into it
+npm test               # offline test suite (pytest); no API key needed
 
 npm run dev            # starts both halves:
                        #   UI      http://localhost:5319
@@ -45,7 +47,7 @@ Open the UI, go to **Settings**, and paste at least one API key:
 | NVIDIA NIM | `NVIDIA_API_KEY` | build.nvidia.com — free, no card |
 | Groq | `GROQ_API_KEY` | console.groq.com — free tier |
 | OpenRouter | `OPENROUTER_API_KEY` | openrouter.ai — free models + paid overflow |
-| Ollama | (none) | local; flip `enabled: true` in `server/src/agent/providers.ts` after `ollama pull qwen2.5-coder:7b` |
+| Ollama | (none) | local; flip `enabled: true` in `server/agentzero/agent/providers.py` after `ollama pull qwen2.5-coder:7b` |
 
 Keys are stored in `~/.agentzero/settings.json` (mode 0600) and are never sent
 back to the browser. The environment variables above work too (see
@@ -81,14 +83,21 @@ npm run cli -- trace <taskId> --project /path/to/repo
 ## Layout
 
 ```
-server/src/agent/   the agentic core — start with types.ts, then orchestrator.ts
-server/src/web/     HTTP host: routes, SSE stream, review, settings
-server/src/shared/  wire types shared (type-only) with the UI
-server/src/cli.ts   headless driver
-ui/src/             React front-end (panels for chat, files, review, routing, trace, settings)
-docs/               architecture and design rationale
+server/agentzero/agent/   the agentic core — start with types.py, then orchestrator.py
+server/agentzero/web/     HTTP host: routes, SSE stream, review, settings
+server/agentzero/cli.py   headless driver
+server/tests/             the offline suite (pytest)
+shared/types.ts           the wire contract, mirrored by agent/types.py
+ui/src/                   React front-end (chat, files, review, routing, trace, settings)
+docs/                     architecture and design rationale
 ```
 
-There is no build step for the server — it runs directly under `tsx`. The UI
-is a standard Vite app; `npm run build` produces `ui/dist`, which the server
-serves so production is a single process.
+The server is Python and has no build step. `shared/types.ts` stays TypeScript
+on purpose: the UI imports it type-only, so the browser half keeps compile-time
+checking of what the server sends, and `agent/types.py` emits exactly those
+camelCase spellings. The UI is a standard Vite app; `npm run build` produces
+`ui/dist`, which the server serves so production is a single process.
+
+The `npm` scripts are unchanged (`dev`, `test`, `cli`, `build`) — they now
+shell into `server/.venv` rather than `tsx`, so nothing you already type has
+to change.

@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 /**
- * Starts the agent server and the UI dev server together. A twenty-line
- * spawner rather than a dependency like `concurrently`.
+ * Starts the agent server (Python) and the UI dev server (Vite) together.
+ * A thirty-line spawner rather than a dependency like `concurrently`.
  */
 
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+
+import { runPython } from './python.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
@@ -14,10 +16,14 @@ const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 let closing = false;
 
 const children = [
-  { name: 'server', args: ['run', 'dev', '-w', 'server'] },
-  { name: 'ui',     args: ['run', 'dev', '-w', 'ui'] },
-].map(({ name, args }) => {
-const child = spawn(npm, args, { cwd: root, stdio: 'inherit', shell: true });
+  { name: 'server', start: () => runPython(['-m', 'agentzero.web.main']) },
+  {
+    name: 'ui',
+    start: () => spawn(npm, ['run', 'dev', '-w', 'ui'],
+      { cwd: root, stdio: 'inherit', shell: true }),
+  },
+].map(({ name, start }) => {
+  const child = start();
   child.on('exit', (code) => {
     if (!closing) console.log(`\n[${name}] exited with ${code}`);
     shutdown();
@@ -33,11 +39,11 @@ function shutdown() {
 }
 
 /**
- * Windows has no signals: killing npm terminates npm alone and leaves the
- * server it started running, holding its port, until the machine reboots.
+ * Windows has no signals: killing the launcher terminates it alone and leaves
+ * the server it started running, holding its port, until the machine reboots.
  * taskkill walks the process tree instead. (Same problem and same fix as
- * agent/shell.ts, spelled out again because this script has no build step and
- * so cannot import the TypeScript.)
+ * agent/shell.py, spelled out again because this script has no build step and
+ * so cannot import the Python.)
  */
 function stop(child) {
   if (process.platform === 'win32' && child.pid !== undefined) {

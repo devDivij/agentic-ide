@@ -2,7 +2,7 @@
  * Turning a unified diff hunk into the rows a review screen renders.
  *
  * The server already splits a task's changes into hunks (see
- * `server/src/web/review.ts`); this is the other half — what a hunk looks
+ * `server/agentzero/web/review.py`); this is the other half — what a hunk looks
  * like once a person has to read it. Three things a raw `+`/`-` dump does
  * not give you, and that reading a diff actually depends on:
  *
@@ -53,7 +53,7 @@ const HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
  * This exists for the approval prompt: `write_file` proposes a complete
  * replacement file *before* anything lands on disk, so there is no git
  * checkpoint pair to ask the server for a hunk from (that machinery, in
- * `server/src/web/review.ts`, only exists after the fact). The comparison has
+ * `server/agentzero/web/review.py`, only exists after the fact). The comparison has
  * to happen here, client-side, against whatever is on disk right now.
  *
  * `oldText === null` means the file does not exist yet — a create, not an

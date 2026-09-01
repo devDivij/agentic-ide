@@ -13,8 +13,8 @@ export default defineConfig({
   server: {
     port: Number(process.env.AGENTZERO_UI_PORT ?? 5319),
     fs: {
-      // The UI imports its wire types from server/src/shared/types.ts
-      // (type-only, erased at build time), so Vite may read one level up.
+      // The UI imports its wire types from shared/types.ts (type-only,
+      // erased at build time), so Vite may read one level up.
       allow: ['..'],
     },
     proxy: {

@@ -5,11 +5,18 @@ shape as `raw/architecture-map.md` (the design intent). Companion to
 `docs/ARCHITECTURE.md` (the reasoning). Every constant, branch and file below
 was read out of the current source, not projected from the design.
 
-Measured today: `server/src/agent` 4,377 LOC (15 files) · `server/src/web`
-+ `shared` + `cli` 1,669 · `ui/src` 2,188 TS/TSX (+429 CSS) · 41 offline tests.
-Runtime requirements: **Node ≥ 22.5** (`node:sqlite` is built in), **git** on
-PATH. Server dependencies: `zod` only. UI: React 18 + Vite 6. TypeScript is
-typecheck-only (`noEmit`, `.ts` imports run via Node's native stripping).
+Measured today: `server/agentzero/agent` 5,911 LOC (16 files) ·
+`server/agentzero/web` + `cli` 1,847 · `shared/types.ts` 329 · `ui/src` 3,770
+TS/TSX (+631 CSS) · 228 offline tests across 11 files.
+Runtime requirements: **Python ≥ 3.12** (`sqlite3` is in the standard library),
+**Node ≥ 22.5** for the UI's build tooling, **git** on PATH. Server
+dependencies: pydantic, httpx, FastAPI, uvicorn. UI: React 18 + Vite 6.
+
+The server is synchronous throughout the agent core — the loop is strictly
+sequential and needs no concurrency — and asynchronous only at the FastAPI
+edge. Each task runs on a worker thread; the approval callback blocks that
+thread on a `threading.Event` until a route answers it. That single boundary is
+the whole of the concurrency story.
 
 ---
 
@@ -31,18 +38,18 @@ typecheck-only (`noEmit`, `.ts` imports run via Node's native stripping).
    JSON    │ 15 REST endpoints       │ SSE GET /api/events (replay buffer 500,
            ▼                         │ heartbeat 20s, dedup by node id)
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│            WEB HOST  (server/src/web — node:http, no framework, :4319)        │
-│  main.ts      route table · loopback-only bind · Origin+Host checks ·         │
+│            WEB HOST  (server/agentzero/web — FastAPI + uvicorn, :4319)        │
+│  main.py      route table · loopback-only bind · Origin+Host checks ·         │
 │               serves ui/dist when built (one process in production)           │
-│  session.ts   one per project · ApprovalFn ⇄ browser promise · pumps SQLite   │
+│  session.py   one per project · ApprovalFn ⇄ browser promise · pumps SQLite   │
 │               rows → SSE every 400ms (live view IS the post-hoc view)         │
-│  events.ts    SSE fan-out + replay · review.ts diff→hunks→selective re-apply  │
-│  settings.ts  ~/.agentzero/settings.json (0600); keys in, never back out      │
+│  events.py    SSE fan-out + replay · review.py diff→hunks→selective re-apply  │
+│  settings.py  ~/.agentzero/settings.json (0600); keys in, never back out      │
 └───────────────┬──────────────────────────────────────────────────────────────┘
                 │ createAgent() / runTask() / askAside()
                 ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│                 AGENT RUNTIME  (server/src/agent — headless)                  │
+│                 AGENT RUNTIME  (server/agentzero/agent — headless)                  │
 │  orchestrator  ONE deterministic loop: classify → plan → per step             │
 │                [retrieve → turns → verify → checkpoint | revert] → review     │
 │  workers       the 5 model jobs (classify·plan·execute·diagnose·ask)          │
@@ -56,7 +63,7 @@ typecheck-only (`noEmit`, `.ts` imports run via Node's native stripping).
 │  tools         6 tools · approval choke point · path/env safety               │
 │  verify        mechanical only: syntax + optional test command                │
 │  checkpoints   shadow git repo (.agentzero/shadow.git)                        │
-│  store         all durable state (node:sqlite, WAL)                           │
+│  store         all durable state (sqlite3, WAL)                               │
 │  paths         symlink-aware project confinement                              │
 └──────┬──────────────────────┬──────────────────────┬─────────────────────────┘
        ▼                      ▼                      ▼
@@ -65,7 +72,7 @@ typecheck-only (`noEmit`, `.ts` imports run via Node's native stripping).
 │ .agentzero/     │ │ .agentzero/         │ │ NVIDIA NIM · Groq · OpenRouter  │
 │ state.db        │ │ shadow.git          │ │ (+Ollama, +Mistral: in catalog, │
 │ tasks·steps·    │ │ baseline/pre-attempt│ │  disabled by default)           │
-│ facts·pins·     │ │ /step/final commits │ │ cli.ts drives this SAME runtime │
+│ facts·pins·     │ │ /step/final commits │ │ cli.py drives this SAME runtime │
 │ events          │ │ user's git untouched│ │ with no UI at all               │
 └─────────────────┘ └─────────────────────┘ └────────────────────────────────┘
 ```
@@ -169,7 +176,7 @@ Resume: plan/steps/facts/pins/baseSha all live in SQLite, none inside a
 conversation — `resumeTaskId` reloads them and continues at the first
 non-`done` step (classify skipped as already paid for).
 
-## 3. The one call path (`call.ts`) — every task model call
+## 3. The one call path (`call.py`) — every task model call
 
 Exception worth stating: `/bytheway` calls `chatComplete` directly because it
 receives no store by design — so an aside emits no trace events (it is still
@@ -203,16 +210,16 @@ event: llm_call {exact messages, completion, reasoning?, tokens, cost, ms}
     ▼
 extractJson (direct → ```json fenced → outermost balanced braces)
     → coerceTurn (executor only: flattens nested shapes small models emit)
-    → zod safeParse
+    → pydantic validate
     ├─ ok ─────────────────────────────► value
     ├─ invalid + finishReason='length' ► output budget ×2 (truncated ≠ wrong)
     └─ invalid ────────────────────────► REPAIR on the SAME model (sticky
-                                          route) with the specific zod error
+                                          route) with the specific pydantic error
                                           attached (≤2 repairs) ──► throw
     budget-bump paths share ONE counter (≤2 bumps total)
 ```
 
-## 4. The five model jobs (`workers.ts`)
+## 4. The five model jobs (`workers.py`)
 
 ```
 ROLE      CALLS/TASK    TOKENS  TIMEOUT  NOTES
@@ -239,9 +246,9 @@ this-step transcript, loop directive, output contract (rendered LAST).
 ## 5. Subsystems in detail
 
 ```
-ROUTING (router.ts)                     RETRIEVAL (retrieval.ts)
+ROUTING (router.py)                     RETRIEVAL (retrieval.py)
 ┌────────────────────────────────┐      ┌────────────────────────────────────┐
-│ RateBucket/provider tracks     │      │ scanProject: pure-Node BFS walk    │
+│ RateBucket/provider tracks     │      │ scan_project: pure-Python BFS walk    │
 │ req/min · tok/min · req/day ·  │      │ (≤4000 files, ≤400KB, NUL-sniffed, │
 │ tok/day + post-429 penalty     │      │ conventional ignore list)          │
 │ waitMs(est) predicts BEFORE a  │      │ extractTerms: identifier-shaped    │
@@ -256,7 +263,7 @@ ROUTING (router.ts)                     RETRIEVAL (retrieval.ts)
 │ in-process (no HTTP exposure)  │      │ no BM25/embeddings — seam documented│
 └────────────────────────────────┘      └────────────────────────────────────┘
 
-MEMORY (store.ts + context.ts)          VERIFICATION (verify.ts + tools.ts)
+MEMORY (store.py + context.py)          VERIFICATION (verify.py + tools.py)
 ┌────────────────────────────────┐      ┌────────────────────────────────────┐
 │ NO transcript anywhere. Every  │      │ AT THE WRITE: syntax check runs in │
 │ window rebuilt fresh: request ·│      │ write_file itself; error = that    │
@@ -284,7 +291,7 @@ sets the pay-vs-wait exchange rate.
 ```
                      ┌────────────────────────────────────┐
   orchestrator ────► │ events (append-only, WAL)          │
-  + call.ts +        │ parent_id ⇒ call TREE              │
+  + call.py +        │ parent_id ⇒ call TREE              │
   session pump       │ payload_json = exact I/O           │
                      │ tokens · cost_usd · duration_ms    │
                      └──────────────┬─────────────────────┘
@@ -303,7 +310,7 @@ Event kinds: task_start/end · step_start/end · llm_call · tool_call · route 
 assemble · verify · compact · checkpoint · error.
 ```
 
-## 7. Model portfolio (`providers.ts` — data, not code)
+## 7. Model portfolio (`providers.py` — data, not code)
 
 ```
 PROVIDER     TIER     LIMITS                        MODELS (total params, cited)
@@ -330,7 +337,7 @@ Role→model assignment is DYNAMIC ranking per call (tier/free/strength rules),
 not a frozen matrix. Paid overflow fires only when the pay-vs-wait rule says
 waiting costs more score than dollars.
 
-## 8. Shadow git + human review (`checkpoints.ts`, `web/review.ts`)
+## 8. Shadow git + human review (`checkpoints.py`, `web/review.py`)
 
 ```
 GIT_DIR=.agentzero/shadow.git (bare init) · GIT_WORK_TREE=<project>
@@ -350,13 +357,13 @@ APPLY SELECTION: reset ONLY the task-touched files to baseline (rm created
   gets its own explanation instead of an empty pane.
 ```
 
-## 9. Tools, approvals, confinement (`tools.ts`, `paths.ts`)
+## 9. Tools, approvals, confinement (`tools.py`, `paths.py`)
 
 ```
 TOOL          SIDE EFFECT  BEHAVIOUR
 read_file     no           line-numbered; confined (symlink-aware, two-way check)
 list_files    no           ignore-listed dirs filtered; confined
-search_code   no           same pure-Node scanner as retrieval (a missing
+search_code   no           same pure-Python scanner as retrieval (a missing
                            ripgrep binary once read silently as "no matches")
 write_file    YES          complete-file write → immediate syntax check → error
                            returned AS THE CALL'S RESULT; file kept for repair
@@ -430,21 +437,21 @@ Small wart: Settings.testProvider awaits without client-side try/catch.
 
 | Concern | Implemented in |
 |---|---|
-| The one loop, stuck detector, budgets, taxonomy, salvage marking | `agent/orchestrator.ts` |
-| Model jobs + prompt contracts | `agent/workers.ts` |
-| Route→dispatch→log→validate→repair | `agent/call.ts`; HTTP in `agent/llm.ts`; tolerance in `agent/parse.ts` |
-| Context assembly + eviction | `agent/context.ts` |
-| Per-call routing, rate buckets, scoring, budgets | `agent/router.ts`; catalogue in `agent/providers.ts` |
-| Retrieval v0 | `agent/retrieval.ts` |
-| Tools + approval + env scrubbing | `agent/tools.ts`; confinement in `agent/paths.ts` |
-| Mechanical verification | `agent/verify.ts` (+ write-time check in tools) |
-| Shadow git | `agent/checkpoints.ts` (+ same invocation in `web/review.ts`) |
-| Durable state, resume | `agent/store.ts` |
-| HTTP routes, security posture, static serving | `web/main.ts` |
-| Session bridge, live pumping | `web/session.ts`; SSE in `web/events.ts` |
-| Diff surgery / partial accept | `web/review.ts` |
-| Keys | `web/settings.ts` (~/.agentzero/settings.json, 0600) |
-| Headless driver | `cli.ts` (run/resume/providers/trace) |
+| The one loop, stuck detector, budgets, taxonomy, salvage marking | `agent/orchestrator.py` |
+| Model jobs + prompt contracts | `agent/workers.py` |
+| Route→dispatch→log→validate→repair | `agent/call.py`; HTTP in `agent/llm.py`; tolerance in `agent/parse.py` |
+| Context assembly + eviction | `agent/context.py` |
+| Per-call routing, rate buckets, scoring, budgets | `agent/router.py`; catalogue in `agent/providers.py` |
+| Retrieval v0 | `agent/retrieval.py` |
+| Tools + approval + env scrubbing | `agent/tools.py`; confinement in `agent/paths.py` |
+| Mechanical verification | `agent/verify.py` (+ write-time check in tools) |
+| Shadow git | `agent/checkpoints.py` (+ same invocation in `web/review.py`) |
+| Durable state, resume | `agent/store.py` |
+| HTTP routes, security posture, static serving | `web/main.py` |
+| Session bridge, live pumping | `web/session.py`; SSE in `web/events.py` |
+| Diff surgery / partial accept | `web/review.py` |
+| Keys | `web/settings.py` (~/.agentzero/settings.json, 0600) |
+| Headless driver | `cli.py` (run/resume/providers/trace) |
 | UI shell/tabs/pinning | `ui/src/App.tsx`, `panels/*`; stream fold in `state.ts`; readable feed in `activity.ts` |
-| Wire contract shared by both halves | `shared/types.ts` (type-only import from the UI) |
-| Behaviour pins | `server/test/agent.test.ts` (41 offline tests) |
+| Wire contract shared by both halves | `shared/types.py` (type-only import from the UI) |
+| Behaviour pins | `server/tests/` (228 offline tests, 11 files) |
