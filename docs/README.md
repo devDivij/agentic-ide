@@ -6,28 +6,22 @@ One deterministic loop in code drives many narrow, schema-checked model calls;
 every piece of task state lives in SQLite, so nothing is lost when a call, a
 provider, or the whole process dies.
 
-Two documents, for two questions:
-
-- **[docs/ARCHITECTURE-MAP.md](docs/ARCHITECTURE-MAP.md)** — *what is here*: a
-  diagrammed map of the system as built, including a section on what is
-  deliberately not built yet. Start here.
-- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — *why it is shaped this
-  way*: the reasoning, the trade-offs, and a guided reading order for the
-  code (the agentic core is 16 small files; budget 2–3 hours for all of it).
-
 ## Setup (Linux, macOS or Windows, from scratch)
+
 
 Requirements: **Python ≥ 3.12** (the runtime), **Node ≥ 22.5** (the UI's build
 tooling) and **git** on PATH. Nothing else — the server's only dependencies are
 pydantic, httpx, FastAPI and uvicorn, and SQLite ships with Python.
 
-On **Windows**, that git should be [Git for
-Windows](https://git-scm.com/download/win): the commands a model writes are
-POSIX shell, so the agent runs them through the bash that ships alongside it,
-found automatically. WSL's `bash` is deliberately *not* used — it would run
-commands inside Linux, where the project's path does not exist. (Running the
-whole app inside WSL is fine; that is then just the Linux setup. To point at
-some other shell, set `AGENTZERO_SHELL` to the full path of a `bash.exe`.)
+On **Windows**, install [Node.js ≥ 22.5](https://nodejs.org/) (the Windows
+installer from nodejs.org, or `winget install OpenJS.NodeJS.LTS`) and git as
+[Git for Windows](https://git-scm.com/download/win): the commands a model
+writes are POSIX shell, so the agent runs them through the bash that ships
+alongside Git for Windows, found automatically. WSL's `bash` is deliberately
+*not* used — it would run commands inside Linux, where the project's path
+does not exist. (Running the whole app inside WSL is fine; that is then just
+the Linux setup. To point at some other shell, set `AGENTZERO_SHELL` to the
+full path of a `bash.exe`.)
 
 ```bash
 git clone <this repo> && cd agentzero
@@ -64,6 +58,37 @@ each its own rate-limit bucket, so this only actually raises your throughput
 against a provider whose limits are per-key -- NVIDIA, Mistral, Google AI
 Studio and OpenRouter are; Groq's are per-organisation, so extra Groq keys are
 tracked the same way but won't lift its real ceiling.
+
+### Using provided API keys
+
+You may use the API keys given in the api_keys.txt
+
+If you've been handed a set of provider keys (e.g. dropped in a local,
+untracked `docs/api.txt`), get them into `.env` rather than typing them into
+the UI by hand:
+
+```bash
+cp .env.example .env   # if you don't have one yet
+```
+
+Then fill in each provider's line. A provider can hold more than one key —
+add extras with a numbered suffix, in order, with no gaps:
+
+```
+GROQ_API_KEY=first key
+GROQ_API_KEY_2=second key
+GROQ_API_KEY_3=third key
+```
+
+This only raises real throughput for providers with **per-key** limits
+(NVIDIA, Mistral, Google AI Studio, OpenRouter) — Groq's limits are
+per-organisation, so extra Groq keys are still tracked but won't lift its
+ceiling. Restart `npm run dev` after editing `.env` for it to pick up new
+keys; `npm run cli -- providers` confirms what's configured and reachable.
+
+`.env` is gitignored — never commit real keys. If keys arrive in a scratch
+file like `docs/api.txt`, keep it out of git too (it's covered by
+`.gitignore` already) and delete it once its contents are copied into `.env`.
 
 ### Local models (Ollama)
 
