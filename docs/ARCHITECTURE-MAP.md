@@ -159,7 +159,8 @@ FOR EACH STEP (skipped if any dependency failed):
     │        over the WHOLE task's diff, base..head: a pass over what no
     │        single step's own acceptance criteria could see (drift, dupe
     │        logic, a later step undoing an earlier guarantee)
-    │        skipped: no diff to look at, or the budget gate says stop
+    │        skipped: no diff to look at, the budget gate says stop, or the
+    │        task is micro_edit (one step, nothing earlier to contradict)
     │        ok=true or no issues ──► nothing happens, loop continues
     │        ok=false, no replans left ──► finding logged, not acted on
     │        ok=false, a replan left ──► culprit = the step the model named,
@@ -344,8 +345,13 @@ Groq         user     30/min · 12k tok/min ·        llama-3.3-70b-versatile   
 OpenRouter   user     20/min · 1k/day               qwen/qwen3-coder:free     30B*
   one key reaches free AND paid models               qwen/qwen3-coder (PAID)   30B* (*256k ctx)
                                                      mistralai/devstral-small 24B (paid)
-Ollama       floor    hardware-bound      [OFF]     qwen2.5-coder:7b          7B (32k ctx)
-Mistral      user     2 req/min           [OFF]     devstral-small-latest     24B
+Ollama       floor    hardware-bound                Seed-Coder-8B-Instruct    8B (32k ctx)
+  needs no key, on by default; a refused connection   (hf.co/unsloth GGUF, Q4_K_M,
+  falls through cleanly. Dense, fully VRAM-resident    5.07GB -- fits 8GB VRAM with
+  by design -- see providers.py's ollama notes for     no CPU offload; beats the
+  why a MoE model was rejected for this slot.          previous qwen2.5-coder:7b on
+                                                        BigCodeBench-Hard/LiveCodeBench)
+Mistral      user     2 req/min                     devstral-small-latest     24B
 
 assertLegalCatalogue() throws at boot (server AND cli AND web module load) if
 any entry exceeds MAX_TOTAL_PARAMS_B = 80. Compliance must be evidenced: every
@@ -411,13 +417,17 @@ refuses file access outside projects the user explicitly opened, and refuses
 ```
 Retrieval is lexical.      No tree-sitter graph, k-hop expansion, BM25 or
                            embeddings. retrieve()'s body is the documented seam.
-Verification is shallow.   Syntax + optional test command. No cross-family
-                           final grader, no checkpoint-bisect recovery. (A
-                           lighter milestone check IS built: REVIEW, §2 — an
-                           LLM pass every BATCH_REVIEW_SIZE=3 steps and once
-                           at the end, over the accumulated diff, that can
-                           trigger a revert+replan through the ordinary
-                           TAXONOMY path. Fact-purge on revert IS built.)
+Verification is shallow.   Syntax check (~10 languages) plus, when the
+                           planner adds one, a test step gated by its own
+                           run_command exit code -- not a model-trusted
+                           "done". No cross-family final grader, no
+                           checkpoint-bisect recovery. (A lighter milestone
+                           check IS built: REVIEW, §2 — an LLM pass every
+                           BATCH_REVIEW_SIZE=3 steps and once at the end
+                           (skipped for micro_edit), over the accumulated
+                           diff, that can trigger a revert+replan through the
+                           ordinary TAXONOMY path. Fact-purge on revert IS
+                           built.)
 Routing is static.         Preference tiers + buckets + pay-vs-wait. No bandit/
                            history adaptation, no escalation ladder, no
                            de-escalation at milestones.

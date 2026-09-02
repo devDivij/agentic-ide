@@ -126,6 +126,16 @@ export const api = {
       `/api/tasks/${encodeURIComponent(taskId)}/review`,
       { method: 'POST', body: JSON.stringify({ projectRoot, acceptedHunkIds, feedback }) }),
 
+  /**
+   * Reset the tree to right after `stepId` finished and discard every step
+   * after it. Does NOT retry those steps — the tree just goes back; what
+   * happens next is whatever the user types next.
+   */
+  revertToStep: (projectRoot: string, taskId: string, stepId: string) =>
+    request<{ revertedTo: string; stepsReset: string[] }>(
+      `/api/tasks/${encodeURIComponent(taskId)}/revert`,
+      { method: 'POST', body: JSON.stringify({ projectRoot, stepId }) }),
+
   providers: () => request<ProvidersResponse>('/api/providers'),
 
   setKey: (providerId: string, apiKey: string) =>
@@ -137,6 +147,12 @@ export const api = {
     request<{ reachable: boolean; detail: string }>(
       `/api/providers/${encodeURIComponent(providerId)}/test`,
       { method: 'POST', body: JSON.stringify({ apiKey }) }),
+
+  /** web_search's key (Exa) -- separate from setKey: not an LLM provider. */
+  setSearchKey: (apiKey: string) =>
+    request<{ ok: boolean; configured: boolean }>('/api/search/key', {
+      method: 'PUT', body: JSON.stringify({ apiKey }),
+    }),
 
   listFiles: (projectRoot: string, path: string) =>
     request<{ path: string; entries: Array<{ name: string; directory: boolean }> }>(

@@ -6,11 +6,17 @@ import math
 
 import pytest
 
-from agentzero.agent.providers import RateLimits
+from agentzero.agent.providers import RateLimits, get_provider
 from agentzero.agent.router import (
     BUDGETS, HARD_MAX_SECONDS, HARD_MAX_USD, MINUTE_MS, NoUsableModelError,
     RateBucket, Router, SECONDS_PER_USD, is_paying_worth_it, score_task,
 )
+
+#: Ollama needs no key (key_env=None), so it is ranked regardless of
+#: `configured` -- the local floor that is always there. Several tests below
+#: exercise "nothing usable"/"nothing free" scenarios that predate this and
+#: need it excluded explicitly to still mean what they say.
+_OLLAMA_CANDIDATES = [f"ollama/{m.id}" for m in get_provider("ollama").models]
 
 
 # -- the scoring formula the whole policy is derived from --------------------
@@ -105,11 +111,23 @@ def test_the_default_provider_leads_until_a_user_provider_can_serve_the_role():
 
 
 def test_a_provider_without_a_configured_key_is_never_ranked():
-    assert Router(configured=set()).rank("execute") == []
+    """
+    Ollama (key_env=None) is the one exception -- it needs no key at all, so
+    it is ranked regardless of `configured`. Every OTHER candidate must still
+    come from a provider actually in `configured`.
+    """
+    ranked = Router(configured=set()).rank("execute")
+    assert ranked                                  # Ollama alone
+    assert all(c.provider.id == "ollama" for c in ranked)
 
 
 def test_free_models_come_before_paid_ones():
-    ranked = Router(configured={"openrouter"}).rank("execute")
+    # Restricted to openrouter's own candidates: Ollama's floor-tier model is
+    # also free and also ranked, but tier outranks free/paid (rank()'s own
+    # docstring), so it sorts after openrouter's paid models, not before --
+    # correctly, but it would break a naive global cost check here.
+    ranked = [c for c in Router(configured={"openrouter"}).rank("execute")
+              if c.provider.id == "openrouter"]
     costs = [c.model.cost_per_m_tok_in for c in ranked]
     assert costs == sorted(costs, key=lambda c: c > 0)
 
@@ -147,22 +165,30 @@ def test_a_context_larger_than_every_window_is_a_clear_error():
         Router(configured={"groq"}).pick("classify", 10_000_000)
 
 
-def test_no_configured_key_for_a_role_is_a_clear_error():
+def test_no_usable_model_for_a_role_is_a_clear_error():
+    """
+    Ollama's local floor means an empty `configured` set alone no longer
+    starves every role (see test_a_provider_without_a_configured_key_is_never_
+    ranked) -- so this exercises the genuine "nothing usable at all" path by
+    excluding Ollama's own candidates too.
+    """
     router = Router(configured=set())
-    with pytest.raises(NoUsableModelError, match="Configure at least one API key"):
-        router.pick("execute", 100)
+    with pytest.raises(NoUsableModelError, match="No usable model"):
+        router.pick("execute", 100, exclude=_OLLAMA_CANDIDATES)
 
 
 def test_max_wait_ms_zero_raises_instead_of_sleeping():
     """
     A caller for whom the call is only an optional enhancement (retrieval's
     entity ranking) passes 0 so a busy bucket fails fast instead of blocking
-    the step for up to MAX_WAIT_MS.
+    the step for up to MAX_WAIT_MS. Ollama is excluded: its bucket carries no
+    limits, so it would otherwise be "ready" and short-circuit the scenario
+    this test is actually about (groq busy, nothing else ready).
     """
     router = Router(configured={"groq"})
     router._buckets["groq"].penalize(50_000)
     with pytest.raises(NoUsableModelError, match="rate-limited for more than 0s"):
-        router.pick("classify", 100, max_wait_ms=0)
+        router.pick("classify", 100, max_wait_ms=0, exclude=_OLLAMA_CANDIDATES)
 
 
 def test_snapshot_covers_every_provider():

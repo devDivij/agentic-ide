@@ -45,12 +45,18 @@ export interface ChatTask {
 export interface TaskActions {
   /** `feedback` is optional guidance, passed on whether or not it was allowed. */
   onApprove: (eventId: number, approved: boolean, feedback?: string) => void;
-  onReview: () => void;
+  /** Which task's diff to open the Review tab on -- there is no other way to say. */
+  onReview: (taskId: string) => void;
   onResume: (taskId: string) => void;
   onRetry: (prompt: string) => void;
   onAsk: (prompt: string) => void;
   onExplain: (taskId: string) => void;
   onStop: (taskId: string) => void;
+  /**
+   * Reset the tree to right after this step and discard every step after it.
+   * Confirmed by the caller before this fires — it overwrites files on disk.
+   */
+  onRevert: (taskId: string, stepId: string) => void;
 }
 
 /** Re-render on a timer, so an elapsed counter actually counts. */
@@ -68,11 +74,14 @@ function useTick(active: boolean, everyMs = 500): void {
 // ---------------------------------------------------------------------------
 
 /**
- * A message with its `@path[:12-40]` references rendered as clickable chips
- * (spec 7b: the output chat, not just the input box, must support pinning
- * and unpinning through these). Clicking one toggles it in the shared tray.
+ * Any chat text with its `@path[:12-40]` references rendered as clickable
+ * chips (spec 7b: the output chat, not just the input box, must support
+ * pinning and unpinning through these) — used for the human's own prompt AND
+ * the agent's own words (answers, step summaries, the closing report), since
+ * both sides can name a file this way. Clicking a chip toggles it in the
+ * shared tray. Text with no `@tag` in it renders as an ordinary string.
  */
-function PromptText({
+function TaggedText({
   text, pins, onTogglePin,
 }: {
   text: string;
@@ -133,12 +142,16 @@ export function TaskEntry({
         <div className="bubble user">
           <div className="bubble-label">you</div>
           {task.prompt
-            ? <PromptText text={task.prompt} pins={pins} onTogglePin={onTogglePin} />
+            ? <TaggedText text={task.prompt} pins={pins} onTogglePin={onTogglePin} />
             : <span className="muted">(resumed task)</span>}
         </div>
         <div className="bubble agent">
           <div className="bubble-label">agent</div>
-          <div className="aside-answer">{end?.summary}</div>
+          <div className="aside-answer">
+            {end?.summary
+              ? <TaggedText text={end.summary} pins={pins} onTogglePin={onTogglePin} />
+              : null}
+          </div>
         </div>
       </>
     );
@@ -148,7 +161,9 @@ export function TaskEntry({
     <>
       <div className="bubble user">
         <div className="bubble-label">you</div>
-        {task.prompt || <span className="muted">(resumed task)</span>}
+        {task.prompt
+          ? <TaggedText text={task.prompt} pins={pins} onTogglePin={onTogglePin} />
+          : <span className="muted">(resumed task)</span>}
       </div>
 
       <div className="bubble agent">
@@ -160,13 +175,19 @@ export function TaskEntry({
 
         {task.steps.length > 0 ? (
           <div className="steps">
-            {task.steps.map((s) => (
+            {task.steps.map((s, i) => (
               <Step
                 key={s.id}
                 step={s}
                 durationMs={durations.get(s.id)}
                 failure={failures.get(s.id)}
                 note={notes.get(s.id)}
+                pins={pins}
+                onTogglePin={onTogglePin}
+                // Nothing to discard on the last step, and reverting mid-run
+                // would fight the very steps still writing to the tree.
+                canRevert={!running && i < task.steps.length - 1}
+                onRevert={() => actions.onRevert(task.id, s.id)}
               />
             ))}
           </div>
@@ -202,13 +223,16 @@ export function TaskEntry({
             that the requested change is already present is a real outcome,
             and sending someone to review an empty diff reads as a bug. */}
         {task.status === 'awaiting_review' && end?.changedFiles !== 0 && (
-          <button className="primary" onClick={actions.onReview}>
+          <button className="primary" onClick={() => actions.onReview(task.id)}>
             Review the changes →
           </button>
         )}
 
         {/* Every finished task states how it ended, not just the bad ones. */}
-        {end && <Outcome end={end} task={task} actions={actions} />}
+        {end && (
+          <Outcome end={end} task={task} actions={actions}
+                  pins={pins} onTogglePin={onTogglePin} />
+        )}
 
         {/* Left mid-flight by a crash or a restart: the plan and every finished
             step are still on disk, so this picks up where it stopped. */}
@@ -253,12 +277,16 @@ export function TaskEntry({
 }
 
 function Step({
-  step, durationMs, failure, note,
+  step, durationMs, failure, note, pins, onTogglePin, canRevert, onRevert,
 }: {
   step: StepWire;
   durationMs: number | undefined;
   failure: FailureInfo | undefined;
   note: StepEndPayload | undefined;
+  pins: PinRef[];
+  onTogglePin: (pin: PinRef) => void;
+  canRevert: boolean;
+  onRevert: () => void;
 }): JSX.Element {
   return (
     <div className="step-block">
@@ -271,11 +299,29 @@ function Step({
         {durationMs !== undefined && (
           <span className="muted small">{(durationMs / 1000).toFixed(0)}s</span>
         )}
+        {canRevert && step.status === 'done' && (
+          <button
+            className="ghost small step-revert"
+            title={`Reset the code to right after ${step.id} and discard every step after it`}
+            onClick={() => {
+              if (confirm(
+                `Revert to ${step.id}? This resets the code to right after that step and `
+                + 'discards every step after it. The task itself will not re-run automatically.',
+              )) onRevert();
+            }}
+          >
+            Revert to here
+          </button>
+        )}
       </div>
 
       {/* What the agent says it actually did — the note it writes on finishing
           a step, which used to be discarded. */}
-      {note?.summary && <div className="step-note">{note.summary}</div>}
+      {note?.summary && (
+        <div className="step-note">
+          <TaggedText text={note.summary} pins={pins} onTogglePin={onTogglePin} />
+        </div>
+      )}
       {note?.filesTouched && note.filesTouched.length > 0 && (
         <div className="step-files muted small">
           {note.filesTouched.map((f) => <code key={f}>{f}</code>)}
@@ -306,15 +352,20 @@ function Failure({ failure }: { failure: FailureInfo }): JSX.Element {
 
 /** What happened overall, and what the person can do about it. */
 function Outcome({
-  end, task, actions,
+  end, task, actions, pins, onTogglePin,
 }: {
   end: TaskEndPayload; task: ChatTask; actions: TaskActions;
+  pins: PinRef[]; onTogglePin: (pin: PinRef) => void;
 }): JSX.Element {
   return (
     <div className="outcome">
       {/* The agent's own closing account comes first: it is what a person
           actually wants to read, and the status line is context for it. */}
-      {end.report && <div className="outcome-report">{end.report}</div>}
+      {end.report && (
+        <div className="outcome-report">
+          <TaggedText text={end.report} pins={pins} onTogglePin={onTogglePin} />
+        </div>
+      )}
 
       {end.links && end.links.length > 0 && (
         <div className="outcome-links">
@@ -324,7 +375,9 @@ function Outcome({
         </div>
       )}
 
-      <div className="outcome-summary">{end.summary}</div>
+      <div className="outcome-summary">
+        <TaggedText text={end.summary} pins={pins} onTogglePin={onTogglePin} />
+      </div>
       {end.abortReason && <div className="muted small">{end.abortReason}</div>}
       {end.advice && <div className="outcome-advice">{end.advice}</div>}
       <div className="row outcome-actions">
@@ -337,7 +390,7 @@ function Outcome({
             "the diff is empty", while undefined means an older task that
             never reported it, where offering is the safer guess. */}
         {end.stepsCompleted > 0 && end.changedFiles !== 0 && (
-          <button onClick={actions.onReview}>
+          <button onClick={() => actions.onReview(task.id)}>
             {end.status === 'awaiting_review' ? 'Review the changes' : 'Review partial changes'}
           </button>
         )}

@@ -78,6 +78,14 @@ export function App(): JSX.Element {
     () => readStoredConversation(localStorage.getItem('agentzero.projectRoot') ?? ''));
   /** The tasks of the open chat — the conversation history. */
   const [history, setHistory] = useState<TaskRow[]>([]);
+  /**
+   * Which task's diff the Review tab shows -- set explicitly by clicking
+   * "Review the changes" on a specific task's bubble, so reviewing an OLDER
+   * task in the chat doesn't silently show whatever `state.task` (the most
+   * recently active one) happens to be. Falls back to that when nothing has
+   * been explicitly picked yet -- e.g. clicking the Review tab directly.
+   */
+  const [reviewTaskId, setReviewTaskId] = useState<string | null>(null);
 
   const running = state.task?.status === 'running';
 
@@ -134,6 +142,7 @@ export function App(): JSX.Element {
           setDraft('');          // an @path tag pointing into the old tree
           setPins([]);
           setConversationId(chat);
+          setReviewTaskId(null);
           // The review pane builds a diff for state.task against the project
           // root; after a switch that pairing no longer exists.
           setTab((t) => (t === 'review' ? 'chat' : t));
@@ -151,6 +160,9 @@ export function App(): JSX.Element {
       else localStorage.removeItem(conversationKey(projectRoot));
     }
     setHistory([]);
+    // A review target picked in the chat just left must not silently carry
+    // into this one -- same class of bug as the project-switch case above.
+    setReviewTaskId(null);
     if (projectRoot) refreshHistory(projectRoot, id);
   }, [projectRoot, refreshHistory]);
 
@@ -202,6 +214,17 @@ export function App(): JSX.Element {
       .then(() => pushLog('info', 'Stop requested — finishing the current step.'))
       .catch((e: Error) => setToast(e.message));
   };
+
+  // Returns a promise (unlike resume/stop above) so Chat.tsx can refetch that
+  // task's trace once this actually lands -- nothing streams a follow-up for
+  // a revert the way a resume does.
+  const revertStep = (taskId: string, stepId: string): Promise<void> =>
+    api.revertToStep(projectRoot, taskId, stepId)
+      .then((r) => {
+        pushLog('info', `Reverted to ${r.revertedTo} — discarded ${r.stepsReset.length} step(s).`);
+        refreshHistory(projectRoot, conversationId);
+      })
+      .catch((e: Error) => { setToast(e.message); throw e; });
 
   const approve = (eventId: number, approved: boolean, feedback?: string): void => {
     void api.approve(projectRoot, eventId, approved, feedback)
@@ -298,7 +321,8 @@ export function App(): JSX.Element {
                 onResume={resume}
                 onStop={stop}
                 onApprove={approve}
-                onReview={() => setTab('review')}
+                onReview={(taskId) => { setReviewTaskId(taskId); setTab('review'); }}
+                onRevert={revertStep}
                 draft={draft}
                 setDraft={setDraft}
                 pins={pins}
@@ -310,7 +334,7 @@ export function App(): JSX.Element {
             {tab === 'review' && (
               <Review
                 projectRoot={projectRoot}
-                taskId={state.task?.id ?? null}
+                taskId={reviewTaskId ?? state.task?.id ?? null}
                 onApplied={(message) => { setToast(message); pushLog('info', message); }}
               />
             )}

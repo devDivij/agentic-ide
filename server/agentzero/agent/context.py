@@ -51,6 +51,13 @@ class ContextRequest(Data):
     #: distinction is load-bearing. Only set for TRIAGE's chat/lookup lanes,
     #: where the whole call is one message with no other memory at all.
     prior_task: str | None = None
+    #: TRIAGE's chat/lookup lanes only: one web_search result, gathered by
+    #: CODE (orchestrator.py) when classify_task's own call judged the
+    #: question needs current external knowledge it cannot have -- never a
+    #: second model round-trip. Pinned like prior_task: this is specifically
+    #: why the call is happening, so it must not be the thing silently
+    #: dropped under budget pressure.
+    web_result: str | None = None
     facts: list[Fact] = []
     chunks: list[CodeChunk] = []
     #: Outcome lines from earlier steps. First thing dropped under pressure.
@@ -169,6 +176,11 @@ def build_context(req: ContextRequest) -> BuiltContext:
         # would be first in line to drop under budget pressure, silently
         # reintroducing the exact anaphora failure this field exists to fix.
         add("prior_task", "prior-task", req.prior_task, "pinned")
+
+    if req.web_result:
+        add("web_result", "web-search",
+            f"Web search results (use if relevant, note they may be stale):\n"
+            f"{req.web_result}", "pinned")
 
     # --- evictable -----------------------------------------------------------
     for fact in req.facts:

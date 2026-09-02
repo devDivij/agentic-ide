@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import httpx
 import pytest
 
 from agentzero.agent.tools import (
@@ -20,6 +21,22 @@ from agentzero.agent.types import ApprovalDecision, ToolCall
 
 def approve_all(call, description):
     return ApprovalDecision(approved=True)
+
+
+class _FakeExaResponse:
+    """Stands in for httpx.Response so web_search tests need no network."""
+
+    def __init__(self, results, status_code=200):
+        self.status_code = status_code
+        self.text = ""
+        self._results = results
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError("boom", request=None, response=self)
+
+    def json(self):
+        return {"results": self._results}
 
 
 def reject_with(note=None):
@@ -57,7 +74,7 @@ def test_side_effecting_tools_are_marked_as_needing_approval():
 
 def test_the_tool_surface_stays_small():
     """Small models degrade as the menu grows, picking plausible-but-wrong tools."""
-    assert len(TOOLS) <= 6
+    assert len(TOOLS) <= 7
 
 
 def test_an_unknown_tool_is_reported_not_crashed(ctx):
@@ -80,15 +97,19 @@ def test_every_side_effecting_tool_asks_before_it_runs(project, tool):
     assert asked == [tool]
 
 
-def test_read_only_tools_never_ask(project):
+def test_read_only_tools_never_ask(project, monkeypatch):
     def approval(c, description):
         raise AssertionError("read-only tools must not ask for approval")
 
-    ctx = ToolContext(project_root=project, approval=approval)
+    ctx = ToolContext(project_root=project, approval=approval, search_api_key="k")
     Path(project, "a.py").write_text("x = 1\n")
     assert run_tool(ctx, call("read_file", path="a.py")).ok
     assert run_tool(ctx, call("list_files", path=".")).ok
     assert run_tool(ctx, call("search_code", query="x")).ok
+
+    monkeypatch.setattr("agentzero.agent.tools.httpx.post",
+                        lambda *a, **k: _FakeExaResponse(results=[]))
+    assert run_tool(ctx, call("web_search", query="x")).ok
 
 
 def test_a_rejection_reaches_the_model_in_the_humans_own_words(project):
@@ -299,3 +320,71 @@ def test_listing_hides_generated_directories(ctx, project):
     os.makedirs(Path(project, "src"))
     output = run_tool(ctx, call("list_files", path=".")).output
     assert "src/" in output and "node_modules" not in output
+
+
+# -- web_search ----------------------------------------------------------
+
+
+def test_web_search_needs_an_api_key(ctx):
+    """The default `ctx` fixture carries no search_api_key -- see settings.py::exa_key
+    for where it's actually resolved (settings file, falling back to the
+    environment); this module never reads the environment itself."""
+    result = run_tool(ctx, call("web_search", query="asyncio docs"))
+    assert not result.ok
+    assert "not configured" in result.output
+
+
+def test_web_search_an_empty_query_is_refused(project):
+    ctx = ToolContext(project_root=project, approval=approve_all, search_api_key="k")
+    assert not run_tool(ctx, call("web_search", query="   ")).ok
+
+
+def test_web_search_returns_formatted_results(project, monkeypatch):
+    ctx = ToolContext(project_root=project, approval=approve_all, search_api_key="k")
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        assert url == "https://api.exa.ai/search"
+        assert headers["x-api-key"] == "k"
+        assert json["query"] == "python asyncio docs"
+        return _FakeExaResponse(results=[
+            {"title": "asyncio — Python docs",
+             "url": "https://docs.python.org/3/library/asyncio.html",
+             "text": "asyncio is a library to write concurrent code."},
+        ])
+
+    monkeypatch.setattr("agentzero.agent.tools.httpx.post", fake_post)
+    result = run_tool(ctx, call("web_search", query="python asyncio docs"))
+    assert result.ok
+    assert "asyncio — Python docs" in result.output
+    assert "docs.python.org" in result.output
+    assert "concurrent code" in result.output
+
+
+def test_web_search_no_results_says_so_rather_than_failing(project, monkeypatch):
+    ctx = ToolContext(project_root=project, approval=approve_all, search_api_key="k")
+    monkeypatch.setattr("agentzero.agent.tools.httpx.post",
+                        lambda *a, **k: _FakeExaResponse(results=[]))
+    result = run_tool(ctx, call("web_search", query="something obscure"))
+    assert result.ok and "No results" in result.output
+
+
+def test_web_search_a_network_failure_is_information_not_a_crash(project, monkeypatch):
+    ctx = ToolContext(project_root=project, approval=approve_all, search_api_key="k")
+
+    def fake_post(*args, **kwargs):
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr("agentzero.agent.tools.httpx.post", fake_post)
+    result = run_tool(ctx, call("web_search", query="anything"))
+    assert not result.ok
+    assert "Web search failed" in result.output
+
+
+def test_web_search_an_http_error_status_is_reported(project, monkeypatch):
+    ctx = ToolContext(project_root=project, approval=approve_all, search_api_key="k")
+    monkeypatch.setattr(
+        "agentzero.agent.tools.httpx.post",
+        lambda *a, **k: _FakeExaResponse(results=[], status_code=401))
+    result = run_tool(ctx, call("web_search", query="anything"))
+    assert not result.ok
+    assert "401" in result.output

@@ -1,5 +1,5 @@
 """
-The agent's tool surface: six tools, described and dispatched from the same
+The agent's tool surface: seven tools, described and dispatched from the same
 table so what the model is told and what actually runs cannot drift.
 
 Two rules shape this file:
@@ -19,6 +19,8 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+
+import httpx
 
 from .paths import confine_path, to_posix
 from .retrieval import IGNORED_DIRS, find_matches, scan_project, to_regions
@@ -55,13 +57,20 @@ TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="run_command", args="command", side_effecting=True,
         description="Run a shell command in the project root and wait for it to finish, "
-                    "e.g. the test suite. Use this to verify your own work. "
+                    "e.g. the test suite, or git (diff/log/status/branch/commit/merge -- "
+                    "the project's OWN git repo, not this tool's internal checkpoints). "
+                    "Use this to verify your own work. "
                     "Do NOT use it to start a server — it waits for the command to exit."),
     ToolSpec(
         name="start_server", args="command", side_effecting=True,
         description="Start a long-running process (a dev server, a watcher) in the "
                     "background and return the URL it printed, without waiting for it "
                     "to exit. Use this whenever the task asks you to run or serve something."),
+    ToolSpec(
+        name="web_search", args="query", side_effecting=False,
+        description="Search the public web (current docs, API changes, error messages, "
+                    "library versions). Use this for anything outside the project's own "
+                    "code -- read_file/search_code already cover the project itself."),
 ]
 
 
@@ -84,6 +93,10 @@ class ToolContext:
 
     project_root: str
     approval: ApprovalFn
+    #: web_search's key (Exa), resolved by the caller from Settings/.env --
+    #: this module never reads the environment itself, so it works the same
+    #: whether the key came from the settings screen or a fallback env var.
+    search_api_key: str | None = None
     #: Called after any write so the retrieval cache can invalidate.
     on_files_changed: Callable[[list[str]], None] | None = None
     # Called with any process the agent leaves running, so whoever owns the
@@ -148,6 +161,8 @@ def _dispatch(ctx: ToolContext, call: ToolCall) -> ToolResult:
             return _run_command(ctx, str(args.get("command") or ""))
         case "start_server":
             return _start_server(ctx, str(args.get("command") or ""))
+        case "web_search":
+            return web_search(str(args.get("query") or ""), ctx.search_api_key)
         case _:
             return ToolResult(ok=False, output=f"Unhandled tool: {call.name}")
 
@@ -365,6 +380,59 @@ def _start_server(ctx: ToolContext, command: str) -> ToolResult:
         + f"\nOutput so far:\n{_truncate(output) or '(none yet)'}"
         + "\n\nDo not start it again. If this is what the task asked for, you are done — "
           "report the URL above in your summary."))
+
+
+#: Exa (exa.ai) does semantic web search with the actual page text included in
+#: the response, so the model gets grounding in one call instead of a link it
+#: would then need read_file-style fetching for -- which this agent has no
+#: tool for anyway. The key itself is the CALLER's job to resolve (Settings
+#: screen, falling back to EXA_API_KEY -- see settings.py::exa_key) and is
+#: threaded in fresh on every call via ToolContext/Agent, not read from the
+#: environment here, so a key entered on the Settings screen mid-session
+#: takes effect on the very next call without a restart.
+EXA_SEARCH_URL = "https://api.exa.ai/search"
+
+
+def web_search(query: str, api_key: str | None) -> ToolResult:
+    if not query.strip():
+        return ToolResult(ok=False, output="Empty query")
+    if not api_key:
+        return ToolResult(ok=False, output=(
+            "Web search is not configured. Tell the human this needs an Exa API key "
+            "(https://exa.ai) added on the Settings screen, then continue without it."))
+
+    try:
+        response = httpx.post(
+            EXA_SEARCH_URL,
+            headers={"x-api-key": api_key, "content-type": "application/json"},
+            json={
+                "query": query,
+                "numResults": 5,
+                # "auto" lets Exa pick keyword vs neural search per query --
+                # a version number or exact error string wants keyword match,
+                # a "how do I..." question wants neural.
+                "type": "auto",
+                "contents": {"text": {"maxCharacters": 1000}},
+            },
+            timeout=15)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as err:
+        detail = err.response.text[:200]
+        return ToolResult(ok=False, output=f"Web search failed: HTTP {err.response.status_code} {detail}")
+    except httpx.HTTPError as err:
+        return ToolResult(ok=False, output=f"Web search failed: {err}")
+
+    results = (response.json() or {}).get("results") or []
+    if not results:
+        return ToolResult(ok=True, output="No results.")
+
+    lines = []
+    for r in results:
+        title = r.get("title") or r.get("url") or "(untitled)"
+        url = r.get("url") or ""
+        text = (r.get("text") or "").strip().replace("\n", " ")
+        lines.append(f"- {title} — {url}\n  {text[:500]}")
+    return ToolResult(ok=True, output=_truncate("\n".join(lines)))
 
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")

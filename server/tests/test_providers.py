@@ -27,13 +27,6 @@ def test_every_role_can_be_served_by_an_enabled_provider():
         assert candidates_for_role(role), f"no enabled model serves {role}"
 
 
-def test_disabled_providers_are_never_candidates():
-    disabled = {p.id for p in PROVIDERS if not p.enabled}
-    assert disabled, "the catalogue should keep ready-to-enable rows"
-    for role in ROLES:
-        assert not ({c.provider.id for c in candidates_for_role(role)} & disabled)
-
-
 def test_lookups_miss_cleanly():
     assert get_provider("nope") is None
     assert get_model("nvidia", "nope") is None

@@ -4,7 +4,7 @@ Headless driver for the agent runtime -- how the evaluation harness runs it,
 and the proof that the runtime does not depend on the UI.
 
 Commands:
-  run <prompt> [--project DIR] [--yes] [--test CMD]
+  run <prompt> [--project DIR] [--yes]
   resume [<taskId>] [--project DIR] [--yes]     resume an interrupted task
   providers                                     configured / reachable
   trace <taskId> [--project DIR]                print the call hierarchy
@@ -30,7 +30,7 @@ from .agent.store import Store, now_ms
 from .agent.types import ApprovalDecision, ToolCall
 # Same key resolution as the web server: the Settings screen's file first, the
 # environment filling gaps -- a key entered in the UI works here too.
-from .web.settings import effective_keys
+from .web.settings import effective_keys, exa_key
 
 USAGE = """
 agentzero — headless agent runtime
@@ -38,7 +38,6 @@ agentzero — headless agent runtime
   run <prompt>         Run a task in the current project
     --project DIR        Project root (default: cwd)
     --yes                Auto-approve side-effecting tools (batch runs only)
-    --test "CMD"         Command that runs the test suite, used by verification
 
   resume [<taskId>]    Resume an interrupted task (latest one if no id given)
   providers            Probe every model with a real call; show what answers
@@ -55,7 +54,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("command", nargs="?")
     parser.add_argument("target", nargs="?")
     parser.add_argument("--project")
-    parser.add_argument("--test")
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--quick", action="store_true")
     return parser
@@ -116,8 +114,8 @@ def _start_task(args: argparse.Namespace, prompt: str, resume_task_id: str | Non
     agent = create_agent(
         project_root=project_root,
         keys=keys,
+        search_api_key=exa_key(),
         approval=_auto_approve if args.yes else _terminal_approval,
-        test_command=args.test,
         on_progress=lambda message: print(f"  {message}"),
         on_route=lambda d, role: print(
             f"  -> [{d.provider_id}] {d.model_id}  ({d.reason})"),

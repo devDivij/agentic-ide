@@ -33,7 +33,7 @@ export function Chat({
   projectRoot, conversationId, conversations, onSelectConversation,
   onRenameConversation,
   task, steps, trace, logs, approvals, asides, history, running,
-  onSubmit, onBytheway, onResume, onStop, onApprove, onReview, draft, setDraft,
+  onSubmit, onBytheway, onResume, onStop, onApprove, onReview, onRevert, draft, setDraft,
   pins, onRemovePin, onTogglePin, onClearPins,
 }: {
   projectRoot: string;
@@ -56,7 +56,13 @@ export function Chat({
   onResume: (taskId: string) => void;
   onStop: (taskId: string) => void;
   onApprove: (eventId: number, approved: boolean, feedback?: string) => void;
-  onReview: () => void;
+  onReview: (taskId: string) => void;
+  /**
+   * Unlike the other actions, this one resolves: nothing streams a follow-up
+   * for a revert the way a resume does, so this component has to know when
+   * it is done in order to refetch the trace itself (see `handleRevert`).
+   */
+  onRevert: (taskId: string, stepId: string) => Promise<void>;
   draft: string;
   setDraft: (value: string) => void;
   /** The active manual-context tray — files/ranges pinned by hand. */
@@ -98,11 +104,22 @@ export function Chat({
     composer.current?.focus();
   };
 
+  // A revert has no live task streaming its aftermath onto the trace, unlike
+  // resume/stop -- so once the server confirms it, pull the trace fresh
+  // (same fetch `onExplain` uses) to pick up the step resets it recorded.
+  const handleRevert = (taskId: string, stepId: string): void => {
+    void onRevert(taskId, stepId)
+      .then(() => api.trace(projectRoot, taskId))
+      .then((r) => setFetched((f) => ({ ...f, [taskId]: r.events })))
+      .catch(() => undefined);       // failure already surfaced by onRevert
+  };
+
   const actions: TaskActions = {
     onApprove,
     onStop,
     onReview,
     onResume,
+    onRevert: handleRevert,
     onRetry: focusComposer,
     onAsk: () => focusComposer('/bytheway '),
     onExplain: explain,

@@ -22,7 +22,7 @@ Everything below follows from what a small model **cannot** do:
 |---|---|
 | Drifts over long horizons, cannot self-steer | Control flow lives in code. Models fill slots; the loop decides what happens next |
 | Poor at open-ended judgement, fine at narrow scoped jobs | One call = one narrow job with one schema. No rolling conversation anywhere |
-| Unreliable self-critic | Verification is mechanical first (parse, tests). Model judgement is used only for classification |
+| Unreliable self-critic | Verification is mechanical first (parse; and for a planner-added test step, that step's own `run_command` exit code, not the model's "done"). Model judgement is used only for classification |
 | Any call can die on a rate limit | State lives in SQLite, never in a conversation, so a dead call costs only itself |
 | Cannot produce nested structured output reliably | Executor replies are one flat JSON object; the loop reassembles the tool call |
 
@@ -64,7 +64,7 @@ To swap an implementation you edit the file that owns it. Suggested order:
 | plan | 1× per task | break the request into steps | routed to the strongest tier; output normalised in code |
 | execute | many | one tool call or "done" per turn | flat schema, tools reassembled in code, stuck-detector watches it |
 | diagnose | on failure | label WHY a step failed | one label from seven; the label→action table lives in code |
-| review | every 3 steps + once at the end | label what a batch of *passing* steps got wrong that no step's own checks could see | `{ok, issues[]}` only; same split as diagnose — never decides the response |
+| review | every 3 steps + once at the end (skipped for `micro_edit`: one step has nothing earlier to be inconsistent with) | label what a batch of *passing* steps got wrong that no step's own checks could see | `{ok, issues[]}` only; same split as diagnose — never decides the response |
 | ask | on demand | `/bytheway` isolated Q&A | no task state can reach it |
 
 The diagnose split is the key trick for using weak models on judgement-shaped
@@ -223,7 +223,7 @@ do not change.
 |---|---|---|
 | Term extraction + literal search retrieval | tree-sitter symbol graph, hybrid lexical/dense entry, k-hop expansion | `retrieval.py` |
 | Priority-eviction compaction, relevance-ranked within each tier (lexical term overlap) | cross-call fact dedup, richer per-role budgets | `context.py` |
-| Syntax + test verification | milestone gates; different-model final gate | `verify.py` |
+| Syntax verification, ~10 languages; testing is a planner-added step gated by its own exit code | milestone gates; different-model final gate | `verify.py` (syntax), `orchestrator.py` (the test step's gate) |
 | Static preference ranking | provider health scores, escalation ladder | `router.py` |
 | Sequential steps | parallel independent steps (the `depends_on` ready-set already supports it) | `orchestrator.py` |
 

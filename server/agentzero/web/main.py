@@ -39,11 +39,11 @@ from ..agent.router import Router
 from ..agent.store import Store, conversation_title
 from ..agent.workers import ask_aside
 from .events import EventBus
-from .review import apply_selection, build_review
+from .review import apply_selection, build_review, revert_to_step
 from .session import Session
 from .settings import (
-    effective_keys, key_presence, load_settings, save_settings, set_provider_key,
-    settings_path,
+    EXA_PROVIDER_ID, effective_keys, exa_key, key_presence, load_settings,
+    save_settings, set_provider_key, settings_path,
 )
 
 PORT = int(os.environ.get("AGENTZERO_PORT") or 4319)
@@ -73,7 +73,7 @@ def session_for(project_root: str) -> Session:
     root = str(Path(project_root).resolve())
     session = _sessions.get(root)
     if session is None:
-        session = Session(root, effective_keys(), bus)
+        session = Session(root, effective_keys(), bus, search_api_key=exa_key())
         _sessions[root] = session
     return session
 
@@ -161,6 +161,11 @@ def get_providers() -> dict[str, Any]:
             for p in PROVIDERS for m in p.models
         ],
         "settingsPath": settings_path(),
+        # Not an LLM routing provider (it doesn't appear in PROVIDERS / route
+        # anywhere), but it's the same "type a key into Settings" story as
+        # every provider above, for the web_search tool -- see settings.py.
+        "search": {"providerId": EXA_PROVIDER_ID, "label": "Exa (web search)",
+                   "configured": exa_key() is not None},
     }
 
 
@@ -177,6 +182,20 @@ def put_provider_key(provider_id: str, body: KeyBody) -> dict[str, Any]:
     for root in list(_sessions):
         _sessions.pop(root).close()
     return {"ok": True, "configured": key_presence()}
+
+
+@app.put("/api/search/key")
+def put_search_key(body: KeyBody) -> dict[str, Any]:
+    """
+    The web_search tool's key, saved the same way a provider's is. Kept off
+    the /api/providers/{id}/key path on purpose: that endpoint 404s anything
+    not in the LLM routing catalogue (PROVIDERS), and Exa isn't a chat
+    provider -- it has no models, no rate buckets, nothing Router touches.
+    """
+    set_provider_key(EXA_PROVIDER_ID, body.apiKey)
+    for root in list(_sessions):
+        _sessions.pop(root).close()
+    return {"ok": True, "configured": exa_key() is not None}
 
 
 @app.post("/api/providers/{provider_id}/test")
@@ -399,6 +418,38 @@ def post_review(task_id: str, body: ReviewBody) -> dict[str, Any]:
         session = session_for(root)
         if not session.is_running:
             session.start("", resume_task_id=task_id)
+    return result.wire()
+
+
+class RevertBody(BaseModel):
+    projectRoot: str | None = None
+    stepId: str | None = None
+
+
+@app.post("/api/tasks/{task_id}/revert")
+def post_revert(task_id: str, body: RevertBody) -> dict[str, Any]:
+    """
+    Reset the tree to right after `stepId` finished and discard every step
+    after it -- deliberately does NOT auto-resume (see review.py's module
+    note): a revert means the user wants to go a different direction, and the
+    next thing that should run is their next prompt, not the old plan's
+    unchanged tail.
+    """
+    if not body.projectRoot or not body.stepId:
+        raise HTTPException(400, "projectRoot and stepId are required")
+    root = str(Path(body.projectRoot).resolve())
+    session = session_for(root)
+    if session.is_running:
+        raise HTTPException(409, "Stop the running task before reverting.")
+    try:
+        result = revert_to_step(root, task_id, body.stepId)
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+
+    bus.publish({
+        "type": "log", "projectRoot": root, "taskId": task_id, "level": "info",
+        "message": (f"Reverted to {result.reverted_to} — discarded "
+                    f"{len(result.steps_reset)} step(s) after it.")})
     return result.wire()
 
 

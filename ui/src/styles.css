@@ -315,6 +315,7 @@ body:has(.splitter.dragging) { user-select: none; }
 .step-failed { color: var(--bad); }
 .step-running .step-mark { color: var(--accent); }
 .step-skipped { color: var(--muted); text-decoration: line-through; }
+.step-revert { flex-shrink: 0; padding: 0 4px; }
 
 .metrics { display: flex; gap: 14px; margin-top: 8px; font-size: 11px; color: var(--muted); }
 .metrics + button { margin-top: 10px; }

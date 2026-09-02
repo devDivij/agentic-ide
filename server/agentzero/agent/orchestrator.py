@@ -41,12 +41,12 @@ from .retrieval import Retriever
 from .router import BUDGETS, RouteDecision, Router
 from .shell import assert_shell_available, terminate
 from .store import Store, conversation_title, now_ms
-from .tools import ToolContext, run_tool
+from .tools import ToolContext, run_tool, web_search
 from .types import (
     ApprovalFn, CodeChunk, Data, FailureClass, NewEvent, Plan, PlanStep, Role,
     StepRecord, StepStatus, Task, TaskStatus, ToolCall,
 )
-from .verify import verify_changes
+from .verify import Verdict, verify_changes
 from .workers import (
     WorkerCtx, answer_chat, answer_lookup, classify_task, diagnose_failure,
     execute_turn, make_plan, normalise_plan, review_batch, single_step_plan,
@@ -87,8 +87,8 @@ def must_act_now(turns: int) -> str:
         "you already have the project's file list and the relevant code above. "
         'Your next action MUST be write_file (or start_server if the task asks you '
         'to run something, or "done" if the work is already complete, or "blocked" '
-        "if you genuinely cannot proceed). Do NOT call read_file, list_files or "
-        "search_code again.")
+        "if you genuinely cannot proceed). Do NOT call read_file, list_files, "
+        "search_code or web_search again.")
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +111,10 @@ class Agent(WorkerCtx):
     retriever: Retriever
     checkpoints: Checkpoints
     approval: ApprovalFn
-    test_command: str | None = None
+    #: web_search's key (Exa). Separate from `keys` on purpose: `keys` feeds
+    #: Router's provider ranking, and Exa is not an LLM routing provider --
+    #: it has no models or rate buckets, so it does not belong in that set.
+    search_api_key: str | None = None
     on_progress: Callable[[str], None] | None = None
     # Processes the agent started and left running (dev servers). Held so the
     # owner of the session can stop them; `stop_background` does that.
@@ -123,7 +126,7 @@ def create_agent(
     keys: dict[str, str],
     approval: ApprovalFn,
     *,
-    test_command: str | None = None,
+    search_api_key: str | None = None,
     on_progress: Callable[[str], None] | None = None,
     on_route: Callable[[RouteDecision, Role], None] | None = None,
 ) -> Agent:
@@ -136,11 +139,11 @@ def create_agent(
         db=Store(project_root),
         router=Router(set(keys.keys()), on_route),
         keys=keys,
+        search_api_key=search_api_key,
         retriever=Retriever(project_root),
         checkpoints=Checkpoints(project_root),
         project_rules=read_project_rules(project_root),
         approval=approval,
-        test_command=test_command,
         on_progress=on_progress,
         # Fires when the user asks the task to stop. Checked at every loop
         # boundary and handed to the HTTP layer, so an in-flight model call is
@@ -315,8 +318,25 @@ def run_task(agent: Agent, prompt: str, *, resume_task_id: str | None = None,
                     payload={"tool": "retrieve",
                              "chunks": [f"{c.path}:{c.start_line}-{c.end_line}"
                                         for c in chunks]}))
-            reply = (answer_lookup(agent, task, chunks, root_id, prior_task) if mode == "lookup"
-                     else answer_chat(agent, task, root_id, prior_task))
+
+            # classify_task's own call already decided whether this needs
+            # external grounding (Classification.web_query) -- one search in
+            # code, never a second classify round-trip.
+            web_result: str | None = None
+            if classification.web_query.strip():
+                _report(agent, f"Searching the web: {classification.web_query}")
+                search = web_search(classification.web_query, agent.search_api_key)
+                db.append_event(NewEvent(
+                    task_id=task.id, parent_id=root_id, kind="tool_call",
+                    payload={"tool": "web_search", "query": classification.web_query,
+                             "result": search.wire()},
+                    status="ok" if search.ok else "error"))
+                if search.ok:
+                    web_result = search.output
+
+            reply = (answer_lookup(agent, task, chunks, root_id, prior_task, web_result)
+                     if mode == "lookup"
+                     else answer_chat(agent, task, root_id, prior_task, web_result))
             if not reply.requires_edits:
                 db.set_status(task.id, "done")
                 db.append_event(NewEvent(
@@ -397,8 +417,16 @@ def run_task(agent: Agent, prompt: str, *, resume_task_id: str | None = None,
                 # problem only visible once the last step is in. A finding
                 # here re-enters the SAME replan path a step failure would;
                 # `outcome` becomes a _Replan and falls through to it below.
-                review = _run_final_review(agent, task, plan, base_sha, root_id,
-                                           started_at, replans_used)
+                #
+                # Skipped for micro_edit: L2's whole job is judging the
+                # accumulated diff against EARLIER steps (contradicts one,
+                # duplicates one, undoes one's guarantee) -- a single-step
+                # plan has no earlier step to be inconsistent with, so the
+                # call can only ever come back clean. Spending it anyway
+                # would just be an LLM call with no possible finding.
+                review = (None if from_micro_edit else
+                          _run_final_review(agent, task, plan, base_sha, root_id,
+                                            started_at, replans_used))
                 if review is None:
                     break
                 outcome = review
@@ -1072,11 +1100,20 @@ def _run_one_step(agent: Agent, task: Task, plan: Plan, step: PlanStep,
             # work that actually exists; only a step that changed nothing fails
             # on the model's word alone.
             if result.outcome == "blocked" and not result.files_touched:
-                problem = result.blocked_reason or "executor reported it was blocked"
+                problem = "\n".join(
+                    p for p in [result.blocked_reason, result.last_command_failed] if p
+                ) or "executor reported it was blocked"
             else:
                 # Mechanical gate: cheap, and it cannot hallucinate a pass.
-                verdict = verify_changes(
-                    agent.project_root, result.files_touched, agent.test_command)
+                # `last_command_failed` folds in here too -- a planner-added
+                # test step touches no files, so verify_changes alone would
+                # rubber-stamp it; the LAST run_command's real exit code, not
+                # the model's "done", is what decides a step like that.
+                verdict = verify_changes(agent.project_root, result.files_touched)
+                if result.last_command_failed:
+                    verdict = Verdict(
+                        passed=False,
+                        problems=[*verdict.problems, result.last_command_failed])
                 db.append_event(NewEvent(
                     task_id=task.id, parent_id=step_event_id, kind="verify",
                     step_id=step.id, payload=verdict.wire(),
@@ -1315,6 +1352,17 @@ class _TurnsResult:
     # `model_blocked` is the executor's own claim and is the only case that may
     # need one.
     blocked_kind: Literal["looping", "turn_limit", "model_blocked"] | None = None
+    # The exit code of the LAST `run_command` call this step made, if it was
+    # non-zero -- None if the step never ran a command, or its last one
+    # passed. This is what makes a planner-added "run the tests" step
+    # mechanical rather than a model's word for it: a small model completing
+    # a step after reading red test output and saying "done" anyway is
+    # exactly the self-verification failure this whole gate exists to avoid
+    # (see the "Blocked" note below). Only the LAST call counts -- a red run
+    # earlier in the step that the model then fixed and re-ran clean is not a
+    # failure, and re-checking every intermediate run would punish exactly
+    # the debugging loop this tool exists to support.
+    last_command_failed: str | None = None
 
 
 def _execute_step_turns(agent: Agent, task: Task, plan: Plan, step: PlanStep,
@@ -1343,6 +1391,8 @@ def _execute_step_turns(agent: Agent, task: Task, plan: Plan, step: PlanStep,
     fingerprints: dict[str, int] = {}
     #: Consecutive turns spent looking around without changing anything.
     exploring = 0
+    #: Overwritten on every run_command call -- only the LAST one survives.
+    last_command_failed: str | None = None
 
     for _turn in range(MAX_TURNS_PER_STEP):
         # Between turns is the cheapest safe place to stop: the last tool call
@@ -1375,14 +1425,15 @@ def _execute_step_turns(agent: Agent, task: Task, plan: Plan, step: PlanStep,
                 files_touched=list(files_touched),
                 new_facts=action.new_facts or [],
                 blocked_reason=action.blocked_reason,
-                blocked_kind="model_blocked" if action.action == "blocked" else None)
+                blocked_kind="model_blocked" if action.action == "blocked" else None,
+                last_command_failed=last_command_failed)
 
         tool_call = to_tool_call(action)
         if tool_call is None:
             transcript.append(
                 f'You replied with "{action.action}", which is not a tool. Use one of: '
                 "read_file, list_files, search_code, write_file, run_command, "
-                "start_server, done, blocked.")
+                "start_server, web_search, done, blocked.")
             continue
 
         fingerprint = json.dumps({"name": tool_call.name, "args": tool_call.args},
@@ -1415,11 +1466,13 @@ def _execute_step_turns(agent: Agent, task: Task, plan: Plan, step: PlanStep,
                 blocked_reason=(
                     f"Called {tool_call.name}({summarise_args(tool_call.args)}) with "
                     f"identical arguments {seen} times without making progress."),
-                blocked_kind="looping")
+                blocked_kind="looping",
+                last_command_failed=last_command_failed)
 
         result = run_tool(ToolContext(
             project_root=agent.project_root,
             approval=agent.approval,
+            search_api_key=agent.search_api_key,
             on_files_changed=lambda _paths: agent.retriever.invalidate(),
             on_process_started=agent.background.append,
         ), tool_call)
@@ -1434,6 +1487,15 @@ def _execute_step_turns(agent: Agent, task: Task, plan: Plan, step: PlanStep,
         changed_something = tool_call.name in ("write_file", "start_server")
         exploring = 0 if changed_something else exploring + 1
 
+        # Ground truth for a planner-added test step: the model's own "done"
+        # is not trusted to notice red output (that is the whole reason
+        # verify_changes exists below), so track the LAST run_command's exit
+        # status directly and let it override a cheerful "done" later.
+        if tool_call.name == "run_command":
+            last_command_failed = None if result.ok else (
+                f"`{tool_call.args.get('command', '')}` exited non-zero:\n"
+                + result.output[-2000:])
+
         for path in result.files_touched or []:
             files_touched[path] = None
         transcript.append(
@@ -1444,6 +1506,7 @@ def _execute_step_turns(agent: Agent, task: Task, plan: Plan, step: PlanStep,
         outcome="blocked",
         summary=f"Did not finish within {MAX_TURNS_PER_STEP} turns.",
         files_touched=list(files_touched),
+        last_command_failed=last_command_failed,
         new_facts=[],
         blocked_reason=(f"The step used all {MAX_TURNS_PER_STEP} of its turns "
                         "without finishing."),
@@ -1591,7 +1654,7 @@ def to_tool_call(action: Any) -> ToolCall | None:
     match action.action:
         case "read_file" | "list_files":
             return ToolCall(name=action.action, args={"path": action.path or "."})
-        case "search_code":
+        case "search_code" | "web_search":
             return ToolCall(name=action.action, args={"query": action.query or ""})
         case "write_file":
             return ToolCall(name=action.action,

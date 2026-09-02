@@ -42,6 +42,20 @@ export function Settings(): JSX.Element {
     setStatus((s) => ({ ...s, [providerId]: result.detail }));
   };
 
+  // Same drafts/status maps as the LLM providers above, keyed by the same
+  // providerId ("exa") the server sends -- it just isn't in `data.providers`
+  // because it doesn't route chat calls. See setSearchKey in api.ts.
+  const saveSearch = async (providerId: string): Promise<void> => {
+    try {
+      await api.setSearchKey(drafts[providerId] ?? '');
+      setDrafts((d) => ({ ...d, [providerId]: '' }));
+      setStatus((s) => ({ ...s, [providerId]: 'saved' }));
+      load();
+    } catch (e) {
+      setStatus((s) => ({ ...s, [providerId]: (e as Error).message }));
+    }
+  };
+
   if (error) return <div className="panel error">{error}</div>;
   if (!data) return <div className="panel">Loading…</div>;
 
@@ -139,6 +153,45 @@ export function Settings(): JSX.Element {
           </div>
         );
       })}
+
+      <h2>Optional tools</h2>
+      <p className="muted">
+        Not a model provider — this powers the agent's own web_search tool.
+        Without it, the agent is told search isn't configured and continues
+        without it; nothing else in the system needs this key.
+      </p>
+      <div className="provider">
+        <div className="provider-head">
+          <strong>{data.search.label}</strong>
+          <span className={data.search.configured ? 'tag ok' : 'tag'}>
+            {data.search.configured ? 'configured' : 'not configured'}
+          </span>
+        </div>
+        <div className="row">
+          <input
+            type="password"
+            placeholder="Paste EXA_API_KEY"
+            value={drafts[data.search.providerId] ?? ''}
+            onChange={(e) =>
+              setDrafts((d) => ({ ...d, [data.search.providerId]: e.target.value }))}
+          />
+          <button onClick={() => void saveSearch(data.search.providerId)}>Save</button>
+          {data.search.configured && (
+            <button
+              className="danger"
+              onClick={() => {
+                setDrafts((d) => ({ ...d, [data.search.providerId]: '' }));
+                void api.setSearchKey('').then(load);
+              }}
+            >
+              Clear
+            </button>
+          )}
+        </div>
+        {status[data.search.providerId] && (
+          <div className="muted">{status[data.search.providerId]}</div>
+        )}
+      </div>
     </div>
   );
 }

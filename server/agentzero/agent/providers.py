@@ -315,25 +315,51 @@ PROVIDERS: list[ProviderSpec] = [
         label="Local (Ollama)",
         base_url=os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434/v1",
         key_env=None,
-        # Off by default: routing to a local model that is not installed gives a
-        # confusing connection error. Flip to True once `ollama pull` has run.
-        enabled=False,
+        # On by default: a connection refused (nothing pulled/serving on
+        # localhost:11434) is caught generically in llm.py's
+        # _post_with_timeout and turned into a TransientProviderError like
+        # any other transient failure, so the router just excludes it and
+        # falls through to the next candidate -- never a raw traceback. Its
+        # 'floor' preference (below) already means it is picked last, so
+        # having no model actually pulled costs nothing beyond that one
+        # excluded attempt. See README.md for the `ollama pull` setup.
+        enabled=True,
         preference="floor",
         limits=RateLimits(),
         notes=(
-            "Zero-key floor. The 16GB RAM / 8GB VRAM limit means a ~7B model at "
-            "Q4. Too weak to lead; used when no key is configured or every "
-            "remote bucket is exhausted."
+            "Zero-key floor. The 16GB RAM / 8GB VRAM limit means a dense ~8B "
+            "model at Q4, fully VRAM-resident -- deliberately NOT a MoE model "
+            "offloaded across VRAM+RAM (gpt-oss-20b, Qwen3-Coder-30B-A3B): "
+            "real-world reports put CPU-offloaded MoE at 8GB VRAM around "
+            "30 tok/s or worse and highly system-RAM-bandwidth-dependent, "
+            "which is the wrong trade for a fallback whose only job is to be "
+            "a predictable last resort, not a source of new timeouts. Too "
+            "weak to lead; used when no key is configured or every remote "
+            "bucket is exhausted."
         ),
         models=[
             ModelSpec(
-                id="qwen2.5-coder:7b",
-                total_params_b=7,
-                params_source="Qwen2.5-Coder model card: 7B dense",
+                # Not in Ollama's official curated library -- pulled straight
+                # from Hugging Face (`ollama pull
+                # hf.co/unsloth/Seed-Coder-8B-Instruct-GGUF`, defaults to
+                # Q4_K_M); Ollama registers it under this exact string, which
+                # must be sent verbatim as the wire model id. Picked over the
+                # previous qwen2.5-coder:7b: same VRAM class (5.07GB Q4_K_M
+                # vs ~5GB) and same 32K context, but beats it on every
+                # less-saturated/harder benchmark on its own model card --
+                # BigCodeBench-Hard 26.4 vs 20.3, LiveCodeBench 24.7 vs 17.3,
+                # MHPP 36.2 vs 26.7 (Qwen2.5-Coder-7B-Instruct only leads on
+                # HumanEval, 88.4 vs 84.8, which is old and near-saturated).
+                id="hf.co/unsloth/Seed-Coder-8B-Instruct-GGUF:Q4_K_M",
+                total_params_b=8,
+                params_source="ByteDance-Seed/Seed-Coder-8B-Instruct model card: 8B dense",
                 context_tokens=32_000,
                 cost_per_m_tok_in=0, cost_per_m_tok_out=0,
                 roles=["locate", "classify", "plan", "execute", "diagnose", "review", "ask"],
-                swe_score=20.0, elo_rating=1050, speed_tps=25,
+                # Bumped from the previous entry's (20.0, 1050, 25) in
+                # proportion to the real, cited BigCodeBench-Hard/LiveCodeBench
+                # deltas above -- not an independently measured SWE-bench run.
+                swe_score=24.0, elo_rating=1070, speed_tps=22,
             ),
         ],
     ),

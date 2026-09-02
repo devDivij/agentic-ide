@@ -47,11 +47,44 @@ Open the UI, go to **Settings**, and paste at least one API key:
 | NVIDIA NIM | `NVIDIA_API_KEY` | build.nvidia.com — free, no card |
 | Groq | `GROQ_API_KEY` | console.groq.com — free tier |
 | OpenRouter | `OPENROUTER_API_KEY` | openrouter.ai — free models + paid overflow |
-| Ollama | (none) | local; flip `enabled: true` in `server/agentzero/agent/providers.py` after `ollama pull qwen2.5-coder:7b` |
+| Ollama | (none) | local — see below |
 
 Keys are stored in `~/.agentzero/settings.json` (mode 0600) and are never sent
 back to the browser. The environment variables above work too (see
 `.env.example`).
+
+### Local models (Ollama)
+
+Ollama needs no key — it's on in the catalogue by default, as the lowest-
+preference "floor" option, used only when nothing else is configured or every
+remote provider is rate-limited. If it's not actually running, calls to it
+just fail closed and fall through to the next candidate; nothing crashes.
+
+```bash
+# 1. Install Ollama: https://ollama.com/download (macOS/Windows/Linux)
+
+# 2. Pull the model the catalogue expects: Seed-Coder-8B-Instruct (dense, 8B,
+#    5.07GB at Q4_K_M -- fully VRAM-resident on an 8GB card, no CPU offload).
+#    Not in Ollama's own curated library, so this pulls the GGUF straight
+#    from Hugging Face (defaults to Q4_K_M automatically):
+ollama pull hf.co/unsloth/Seed-Coder-8B-Instruct-GGUF
+
+# 3. Ollama serves itself on http://localhost:11434 once installed — nothing
+#    else to start. Only set this if it's running somewhere else:
+echo "OLLAMA_BASE_URL=http://localhost:11434/v1" >> .env
+```
+
+Why this model and not something bigger: a MoE model like gpt-oss-20b or
+Qwen3-Coder-30B-A3B scores higher on raw coding benchmarks, but neither fits
+in 8GB VRAM alone — they need `llama.cpp`/Ollama's CPU-offload path, and
+real-world reports put that around 30 tok/s or worse on an 8GB card, varying
+a lot with the machine's system-RAM bandwidth. A fallback that's only there
+to be a predictable last resort shouldn't itself become a new source of
+timeouts, so this stays a small dense model that lives entirely in VRAM.
+
+Nothing to do in the UI: it needs no key, so it won't appear on the Settings
+screen. To turn it off instead, set `enabled=False` on the `ollama`
+`ProviderSpec` in `server/agentzero/agent/providers.py`.
 
 Then click the project button in the header, choose a folder, and describe a
 change. The agent classifies the task, plans it, executes step by step (asking
@@ -66,7 +99,7 @@ harness runs it, and the proof the agent does not depend on the UI:
 ```bash
 npm run cli -- providers                          # configured / reachable
 npm run cli -- run "your task" --project /path/to/repo
-npm run cli -- run "fix the tests" --project . --yes --test "pytest -q"
+npm run cli -- run "fix the tests" --project . --yes
 npm run cli -- resume --project /path/to/repo     # continue an interrupted task
 npm run cli -- trace <taskId> --project /path/to/repo
 ```

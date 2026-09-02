@@ -280,10 +280,18 @@ export interface ModelInfo {
   roles: string[];
 }
 
+/** web_search's key (Exa) -- not an LLM routing provider, so it is not in `providers`. */
+export interface SearchInfo {
+  providerId: string;
+  label: string;
+  configured: boolean;
+}
+
 export interface ProvidersResponse {
   providers: ProviderInfo[];
   models: ModelInfo[];
   settingsPath: string;
+  search: SearchInfo;
 }
 
 // ---------------------------------------------------------------------------

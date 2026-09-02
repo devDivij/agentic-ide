@@ -19,6 +19,14 @@ from ..agent.providers import PROVIDERS
 
 SETTINGS_PATH = Path.home() / ".agentzero" / "settings.json"
 
+#: Not an LLM routing provider, so it lives outside PROVIDERS/effective_keys
+#: (which feed Router) -- but it is stored and resolved the same way: the
+#: settings file first, the environment filling the gap. Same reasoning as
+#: every other key here: an evaluator types it into the Settings screen
+#: without needing to touch a .env file or restart the server.
+EXA_PROVIDER_ID = "exa"
+EXA_KEY_ENV = "EXA_API_KEY"
+
 
 def settings_path() -> str:
     return str(SETTINGS_PATH)
@@ -74,3 +82,16 @@ def key_presence() -> dict[str, bool]:
     """Whether a key is set, without ever returning the key itself."""
     keys = effective_keys()
     return {p.id: (p.key_env is None or p.id in keys) for p in PROVIDERS}
+
+
+def exa_key(env: dict[str, str] | None = None) -> str | None:
+    """
+    Resolve the web_search tool's key: settings file first, then the
+    environment -- same order as effective_keys(), so "set EXA_API_KEY in
+    .env" and "type it into Settings" both work, and either one alone is
+    enough to show as configured.
+    """
+    source = os.environ if env is None else env
+    stored = load_settings()["keys"]
+    value = stored.get(EXA_PROVIDER_ID) or source.get(EXA_KEY_ENV)
+    return value.strip() if value and value.strip() else None

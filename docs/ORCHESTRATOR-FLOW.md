@@ -79,7 +79,7 @@ model calls — pure code that shapes or fabricates a `Plan`.
 | `make_plan` | [`run_task` L361](../server/agentzero/agent/orchestrator.py#L361), [`_replan` L647](../server/agentzero/agent/orchestrator.py#L647) | once per plan, once per replan |
 | `execute_turn` | [`_execute_step_turns` L1093](../server/agentzero/agent/orchestrator.py#L1093) | up to 12× per step attempt |
 | `diagnose_failure` | [`classify_failure` L1221](../server/agentzero/agent/orchestrator.py#L1221) | only when the failure is genuinely ambiguous — see §7 |
-| `review_batch` | [`_review_changes` L801](../server/agentzero/agent/orchestrator.py#L801) | every `BATCH_REVIEW_SIZE`(3) steps, and once at the end, skipped if the plan already has a failed/skipped step — see §7a |
+| `review_batch` | [`_review_changes`](../server/agentzero/agent/orchestrator.py) | every `BATCH_REVIEW_SIZE`(3) steps, and once at the end — skipped if the plan already has a failed/skipped step, and skipped outright for `micro_edit` (single step, nothing for it to be inconsistent with) — see §7a |
 | `summarize_prior_task` | [`run_task` L274-275](../server/agentzero/agent/orchestrator.py#L274-L275) | once, only on a follow-up prompt in the same conversation |
 
 ---
@@ -96,7 +96,7 @@ flowchart TB
   CK[["checkpoints.py — shadow git"]]
   ST[["store.py — SQLite, all durable state"]]
   TOOLS["tools.py — read_file/write_file/run_command/..."]
-  VER["verify.py — syntax + optional test command"]
+  VER["verify.py — syntax only; a planner-added test step is<br/>gated by its own run_command exit code (in orchestrator.py), not by verify.py"]
   SH["shell.py — subprocess + terminate()"]
   TY["types.py — Task, Plan, PlanStep, Failure*, events"]
 
@@ -236,7 +236,7 @@ flowchart TD
   B --> C(["_execute_step_turns — §6"])
   C --> D{"blocked, no files touched?"}
   D -->|yes| E["problem = blocked_reason"]
-  D -->|no| F["verify_changes — mechanical"]
+  D -->|no| F["verify_changes (syntax) + last run_command<br/>exit code, if any — both mechanical"]
   F --> G{"passed?"}
   G -->|yes| H[["commit checkpoint · add_facts · mark done"]]
   G -->|no| I["classify_failure — §7"]
@@ -339,7 +339,10 @@ quietly undoing an earlier guarantee. REVIEW is the layer that looks.
 It fires from two call sites into one shared function: periodically inside
 `_run_steps` (a window of the last `BATCH_REVIEW_SIZE`(3) completed steps),
 and once more from `run_task` after the step loop finishes cleanly (the whole
-task, `base_sha` → HEAD — see §3's `Finished → REVIEW` edge). Both go through
+task, `base_sha` → HEAD — see §3's `Finished → REVIEW` edge) — **except for
+`micro_edit`**, whose single step has no earlier step to be inconsistent
+with, so the end-of-task call is skipped outright rather than spent on a
+verdict that can only ever come back clean. Both go through
 `_review_changes`, which never touches the tree on a clean verdict and, on a
 finding, produces the same `_Replan` shape a step failure would.
 

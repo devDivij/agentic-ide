@@ -410,6 +410,45 @@ def test_a_task_runs_and_its_write_waits_for_a_human(client, tmp_path, monkeypat
     assert review["hunks"][0]["file"] == "a.py"
 
 
+def test_revert_is_refused_while_a_task_is_running(client, tmp_path, monkeypatch):
+    """
+    A `git read-tree --reset` racing the executor's own writes is exactly the
+    kind of corruption the whole point of this guard is to rule out.
+    """
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    script_model(monkeypatch, **{
+        "classify": ['{"complexity":"easy","reason":"r","mode":"task"}'],
+        "plan": [json.dumps({"summary": "s", "steps": [
+            {"id": "s1", "intent": "write it", "targetFiles": ["a.py"],
+             "acceptanceCriteria": ["exists"], "dependsOn": [],
+             "difficulty": "routine"}]})],
+        "execute": [
+            json.dumps({"thought": "w", "action": "write_file", "path": "a.py",
+                        "content": "x = 1\n"}),
+            json.dumps({"thought": "ok", "action": "done", "summary": "wrote a.py",
+                        "filesTouched": ["a.py"]}),
+        ],
+    })
+
+    client.post("/api/tasks", headers=LOCAL, json={
+        "projectRoot": str(tmp_path), "prompt": "write a.py"})
+    session = web_main.session_for(str(tmp_path))
+    pending_id = _wait_for(lambda: next(iter(session._pending), None))
+    assert pending_id is not None, "the write should be waiting for approval"
+    assert session.is_running
+
+    # The guard fires before the task/step is even looked up, so any id does.
+    response = client.post("/api/tasks/whichever-task/revert", headers=LOCAL,
+                           json={"projectRoot": str(tmp_path), "stepId": "s1"})
+    assert response.status_code == 409
+    assert not Path(tmp_path, "a.py").exists()          # untouched by the refused revert
+
+    # Let the run finish so the worker thread doesn't outlive the test.
+    client.post("/api/approvals", headers=LOCAL, json={
+        "projectRoot": str(tmp_path), "eventId": pending_id, "approved": True})
+    _wait_for(lambda: (not session.is_running) or None)
+
+
 DONE_AT_ONCE = {
     "classify": ['{"complexity":"easy","reason":"r","mode":"task"}'],
     "plan": [json.dumps({"summary": "s", "steps": [

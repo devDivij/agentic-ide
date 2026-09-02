@@ -102,6 +102,28 @@ export function taskEndOf(nodes: TraceNode[]): TaskEndPayload | null {
 export function stepsFromTrace(nodes: TraceNode[]): StepWire[] {
   const byId = new Map<string, StepWire>();
   for (const node of nodes) {
+    // A revert (checkpoint action:'revert') doesn't touch step_start/step_end
+    // history -- those already-recorded events stay true accounts of what
+    // happened. It marks the AFFECTED steps 'pending' again on top, same as
+    // a rejected review hunk requeuing one. This has to run in the SAME
+    // ordered pass as step_start/step_end below, not a separate loop after
+    // it: a later resume re-completing a reverted step writes a fresh
+    // step_end AFTER this event's seq, and a second loop would blindly
+    // reapply the stale reset on top of that, undoing the resume. It also
+    // has to sit above the `!node.stepId` guard, since this event carries no
+    // stepId of its own -- it affects OTHER steps, named in its payload.
+    if (node.kind === 'checkpoint' && isObject(node.payload)
+        && node.payload.action === 'revert') {
+      const resetIds = Array.isArray(node.payload.stepsReset)
+        ? node.payload.stepsReset.filter((id): id is string => typeof id === 'string')
+        : [];
+      for (const id of resetIds) {
+        const existing = byId.get(id);
+        if (existing) byId.set(id, { ...existing, status: 'pending', attempts: 0 });
+      }
+      continue;
+    }
+
     if (!node.stepId) continue;
 
     if (node.kind === 'step_start') {
@@ -131,6 +153,7 @@ export function stepsFromTrace(nodes: TraceNode[]): StepWire[] {
       });
     }
   }
+
   return [...byId.values()];
 }
 
@@ -233,10 +256,18 @@ export function describeNode(node: TraceNode): ActivityLine | null {
 function describeTool(payload: unknown): string {
   if (!isObject(payload)) return 'used a tool';
 
-  // Retrieval is logged as a pseudo-tool with a different shape.
+  // Retrieval and TRIAGE's own web search are logged as pseudo-tools, each
+  // with its own shape rather than the {call, result} step-execution one.
   if (payload.tool === 'retrieve') {
     const chunks = Array.isArray(payload.chunks) ? payload.chunks.length : 0;
     return `retrieved ${chunks} code chunk${chunks === 1 ? '' : 's'}`;
+  }
+  if (payload.tool === 'web_search') {
+    const query = str(payload.query) ?? '';
+    const result = isObject(payload.result) ? payload.result : null;
+    return result?.ok === false
+      ? `web search failed: "${query}"`
+      : `searched the web for "${query}"`;
   }
 
   const call = isObject(payload.call) ? payload.call : null;
@@ -251,6 +282,7 @@ function describeTool(payload: unknown): string {
     case 'read_file':   return `read ${path}`;
     case 'list_files':  return `listed ${path || '.'}`;
     case 'search_code': return `searched for "${str(args.query) ?? ''}"`;
+    case 'web_search':  return `searched the web for "${str(args.query) ?? ''}"`;
     case 'write_file':  return failed ? `could not write ${path}` : `wrote ${path}`;
     case 'run_command': {
       const command = str(args.command) ?? '';

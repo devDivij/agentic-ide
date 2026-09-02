@@ -46,9 +46,11 @@ class _Pending:
 
 
 class Session:
-    def __init__(self, project_root: str, keys: dict[str, str], bus: EventBus) -> None:
+    def __init__(self, project_root: str, keys: dict[str, str], bus: EventBus, *,
+                search_api_key: str | None = None) -> None:
         self.project_root = project_root
         self._keys = keys
+        self._search_api_key = search_api_key
         self._bus = bus
         self._agent: Agent | None = None
         #: Servers the agent started, kept alive past the task that started them.
@@ -106,6 +108,7 @@ class Session:
         self._agent = create_agent(
             project_root=self.project_root,
             keys=self._keys,
+            search_api_key=self._search_api_key,
             approval=self._request_approval,
             on_progress=lambda message: self._publish({
                 "type": "log", "taskId": self._current_task_id,

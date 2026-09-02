@@ -112,12 +112,20 @@ class Classification(Data):
     # request into a reply that never touches a file, and a false 'micro_edit'
     # skips a decomposition a genuinely multi-file change needed.
     mode: TriageMode = "task"
+    # Set only when mode is chat/lookup AND answering needs something this
+    # call cannot know (a library's current version, a recent API change) --
+    # the answering call has no tools of its own, so this is its only way to
+    # ask for grounding. Empty otherwise, INCLUDING for task/micro_edit: the
+    # executor already has its own web_search tool for those, so asking here
+    # too would just spend a search neither lane can use. `run_task` reads
+    # this and runs ONE web_search in code -- never a second classify call.
+    web_query: str = ""
 
 
 CLASSIFY_CONTRACT = """
 Reply with ONLY this JSON object and nothing else:
 {"complexity": "easy" | "medium" | "hard", "reason": "one short sentence",
- "mode": "chat" | "lookup" | "micro_edit" | "task"}
+ "mode": "chat" | "lookup" | "micro_edit" | "task", "webQuery": ""}
 
 mode:
   chat        a greeting, thanks, or question with no implied file change
@@ -134,6 +142,13 @@ complexity (ignored when mode is "chat" or "lookup"):
   easy    a single obvious edit in one file
   medium  a few related edits, or one edit that needs looking around first
   hard    several files, or the change is not obvious from the request alone
+
+webQuery: a short search query, ONLY if mode is "chat" or "lookup" AND
+answering needs something outside this project and outside your own training
+data (a library's current version, a recent API change, an unfamiliar error
+message). Leave it "" otherwise — most questions do not need it, and mode
+"task"/"micro_edit" never need it here, since the change itself will look
+things up as it goes.
 """.strip()
 
 
@@ -186,12 +201,17 @@ requiresEdits is true only if actually satisfying this message requires
 changing a file in the project. If it does, "answer" should still be a short
 line acknowledging that (e.g. "Let me make that change.") — it is shown
 before the work starts.
+
+When "answer" names a specific file from the code shown to you, write it as
+@path (or @path:12-40 for a line range), e.g. "the bug is in @calc.py:12-18" —
+the chat renders this as a clickable reference the human can jump to. Plain
+prose otherwise; do not invent a path you were not shown.
 """.strip()
 
 
 def _answer(ctx: WorkerCtx, task: Task, parent_id: int,
             chunks: list[CodeChunk] | None = None,
-            prior_task: str | None = None) -> Answer:
+            prior_task: str | None = None, web_result: str | None = None) -> Answer:
     return call_model(
         ctx,
         task_id=task.id,
@@ -201,20 +221,22 @@ def _answer(ctx: WorkerCtx, task: Task, parent_id: int,
         max_tokens=600,
         context=build_context(ContextRequest(
             role="ask", prompt=task.prompt, project_rules=ctx.project_rules,
-            output_contract=ANSWER_CONTRACT, chunks=chunks or [], prior_task=prior_task)),
+            output_contract=ANSWER_CONTRACT, chunks=chunks or [], prior_task=prior_task,
+            web_result=web_result)),
     ).value
 
 
 def answer_chat(ctx: WorkerCtx, task: Task, parent_id: int,
-                prior_task: str | None = None) -> Answer:
+                prior_task: str | None = None, web_result: str | None = None) -> Answer:
     """TRIAGE's 'chat' lane: no retrieval at all."""
-    return _answer(ctx, task, parent_id, prior_task=prior_task)
+    return _answer(ctx, task, parent_id, prior_task=prior_task, web_result=web_result)
 
 
 def answer_lookup(ctx: WorkerCtx, task: Task, chunks: list[CodeChunk],
-                  parent_id: int, prior_task: str | None = None) -> Answer:
+                  parent_id: int, prior_task: str | None = None,
+                  web_result: str | None = None) -> Answer:
     """TRIAGE's 'lookup' lane: grounded in retrieved code, still read-only."""
-    return _answer(ctx, task, parent_id, chunks, prior_task=prior_task)
+    return _answer(ctx, task, parent_id, chunks, prior_task=prior_task, web_result=web_result)
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +282,11 @@ Rules:
   - "difficulty" is "routine" or "hairy". Use "hairy" only when the step needs
     real reasoning rather than a mechanical edit.
   - Prefer few steps. One step per file that must change is usually right.
+  - If the change affects logic or behavior a test could actually catch
+    (not a pure style/copy/theme change), add ONE final step that runs the
+    project's test suite (or the relevant subset) with the run_command tool
+    and treats a nonzero exit as a failed step. Skip this step entirely for
+    changes a test cannot meaningfully check.
 """.strip()
 
 
@@ -399,6 +426,7 @@ To use a tool, set "action" to the tool name and put its arguments beside it:
 {"thought": "why", "action": "list_files", "path": "."}
 {"thought": "why", "action": "run_command", "command": "python3 -m pytest -q"}
 {"thought": "why", "action": "start_server", "command": "node server.js"}
+{"thought": "why", "action": "web_search", "query": "requests library current version"}
 {"thought": "why", "action": "write_file", "path": "calc.py", "content": "COMPLETE NEW FILE"}
 
 When the step is finished:
@@ -416,6 +444,14 @@ Rules:
   - Do not repeat a call that already gave you what you needed.
   - To start a server or any process that keeps running, use "start_server",
     never "run_command" - run_command waits for the process to exit.
+  - "search_code" searches THIS project; "web_search" searches the public
+    internet. Use web_search only for something the project itself cannot
+    answer - a library's current API, an error message, a version number.
+  - run_command can also run git (diff/log/status/branch/commit/merge...) on
+    the project's own repository, when the task calls for it.
+  - In "summary", name a file as @path (or @path:12-40 for a line range),
+    e.g. "renamed the helper in @calc.py:12-18" - the chat renders this as a
+    clickable reference. Plain prose for everything else.
   - After editing, finish with "done" - do not keep looking around.
 """.strip()
 
@@ -540,7 +576,7 @@ ok is false only if the diff below has a REAL problem: it contradicts an
 earlier step, duplicates logic that already exists elsewhere in the project,
 breaks something an earlier step's acceptance criteria relied on, or drifts
 from what the user actually asked for. Do not flag style preferences, and do
-not flag anything a test would already catch -- that check already ran.
+not repeat something a passing test step already in this plan covers.
 
 "stepIds" should name whichever of the steps listed above most likely
 introduced the problem, if the diff makes that clear. Leave it empty ([]) if

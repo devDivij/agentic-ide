@@ -282,6 +282,42 @@ def test_a_whole_task_runs_classify_plan_execute_verify_and_diff(
         "greet() lives in greet.py"]
 
 
+def test_a_red_test_step_fails_even_when_the_model_says_done(
+        monkeypatch, agent, project):
+    """
+    A planner-added "run the tests" step touches no files, so verify_changes
+    alone would rubber-stamp it -- the exit code of the step's own
+    run_command call, not the model's "done", must be what decides it. This
+    is the ground-truth check that makes PLAN_CONTRACT's testing-step rule
+    real rather than a step the model can talk its way out of.
+    """
+    script_model(
+        monkeypatch,
+        classify=[CLASSIFY_TASK],
+        plan=[json.dumps({"summary": "run the suite", "steps": [
+            {"id": "s1", "intent": "run the test suite", "targetFiles": [],
+             "acceptanceCriteria": ["the test command exits 0"], "dependsOn": [],
+             "difficulty": "routine"}]})],
+        execute=[
+            json.dumps({"thought": "running tests", "action": "run_command",
+                        "command": "python3 -c \"import sys; sys.exit(1)\""}),
+            # The model reads the red exit and claims success anyway.
+            json.dumps({"thought": "done", "action": "done", "summary": "tests ran",
+                        "filesTouched": []}),
+        ])
+
+    outcome = run_task(agent, "run the tests")
+
+    steps = agent.db.get_steps(outcome.task_id)
+    assert steps[0].status == "failed"
+    assert outcome.steps_completed == 0
+
+    verify_events = [e for e in agent.db.get_events(outcome.task_id) if e.kind == "verify"]
+    assert verify_events, "the mechanical gate must still run for a file-less step"
+    assert verify_events[0].payload["passed"] is False
+    assert "exited non-zero" in verify_events[0].payload["problems"][0]
+
+
 def test_a_chat_message_is_answered_without_planning_or_touching_files(
         monkeypatch, agent, project):
     script_model(
@@ -295,6 +331,57 @@ def test_a_chat_message_is_answered_without_planning_or_touching_files(
     assert outcome.steps_total == 0 and outcome.diff == ""
     end = [e for e in agent.db.get_events(outcome.task_id) if e.kind == "task_end"][0]
     assert end.payload["summary"] == "Hello! What would you like to change?"
+
+
+def test_triage_grounds_a_lookup_answer_with_one_web_search(monkeypatch, agent, project):
+    """
+    classify_task's OWN call decides a question needs external grounding
+    (Classification.web_query) -- the orchestrator then runs exactly one
+    web_search in code and folds it into the answer call. Never a second
+    classify round-trip: the doctrine this file's header states ("one call =
+    one narrow job") stays intact.
+    """
+    import agentzero.agent.tools as tools_module
+
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(json["query"])
+        return _FakeExa([{"title": "Requests 2.32 release notes",
+                          "url": "https://example.com/requests",
+                          "text": "The current stable release is 2.32.3."}])
+
+    agent.search_api_key = "k"
+    monkeypatch.setattr(tools_module.httpx, "post", fake_post)
+
+    seen = script_model(
+        monkeypatch,
+        classify=['{"complexity":"easy","reason":"needs current info",'
+                 '"mode":"lookup","webQuery":"requests library latest version"}'],
+        ask=['{"answer":"2.32.3, per a quick search.","requiresEdits":false}'])
+
+    outcome = run_task(agent, "what is the latest version of the requests library?")
+
+    assert outcome.status == "done"
+    assert calls == ["requests library latest version"]
+    events = [e for e in agent.db.get_events(outcome.task_id) if e.kind == "tool_call"]
+    search_events = [e for e in events if e.payload.get("tool") == "web_search"]
+    assert len(search_events) == 1 and search_events[0].status == "ok"
+
+    # The result actually reached the answering call, not just the log.
+    ask_prompt = " ".join(m.content for m in seen["ask"][0])
+    assert "2.32.3" in ask_prompt
+
+
+class _FakeExa:
+    def __init__(self, results, status_code=200):
+        self.status_code, self.text, self._results = status_code, "", results
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"results": self._results}
 
 
 def test_a_question_wearing_a_question_mark_is_promoted_into_real_work(
