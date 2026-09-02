@@ -33,8 +33,12 @@ export function Settings(): JSX.Element {
   };
 
   const test = async (providerId: string): Promise<void> => {
+    // Sends the drafted key straight to the test endpoint, unsaved. Testing
+    // must never have a save side effect: it's how you check a key before
+    // committing it. An empty draft falls back to the already-saved key on
+    // the server side, so re-testing a configured provider still works.
     setStatus((s) => ({ ...s, [providerId]: 'testing...' }));
-    const result = await api.testProvider(providerId);
+    const result = await api.testProvider(providerId, drafts[providerId] ?? '');
     setStatus((s) => ({ ...s, [providerId]: result.detail }));
   };
 

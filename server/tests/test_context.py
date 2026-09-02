@@ -80,6 +80,52 @@ def test_eviction_drops_outcomes_then_chunks_then_facts():
     assert [m.kind for m in built.manifest] == ["request", "fact"]
 
 
+def test_eviction_prefers_relevance_within_a_tier():
+    """
+    Not just priority order: within the fact tier, the fact that has nothing
+    to do with the current step is dropped before the one that names the
+    file being touched, even though it was added second.
+    """
+    filler = "z" * 50_000
+    built = build_context(ContextRequest(
+        role="execute", prompt="fix the CalculatorWidget overflow bug",
+        step=PlanStep(id="s1", intent="patch CalculatorWidget.render",
+                      target_files=["widget.py"]),
+        facts=[
+            _fact(1, f"CalculatorWidget.render overflows on large input. {filler}"),
+            _fact(2, f"the CI runner uses node 18. {filler}"),
+        ],
+    ))
+    assert built.compacted
+    kept_refs = {m.ref for m in built.manifest if m.kind == "fact"}
+    assert kept_refs == {"#1"}
+
+
+def test_relevance_is_not_just_a_proxy_for_size():
+    """
+    A large chunk shouldn't outrank a small one purely because it is more
+    likely to contain a stray substring match by volume. Relevance is scored
+    against each block's own salient terms, not "does this term occur
+    anywhere in this much text".
+    """
+    tangential_file = "\n".join(
+        f"def helper_{i}(x): return x + {i}  # unrelated utility code"
+        for i in range(2000))
+    big_but_off_topic = _chunk("utils.py", tangential_file)
+    small_but_on_topic = _chunk(
+        "widget.py", "class CalculatorWidget:\n    def render(self): ...")
+
+    built = build_context(ContextRequest(
+        role="execute", prompt="fix the CalculatorWidget overflow bug",
+        step=PlanStep(id="s1", intent="patch CalculatorWidget.render",
+                      target_files=["widget.py"]),
+        chunks=[big_but_off_topic, small_but_on_topic],
+    ))
+    assert built.compacted
+    kept_paths = {m.ref.split(":")[0] for m in built.manifest if m.kind == "chunk"}
+    assert kept_paths == {"widget.py"}
+
+
 def test_pinned_blocks_survive_eviction():
     """
     Silently discarding the plan, the user's pins or the step transcript would
@@ -101,6 +147,26 @@ def test_pinned_blocks_survive_eviction():
     assert "chunk" in built.dropped_kinds
     content = built.messages[1].content
     assert "PINNED CONTENT" in content and "CONTRACT" in content
+
+
+def test_prior_task_survives_eviction():
+    """
+    This is what resolves "it"/"them" back to what the previous task actually
+    did (e.g. "rather make it green" right after a task that set a theme to
+    blue). It has near-zero term overlap with a follow-up prompt like that by
+    construction -- if it were evictable it would be first in line to drop
+    under budget pressure, exactly when a pronoun-only follow-up needs it most.
+    """
+    big = "y" * 80_000
+    built = build_context(ContextRequest(
+        role="execute", prompt="rather change it to green",
+        prior_task=('The PREVIOUS message in this chat was: "change them to blue"\n'
+                    "What you reported doing: Changed theme from 'dark' to 'blue' "
+                    "in app/config.py"),
+        chunks=[_chunk("big.py", big)],
+    ))
+    assert "prior_task" in {m.kind for m in built.manifest}
+    assert "app/config.py" in built.messages[1].content
 
 
 def test_a_previous_attempt_is_carried_into_the_retry():

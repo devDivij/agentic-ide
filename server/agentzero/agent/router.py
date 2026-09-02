@@ -241,8 +241,17 @@ class Router:
 
     def pick(self, role: Role, estimated_tokens: int, *,
              difficulty: Literal["routine", "hairy"] | None = None,
-             exclude: list[str] | None = None) -> RouteDecision:
-        """Pick where this call goes. May genuinely sleep when everything is rate-limited."""
+             exclude: list[str] | None = None,
+             max_wait_ms: float | None = None) -> RouteDecision:
+        """
+        Pick where this call goes. May genuinely sleep when everything is
+        rate-limited -- up to `max_wait_ms` (MAX_WAIT_MS by default). A caller
+        for whom the call is an optional enhancement rather than the task's
+        own work can pass 0 here to never block: a busy bucket then raises
+        immediately instead of sleeping, same as a bucket that's rate-limited
+        for longer than the cap already does.
+        """
+        wait_cap = MAX_WAIT_MS if max_wait_ms is None else max_wait_ms
         ranked = self.rank(role, difficulty=difficulty, exclude=exclude)
         if not ranked:
             raise NoUsableModelError(
@@ -287,10 +296,10 @@ class Router:
 
         # 4. Cheaper to wait than to pay: actually sleep for the shortest wait.
         best_candidate, best_wait, _ = min(waits, key=lambda w: w[1])
-        if not math.isfinite(best_wait) or best_wait > MAX_WAIT_MS:
+        if not math.isfinite(best_wait) or best_wait > wait_cap:
             raise NoUsableModelError(
                 f"Every provider for '{role}' is rate-limited for more than "
-                f"{MAX_WAIT_MS / 1000:g}s. Add another provider key or try later.")
+                f"{wait_cap / 1000:g}s. Add another provider key or try later.")
         time.sleep(best_wait / 1000)
         return self._decide(
             role, estimated_tokens, best_candidate, [], best_wait,
@@ -320,14 +329,15 @@ class Router:
              difficulty: Literal["routine", "hairy"] | None = None,
              exclude: list[str] | None = None) -> list[Candidate]:
         """
-        Rank candidates for a role. Three sort keys, most significant first:
+        Rank candidates for a role. Four sort keys, most significant first:
           1. preference tier -- a provider the operator configured ('user')
              beats the zero-config default, which beats local. The default tier
              only steps back when a 'user' provider can actually serve THIS role.
-          2. free before paid.
-          3. model strength. Among free models always prefer the stronger one
-             (a weak model that fails a step costs more wall-clock than it
-             saves), and 'hairy' steps prefer strength even at a price.
+          2. size floor -- a model over 15B params always beats one at or under
+             it, regardless of cost. A small model stays usable (nothing is
+             filtered out) so a role with only small candidates can still run.
+          3. free before paid.
+          4. model strength via the benchmark-driven dynamic score below.
         """
         excluded = set(exclude or [])
         usable = [
@@ -349,14 +359,41 @@ class Router:
         def is_free(c: Candidate) -> bool:
             return c.model.cost_per_m_tok_in == 0 and c.model.cost_per_m_tok_out == 0
 
-        def sort_key(c: Candidate) -> tuple[int, int, float]:
-            # Within one (tier, free/paid) group every candidate shares its
-            # freeness, so the TypeScript's two-sided comparator collapses to
-            # this per-candidate key: stronger first, except for paid models on
-            # a routine step, where the smallest capable model wins.
-            prefer_strength = is_free(c) or difficulty == "hairy"
-            strength = -c.model.total_params_b if prefer_strength else c.model.total_params_b
-            return (tier(c), 0 if is_free(c) else 1, strength)
+        #: Below this, a model is deprioritized (never excluded) against any
+        #: larger candidate in the same preference tier -- "always prefer
+        #: models greater than 15B for all tasks", but as a soft ordering so a
+        #: role that only small models can serve still has candidates.
+        SIZE_FLOOR_B = 15
+
+        def undersized(c: Candidate) -> int:
+            return 0 if c.model.total_params_b > SIZE_FLOOR_B else 1
+
+        # Roles needing pure reasoning rather than code-writing muscle. 'review'
+        # is folded in here too: it only ever labels what a batch of passing
+        # steps did wrong, the same judgement-not-generation job as 'diagnose'.
+        # 'locate' too: ranking candidate entities by relevance is a judgement
+        # call, not code generation.
+        REASONING_ROLES = ("plan", "diagnose", "classify", "ask", "review", "locate")
+
+        def sort_key(c: Candidate) -> tuple[int, int, int, float]:
+            # Within one (tier, size, free/paid) group every candidate shares
+            # those three, so this collapses to a single dynamic score per
+            # candidate. Negative values sort first, since sorted() is
+            # ascending -- so "negative" means "highest wins".
+            if role in REASONING_ROLES:
+                # Rule A: pure reasoning logic.
+                dynamic_score = -c.model.elo_rating
+            elif difficulty == "hairy":
+                # Rule B: hairy execution -- the absolute best coding logic.
+                dynamic_score = -c.model.swe_score
+            elif is_free(c):
+                # Rule C, free: cost is a non-issue, so the fastest model wins.
+                dynamic_score = -c.model.speed_tps
+            else:
+                # Rule C, paid: save money on a mechanical edit -- cheapest
+                # wins (what picking the smallest parameter model used to do).
+                dynamic_score = c.model.cost_per_m_tok_out
+            return (tier(c), undersized(c), 0 if is_free(c) else 1, dynamic_score)
 
         return sorted(usable, key=sort_key)
 

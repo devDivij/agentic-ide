@@ -29,11 +29,11 @@ from pydantic import BaseModel, ValidationError
 
 from .context import BuiltContext
 from .llm import (
-    CancelToken, ChatMessage, ModelGoneError, TaskCancelledError,
-    TransientProviderError, TruncatedReasoningError, chat_complete,
+    CancelToken, ChatMessage, JsonGenerationFailedError, ModelGoneError,
+    TaskCancelledError, TransientProviderError, TruncatedReasoningError, chat_complete,
 )
 from .parse import describe_validation_error, extract_json
-from .router import RouteDecision, Router
+from .router import NoUsableModelError, RouteDecision, Router
 from .store import Store
 from .types import NewEvent, Role
 
@@ -69,7 +69,7 @@ class CallResult(NamedTuple):
 
 class CallFailedError(Exception):
     def __init__(self, message: str,
-                 kind: Literal["malformed_output", "transient_api"]) -> None:
+                 kind: Literal["malformed_output", "transient_api", "no_api_key"]) -> None:
         super().__init__(message)
         self.kind = kind
 
@@ -90,6 +90,8 @@ def call_model(
     exclude: list[str] | None = None,
     suppress_reasoning: bool = False,
     timeout_ms: int | None = None,
+    max_fallbacks: int | None = None,
+    max_wait_ms: float | None = None,
 ) -> CallResult:
     """
     `exclude` is "provider/model" ids this call must avoid, so a retry lands
@@ -98,7 +100,17 @@ def call_model(
     knowledge from a PREVIOUS call that already failed. Ignored when honouring
     it would leave no candidate at all -- a retry on the same model still beats
     a retry on nothing.
+
+    `max_fallbacks` overrides MAX_FALLBACKS for callers that are an
+    enhancement, not the task's own work (e.g. retrieval's entity ranking):
+    they have a cheap non-LLM degrade path already, so trying every provider
+    in the catalogue before giving up would spend the same retry budget as
+    real work on a nicety. `max_wait_ms` is the same idea applied to
+    `router.pick`'s own rate-limit wait -- without it, a call that is only
+    ever a nicety could still block the caller for up to MAX_WAIT_MS (90s)
+    when every bucket for its role happens to be busy.
     """
+    fallback_cap = MAX_FALLBACKS if max_fallbacks is None else max_fallbacks
     db, router, keys = deps.db, deps.router, deps.keys
 
     # Record exactly what went into this window, before sending it.
@@ -137,13 +149,22 @@ def call_model(
     while True:
         # Deliberately OUTSIDE the try below: a routing failure is a
         # configuration problem, not a provider failure, and must not be
-        # retried as one.
+        # retried as one. NoUsableModelError becomes a CallFailedError right
+        # here rather than propagating raw, so the taxonomy sees "no_api_key"
+        # instead of routing an unclassified exception through diagnose_failure
+        # -- which would itself try to call a model, fail the exact same way,
+        # and silently relabel this as 'wrong_approach' (see classify_failure).
+        # A missing key is not something retrying or reverting ever fixes.
         if sticky_route is not None:
             route = RouteDecision(provider_id=sticky_route[0], model_id=sticky_route[1],
                                   reason="continuing repair on the same model")
         else:
-            route = router.pick(role, context.estimated_tokens,
-                                difficulty=difficulty, exclude=excluded)
+            try:
+                route = router.pick(role, context.estimated_tokens,
+                                    difficulty=difficulty, exclude=excluded,
+                                    max_wait_ms=max_wait_ms)
+            except NoUsableModelError as err:
+                raise CallFailedError(str(err), "no_api_key") from err
 
         # The routing decision is an event BEFORE the call is made -- never hidden.
         db.append_event(NewEvent(
@@ -209,11 +230,23 @@ def call_model(
                     f"{last_error}", "malformed_output")
             repairs += 1
             sticky_route = (route.provider_id, route.model_id)
+            # A reasoning model can spend its whole budget thinking and return
+            # HTTP 200 with empty `content` (providers.py's Reasoning
+            # docstring). Replaying that as an assistant turn -- an
+            # empty-content message with no tool call -- is itself invalid on
+            # at least one provider (OpenRouter/Cohere: "must have non-empty
+            # content or tool calls"), which turned a repairable malformed
+            # reply into a hard provider_error on the very next attempt.
+            # Nothing meaningful to quote back anyway, so skip the replay.
+            replay = ([ChatMessage(role="assistant", content=result.text)]
+                     if result.text.strip() else [])
+            reason = ("It came back completely empty." if not result.text.strip()
+                     else f"That response was not valid for the required schema:\n{last_error}")
             messages = [
                 *context.messages,
-                ChatMessage(role="assistant", content=result.text),
+                *replay,
                 ChatMessage(role="user", content=(
-                    f"That response was not valid for the required schema:\n{last_error}\n\n"
+                    f"{reason}\n\n"
                     "Re-read the required JSON shape given above and follow it exactly. "
                     "An empty list is never a valid answer — if you are unsure, give one "
                     "entry that describes the whole request. Reply with ONLY a single "
@@ -240,6 +273,47 @@ def call_model(
                     "Model kept exhausting its output budget while reasoning.",
                     "malformed_output") from err
             current_max_tokens = max(current_max_tokens * 3, 4096)
+            continue
+        except JsonGenerationFailedError as err:
+            # The provider's own JSON-mode validator rejected this reply --
+            # a malformed answer, not a provider outage, so it gets the same
+            # remedy as a schema-validation failure: repair on the SAME
+            # model with what it produced attached. Falling through to the
+            # generic branch below would burn a fallback on a model that
+            # never actually failed to answer.
+            last_error = (
+                f"The provider rejected this reply as invalid JSON before it reached "
+                f"the caller:\n{err.failed_generation}")
+            db.append_event(NewEvent(
+                task_id=task_id, parent_id=parent_id, kind="error",
+                role=role, step_id=step_id,
+                payload={"failureClass": "malformed_output",
+                         "provider": err.provider_id, "model": err.model_id,
+                         "message": last_error, "action": "repairing with the same model"},
+                status="error"))
+            if repairs >= MAX_REPAIRS:
+                raise CallFailedError(
+                    f"Model output failed JSON validation after {repairs} repair "
+                    f"attempts:\n{last_error}", "malformed_output") from err
+            repairs += 1
+            sticky_route = (err.provider_id, err.model_id)
+            # Quoted as evidence in a user turn, not replayed as an assistant
+            # turn: this text is provider-reported, not a validated 200 reply
+            # (contrast the ValidationError branch above, which replays
+            # `result.text` -- that came back through a real response and was
+            # already run through `_extract_json_safe`). Giving unvalidated
+            # provider-controlled text assistant-role authority would let
+            # anything that reads as an instruction steer the repair turn.
+            messages = [
+                *context.messages,
+                ChatMessage(role="user", content=(
+                    "Your previous reply was rejected by the API before delivery "
+                    f"because it was not valid JSON. What it contained:\n"
+                    f"{err.failed_generation}\n\n"
+                    "Re-read the required JSON shape given above and follow it "
+                    "exactly. Reply with ONLY a single JSON object. No prose, no code "
+                    "fences.")),
+            ]
             continue
         except Exception as err:      # noqa: BLE001 - every provider failure lands here
             transient = isinstance(err, TransientProviderError)
@@ -274,7 +348,7 @@ def call_model(
             sticky_route = None
             excluded.append(f"{route.provider_id}/{route.model_id}")
             fallbacks += 1
-            if fallbacks > MAX_FALLBACKS:
+            if fallbacks > fallback_cap:
                 raise CallFailedError(
                     f"All providers failed for role '{role}': {last_error}",
                     "transient_api") from err

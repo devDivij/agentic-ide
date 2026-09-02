@@ -265,7 +265,7 @@ Rules:
 
 def make_plan(ctx: WorkerCtx, task: Task, chunks: list[CodeChunk],
               pinned: list[CodeChunk], project_files: list[str],
-              parent_id: int) -> Plan:
+              parent_id: int, prior_task: str | None = None) -> Plan:
     """
     Planning that cannot fail the task.
 
@@ -278,7 +278,7 @@ def make_plan(ctx: WorkerCtx, task: Task, chunks: list[CodeChunk],
     than failing for complex work.
     """
     try:
-        return _plan_with_model(ctx, task, chunks, pinned, project_files, parent_id)
+        return _plan_with_model(ctx, task, chunks, pinned, project_files, parent_id, prior_task)
     except Exception as err:      # noqa: BLE001 - planning may never kill a task
         ctx.db.append_event(NewEvent(
             task_id=task.id, parent_id=parent_id, kind="error", role="plan",
@@ -309,7 +309,7 @@ def single_step_plan(task: Task) -> Plan:
 
 def _plan_with_model(ctx: WorkerCtx, task: Task, chunks: list[CodeChunk],
                      pinned: list[CodeChunk], project_files: list[str],
-                     parent_id: int) -> Plan:
+                     parent_id: int, prior_task: str | None = None) -> Plan:
     draft = call_model(
         ctx,
         task_id=task.id,
@@ -324,7 +324,7 @@ def _plan_with_model(ctx: WorkerCtx, task: Task, chunks: list[CodeChunk],
         context=build_context(ContextRequest(
             role="plan", prompt=task.prompt, project_rules=ctx.project_rules,
             project_files=project_files, chunks=chunks, pinned=pinned,
-            output_contract=PLAN_CONTRACT)),
+            prior_task=prior_task, output_contract=PLAN_CONTRACT)),
     ).value
     return normalise_plan(Plan(summary=draft.summary, steps=list(draft.steps)))
 
@@ -431,7 +431,8 @@ def execute_turn(ctx: WorkerCtx, task: Task, plan: Plan, step: PlanStep,
                  recent_outcomes: list[str], step_transcript: list[str],
                  project_files: list[str], parent_id: int,
                  previous_attempt: str | None = None, directive: str | None = None,
-                 exclude: list[str] | None = None) -> TurnResult:
+                 exclude: list[str] | None = None,
+                 prior_task: str | None = None) -> TurnResult:
     result = call_model(
         ctx,
         task_id=task.id,
@@ -448,7 +449,7 @@ def execute_turn(ctx: WorkerCtx, task: Task, plan: Plan, step: PlanStep,
             project_files=project_files, plan=plan, step=step, facts=facts,
             chunks=chunks, pinned=pinned, recent_outcomes=recent_outcomes,
             step_transcript=step_transcript, previous_attempt=previous_attempt,
-            directive=directive,
+            directive=directive, prior_task=prior_task,
             output_contract=f"{render_tool_catalog()}\n\n{EXECUTE_CONTRACT}")),
     )
     return TurnResult(turn=result.value, event_id=result.event_id,
@@ -506,6 +507,64 @@ def diagnose_failure(ctx: WorkerCtx, task: Task, step: PlanStep, problem: str,
             recent_outcomes=[f"The step failed with:\n{problem}"],
             output_contract=DIAGNOSE_CONTRACT)),
     ).value.failure_class
+
+
+# ---------------------------------------------------------------------------
+# review -- L2: a pass over a batch's accumulated diff, looking for problems
+# no single step's own acceptance criteria could see. Same discipline as
+# diagnose: this worker only ever labels a problem, never decides what to do
+# about it -- the orchestrator turns a finding into a REPLAN through the
+# ordinary taxonomy-shaped path (see orchestrator.py's `_review_changes`).
+# ---------------------------------------------------------------------------
+
+
+class ReviewIssue(Data):
+    description: str = Field(min_length=1)
+    #: Which of the reviewed steps most likely introduced it, if the model
+    #: can tell from the diff. Empty when it can't -- the orchestrator then
+    #: blames the most recent step in the batch, the least destructive guess.
+    step_ids: list[str] = []
+
+
+class BatchReview(Data):
+    ok: bool = True
+    issues: list[ReviewIssue] = []
+
+
+REVIEW_CONTRACT = """
+Reply with ONLY this JSON object and nothing else:
+{"ok": true | false,
+ "issues": [{"description": "one short sentence", "stepIds": ["s2"]}]}
+
+ok is false only if the diff below has a REAL problem: it contradicts an
+earlier step, duplicates logic that already exists elsewhere in the project,
+breaks something an earlier step's acceptance criteria relied on, or drifts
+from what the user actually asked for. Do not flag style preferences, and do
+not flag anything a test would already catch -- that check already ran.
+
+"stepIds" should name whichever of the steps listed above most likely
+introduced the problem, if the diff makes that clear. Leave it empty ([]) if
+you can't tell which one.
+""".strip()
+
+
+def review_batch(ctx: WorkerCtx, task: Task, plan: Plan, step_notes: list[str],
+                 diff: str, parent_id: int) -> BatchReview:
+    return call_model(
+        ctx,
+        task_id=task.id,
+        role="review",
+        parent_id=parent_id,
+        schema=BatchReview,
+        max_tokens=1500,
+        # A judgement call over a whole diff, not a one-word label -- give it
+        # more room than diagnose before we start worrying about truncation.
+        timeout_ms=45_000,
+        context=build_context(ContextRequest(
+            role="review", prompt=task.prompt, project_rules=ctx.project_rules,
+            plan=plan, recent_outcomes=step_notes, diff=diff,
+            output_contract=REVIEW_CONTRACT)),
+    ).value
 
 
 # ---------------------------------------------------------------------------

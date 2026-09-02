@@ -166,6 +166,175 @@ def test_the_file_tree_hides_generated_directories(client, tmp_path):
     assert names == ["src", "a.py"]
 
 
+def test_a_new_file_can_be_created_but_not_overwritten(client, tmp_path):
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    created = client.post("/api/file", headers=LOCAL,
+                          json={"projectRoot": str(tmp_path), "path": "src/new.py"})
+    assert created.status_code == 201
+    assert Path(tmp_path, "src", "new.py").read_text() == ""
+
+    again = client.post("/api/file", headers=LOCAL,
+                        json={"projectRoot": str(tmp_path), "path": "src/new.py"})
+    assert again.status_code == 409
+
+
+def test_a_new_folder_can_be_created(client, tmp_path):
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    created = client.post("/api/file", headers=LOCAL, json={
+        "projectRoot": str(tmp_path), "path": "src/lib", "directory": True})
+    assert created.status_code == 201
+    assert Path(tmp_path, "src", "lib").is_dir()
+
+
+@pytest.mark.parametrize("path", ["../../etc/evil", "/etc/evil"])
+def test_creating_outside_the_project_is_refused(client, tmp_path, path):
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    response = client.post("/api/file", headers=LOCAL,
+                           json={"projectRoot": str(tmp_path), "path": path})
+    assert response.status_code == 400
+
+
+def test_a_file_can_be_renamed(client, tmp_path):
+    Path(tmp_path, "a.py").write_text("x = 1\n")
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    renamed = client.put("/api/file/rename", headers=LOCAL, json={
+        "projectRoot": str(tmp_path), "path": "a.py", "newPath": "b.py"})
+    assert renamed.status_code == 200
+    assert not Path(tmp_path, "a.py").exists()
+    assert Path(tmp_path, "b.py").read_text() == "x = 1\n"
+
+
+def test_renaming_onto_an_existing_file_is_refused(client, tmp_path):
+    Path(tmp_path, "a.py").write_text("a\n")
+    Path(tmp_path, "b.py").write_text("b\n")
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    response = client.put("/api/file/rename", headers=LOCAL, json={
+        "projectRoot": str(tmp_path), "path": "a.py", "newPath": "b.py"})
+    assert response.status_code == 409
+    assert Path(tmp_path, "a.py").exists()          # nothing moved
+
+
+def test_renaming_the_project_root_is_refused(client, tmp_path):
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    response = client.put("/api/file/rename", headers=LOCAL, json={
+        "projectRoot": str(tmp_path), "path": ".", "newPath": "elsewhere"})
+    assert response.status_code == 400
+
+
+def test_renaming_cannot_escape_through_the_destination(client, tmp_path):
+    """The classic miss: confining the source but not where it lands."""
+    Path(tmp_path, "a.py").write_text("x\n")
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    response = client.put("/api/file/rename", headers=LOCAL, json={
+        "projectRoot": str(tmp_path), "path": "a.py", "newPath": "../../etc/evil"})
+    assert response.status_code == 400
+    assert Path(tmp_path, "a.py").exists()
+
+
+def test_renaming_through_a_symlink_escape_is_refused(client, tmp_path):
+    outside = tmp_path.parent / "outside-rename-target"
+    outside.mkdir(exist_ok=True)
+    Path(tmp_path, "escape").symlink_to(outside)
+    Path(tmp_path, "a.py").write_text("x\n")
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    response = client.put("/api/file/rename", headers=LOCAL, json={
+        "projectRoot": str(tmp_path), "path": "a.py", "newPath": "escape/a.py"})
+    assert response.status_code == 400
+    assert Path(tmp_path, "a.py").exists()
+    assert not (outside / "a.py").exists()
+
+
+def test_a_file_can_be_deleted(client, tmp_path):
+    Path(tmp_path, "a.py").write_text("x\n")
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    response = client.request("DELETE", "/api/file", headers=LOCAL,
+                              json={"projectRoot": str(tmp_path), "path": "a.py"})
+    assert response.status_code == 200
+    assert not Path(tmp_path, "a.py").exists()
+
+
+def test_a_folder_is_deleted_recursively(client, tmp_path):
+    Path(tmp_path, "src").mkdir()
+    Path(tmp_path, "src", "a.py").write_text("x\n")
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    response = client.request("DELETE", "/api/file", headers=LOCAL,
+                              json={"projectRoot": str(tmp_path), "path": "src"})
+    assert response.status_code == 200
+    assert not Path(tmp_path, "src").exists()
+
+
+def test_deleting_the_project_root_is_refused(client, tmp_path):
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    response = client.request("DELETE", "/api/file", headers=LOCAL,
+                              json={"projectRoot": str(tmp_path), "path": "."})
+    assert response.status_code == 400
+    assert tmp_path.exists()
+
+
+def test_deleting_outside_the_project_is_refused(client, tmp_path):
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    response = client.request("DELETE", "/api/file", headers=LOCAL,
+                              json={"projectRoot": str(tmp_path), "path": "../../etc/evil"})
+    assert response.status_code == 400
+
+
+def test_the_task_database_cannot_be_created_renamed_or_deleted_through_the_api(
+    client, tmp_path,
+):
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    assert client.post("/api/file", headers=LOCAL, json={
+        "projectRoot": str(tmp_path), "path": ".agentzero/x"}).status_code == 400
+    assert client.request("DELETE", "/api/file", headers=LOCAL, json={
+        "projectRoot": str(tmp_path), "path": ".agentzero"}).status_code == 400
+
+
+def test_deleting_something_that_does_not_exist_is_a_clean_404(client, tmp_path):
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    response = client.request("DELETE", "/api/file", headers=LOCAL,
+                              json={"projectRoot": str(tmp_path), "path": "nope.py"})
+    assert response.status_code == 404
+
+
+# -- project-wide search -------------------------------------------------------
+
+
+def test_search_finds_matches_across_files(client, tmp_path):
+    Path(tmp_path, "a.py").write_text("def handle_request():\n    pass\n")
+    Path(tmp_path, "b.py").write_text("x = 1\n")
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    response = client.get("/api/search", headers=LOCAL,
+                          params={"projectRoot": str(tmp_path), "query": "handle_request"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["results"] == [{"path": "a.py", "line": 1, "text": "def handle_request():"}]
+    assert body["truncated"] is False
+
+
+def test_search_is_case_insensitive_and_skips_ignored_dirs(client, tmp_path):
+    Path(tmp_path, "node_modules").mkdir()
+    Path(tmp_path, "node_modules", "lib.js").write_text("needle\n")
+    Path(tmp_path, "a.py").write_text("NEEDLE\n")
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    response = client.get("/api/search", headers=LOCAL,
+                          params={"projectRoot": str(tmp_path), "query": "needle"})
+    paths = [r["path"] for r in response.json()["results"]]
+    assert paths == ["a.py"]
+
+
+def test_an_empty_search_query_returns_no_results_without_scanning(client, tmp_path):
+    client.post("/api/project", headers=LOCAL, json={"path": str(tmp_path)})
+    response = client.get("/api/search", headers=LOCAL,
+                          params={"projectRoot": str(tmp_path), "query": "  "})
+    assert response.status_code == 200
+    assert response.json() == {"query": "  ", "results": [], "truncated": False}
+
+
+def test_searching_an_unopened_project_is_refused(client, tmp_path):
+    response = client.get("/api/search", headers=LOCAL,
+                          params={"projectRoot": str(tmp_path), "query": "x"})
+    assert response.status_code == 400
+
+
 def test_the_picker_browses_outside_any_project_by_design(client, tmp_path):
     """It CHOOSES the project, so it cannot be confined to one."""
     Path(tmp_path, "sub").mkdir()

@@ -254,67 +254,37 @@ STOPWORDS = {
     "of", "is", "be", "can", "will", "just", "also", "some", "any", "all",
 }
 
+# Deliberately short: this model has no tools and a FIXED candidate list
+# already narrowed by graph search (search_entity + one hop of
+# traverse_graph) -- it cannot explore the repo, trace call flows, or
+# discover anything not already listed below it. The original version of
+# this prompt (a GitHub-issue localization workflow lifted wholesale from a
+# LocAgent-style benchmark prompt) told it to do all of that anyway, which is
+# just noise for a task that is actually "pick from this list."
 TASK_INSTRUCTION = """
-Given the following GitHub problem description, your objective is to localize the specific files, classes or functions, and lines of code that need modification or contain key information to resolve the issue.
+Given this issue description and a list of candidate code locations already
+found by searching the codebase, decide which of the candidates are actually
+relevant to the issue.
+""".strip()
 
-Follow these steps to localize the issue:
-## Step 1: Categorize and Extract Key Problem Information
- - Classify the problem statement into the following categories:
-    Problem description, error trace, code to reproduce the bug, and additional context.
- - Identify modules in the '{package_name}' package mentioned in each category.
- - Use extracted keywords and line numbers to search for relevant code references for additional context.
+# The candidates below are already narrowed by graph search (search_entity +
+# one hop of traverse_graph) -- this contract asks for a ranking over THAT
+# short list, not open-ended localization prose. Matches the rest of the
+# system's convention (workers.py): a concrete JSON example, not a type
+# description, because a small model follows an example far more reliably.
+# The old version of this prompt asked for triple-backtick prose ("wrapped
+# with triple backticks", "it's fine if it's very long") while the call sent
+# response_format=json_object -- those two instructions fight each other,
+# which is what produced the json_validate_failed / truncated_reasoning
+# failures seen in production traces.
+LOCATE_CONTRACT = """
+Reply with ONLY this JSON object and nothing else:
+{"entityIds": ["path/to/file.py:ClassName.method_name", "other/file.py:function_name"]}
 
-## Step 2: Locate Referenced Modules
-- Accurately determine specific modules
-    - Explore the repo to familiarize yourself with its structure.
-    - Analyze the described execution flow to identify specific modules or components being referenced.
-- Pay special attention to distinguishing between modules with similar names using context and described execution flow.
-- Output Format for collected relevant modules:
-    - Use the format: 'file_path:QualifiedName'
-    - E.g., for a function `calculate_sum` in the `MathUtils` class located in `src/helpers/math_helpers.py`, represent it as: 'src/helpers/math_helpers.py:MathUtils.calculate_sum'.
-
-## Step 3: Analyze and Reproducing the Problem
-- Clarify the Purpose of the Issue
-    - If expanding capabilities: Identify where and how to incorporate new behavior, fields, or modules.
-    - If addressing unexpected behavior: Focus on localizing modules containing potential bugs.
-- Reconstruct the execution flow
-    - Identify main entry points triggering the issue.
-    - Trace function calls, class interactions, and sequences of events.
-    - Identify potential breakpoints causing the issue.
-    Important: Keep the reconstructed flow focused on the problem, avoiding irrelevant details.
-
-## Step 4: Locate Areas for Modification
-- Locate specific files, functions, or lines of code requiring changes or containing critical information for resolving the issue.
-- Consider upstream and downstream dependencies that may affect or be affected by the issue.
-- If applicable, identify where to introduce new fields, functions, or variables.
-- Think Thoroughly: List multiple potential solutions and consider edge cases that could impact the resolution.
-
-## Output Format for Final Results:
-Your final output should list the locations requiring modification, wrapped with triple backticks ```
-Each location should include the file path, class name (if applicable), function name, or line numbers, ordered by importance.
-Your answer would better include about 5 files.
-
-### Examples:
-```
-full_path1/file1.py
-line: 10
-class: MyClass1
-function: my_function1
-
-full_path2/file2.py
-line: 76
-function: MyClass2.my_function2
-
-full_path3/file3.py
-line: 24
-line: 156
-function: my_function3
-```
-
-Return just the location(s)
-
-Note: Your thinking should be thorough and so it's fine if it's very long.
-"""
+List the candidate ids above that are actually relevant to the query, most
+relevant first. Use the ids exactly as given in "Candidate locations" -- do
+not invent new ones. An empty list is valid if none of them are relevant.
+""".strip()
 
 class LineMatch(Data):
     path: str
@@ -478,39 +448,52 @@ class Retriever:
             return chunks
 
         if getattr(self, "agent", None) is not None:
+            # Lazy imports: context.py imports extract_terms from this module
+            # at load time, so importing build_context back at module level
+            # here would be a cycle. By call time both modules are already
+            # fully loaded.
             from .call import call_model
-            from .context import BuiltContext
-            from .llm import ChatMessage
-            from pydantic import BaseModel, Field
+            from .context import ContextRequest, build_context
+            from pydantic import Field
 
-            class RankedEntities(BaseModel):
-                entity_ids: list[str] = Field(description="The IDs of the entities most relevant to the query.")
+            class RankedEntities(Data):
+                entity_ids: list[str] = Field(
+                    description="The IDs of the entities most relevant to the query.")
 
-            prompt = TASK_INSTRUCTION.format(package_name="project") + "\n\n"
+            prompt = TASK_INSTRUCTION + "\n\n"
             prompt += f"Issue:\n{query}\n\nCandidate locations:\n"
             for node in expanded:
                 prompt += f"- {node.id}\n"
-            
-            messages = [
-                ChatMessage(role="system", content="You are a code localization agent."),
-                ChatMessage(role="user", content=prompt)
-            ]
-            context = BuiltContext(messages=messages, estimated_tokens=1000, compacted=False, dropped_kinds=[], manifest=[])
-            
+
             try:
                 result = call_model(
                     self.agent,
                     task_id=task_id or "locagent_retrieval",
-                    role="plan",
-                    context=context,
+                    role="locate",
+                    context=build_context(ContextRequest(
+                        role="locate", prompt=prompt, output_contract=LOCATE_CONTRACT)),
                     schema=RankedEntities,
                     max_tokens=2048,
-                    temperature=0.2
+                    temperature=0.2,
+                    # 'locate' is in REASONING_ROLES, so ranking picks the
+                    # highest-elo model -- often a reasoning model with
+                    # thinking on by default. Sorting a short list gains
+                    # nothing from deliberation, and the trace this fix was
+                    # written against showed exactly this model burning
+                    # 2047 and then 6144 tokens thinking before ever
+                    # answering. Same rationale as classify_task.
+                    suppress_reasoning=True,
+                    # This is a ranking nicety with a cheap lexical fallback
+                    # right below -- it should not spend the same per-provider
+                    # retry budget as the task's own work, and must never
+                    # block the step waiting on a busy rate-limit bucket the
+                    # way real work is allowed to.
+                    max_fallbacks=0, max_wait_ms=0,
                 )
                 ranked_ids = result.value.entity_ids
                 id_to_node = {n.id: n for n in expanded}
                 expanded = [id_to_node[eid] for eid in ranked_ids if eid in id_to_node]
-            except Exception as e:
+            except Exception:
                 lowered = [t.lower() for t in terms]
                 def closeness(node: GraphNode) -> int:
                     name = node.name.lower()

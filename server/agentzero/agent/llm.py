@@ -150,6 +150,25 @@ class TruncatedReasoningError(Exception):
         self.tokens_out = tokens_out
 
 
+class JsonGenerationFailedError(Exception):
+    """
+    The provider's own JSON-mode validator rejected the generation before it
+    ever reached us (Groq: HTTP 400, code 'json_validate_failed'). This is a
+    MALFORMED reply, same remedy as a schema-validation failure -- repair on
+    the same model with what it produced attached -- not a provider outage.
+    Without this, it fell through to the generic 4xx branch and was treated
+    as "the provider failed," burning a fallback to a different model instead
+    of a repair turn, and discarding `failed_generation` (the one thing that
+    would actually help the model fix its answer).
+    """
+
+    def __init__(self, provider_id: str, model_id: str, failed_generation: str) -> None:
+        super().__init__(f"{provider_id}/{model_id} rejected its own reply as invalid JSON.")
+        self.provider_id = provider_id
+        self.model_id = model_id
+        self.failed_generation = failed_generation
+
+
 # How long to wait before calling a request hung rather than slow.
 #
 # This was 120s, and a provider that simply never answered cost 120 of one
@@ -203,6 +222,12 @@ def chat_complete(
     else:
         sent = list(messages)
 
+    if json and not any("json" in m.content.lower() for m in sent):
+        # OpenAI-compatible APIs (Groq included) reject json_object response_format
+        # with a 400 unless the word "json" appears somewhere in the messages --
+        # not just advisory like the rest of response_format's behaviour.
+        sent = [ChatMessage(role="system", content="Respond with valid JSON."), *sent]
+
     body: dict[str, Any] = {
         "model": model_id,
         "messages": [m.model_dump() for m in sent],
@@ -228,6 +253,15 @@ def chat_complete(
                 response.status_code)
         if response.status_code in (404, 410):
             raise ModelGoneError(provider_id, model_id, response.status_code)
+        if response.status_code == 400:
+            try:
+                error_body = (response.json() or {}).get("error") or {}
+            except ValueError:
+                error_body = {}
+            if error_body.get("code") == "json_validate_failed":
+                raise JsonGenerationFailedError(
+                    provider_id, model_id,
+                    (error_body.get("failed_generation") or text)[:1000])
         raise RuntimeError(f"{provider.label} returned {response.status_code}: {text[:400]}")
 
     payload = response.json()

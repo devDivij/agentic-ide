@@ -49,7 +49,8 @@ from .types import (
 from .verify import verify_changes
 from .workers import (
     WorkerCtx, answer_chat, answer_lookup, classify_task, diagnose_failure,
-    execute_turn, make_plan, normalise_plan, single_step_plan, summarize_prior_task,
+    execute_turn, make_plan, normalise_plan, review_batch, single_step_plan,
+    summarize_prior_task,
 )
 
 #: Turns one executor step may take before we call it stuck.
@@ -66,6 +67,17 @@ EXPLORE_BUDGET = 4
 
 #: REPLAN budget per task -- doc §3, guard table: `replans_used < 2`.
 MAX_REPLANS = 2
+
+# L2: how many completed steps between review passes. Small on purpose --
+# review's job is to catch drift while it is still cheap to undo, and a
+# batch this size keeps the diff it reads, and the blast radius of acting on
+# a wrong finding, both small.
+BATCH_REVIEW_SIZE = 3
+
+#: A review call reads the whole batch diff at once (unlike a step's own
+#: context, which is built to fit); cap it explicitly rather than let
+#: eviction silently drop it -- see context.py's `diff` field.
+REVIEW_DIFF_CHAR_CAP = 40_000
 
 
 def must_act_now(turns: int) -> str:
@@ -360,7 +372,8 @@ def run_task(agent: Agent, prompt: str, *, resume_task_id: str | None = None,
                 # confidently names a plausible path that does not exist, and
                 # the executor then burns its turn budget chasing it.
                 project_files = agent.retriever.list_paths()
-                plan = make_plan(agent, task, seed_chunks, pinned, project_files, root_id)
+                plan = make_plan(agent, task, seed_chunks, pinned, project_files, root_id,
+                                 prior_task)
                 _report(agent, f"Plan: {len(plan.steps)} steps — {plan.summary}")
             db.save_plan(task.id, plan)
             for step in plan.steps:
@@ -377,9 +390,18 @@ def run_task(agent: Agent, prompt: str, *, resume_task_id: str | None = None,
         replans_used = 0
         while True:
             outcome = _run_steps(agent, task, plan, pinned, root_id, started_at,
-                                 replans_used, from_micro_edit)
+                                 replans_used, from_micro_edit, base_sha, prior_task)
             if isinstance(outcome, _Finished):
-                break
+                # L2, once more: everything the per-batch passes above missed,
+                # over the whole task's diff -- a cross-batch interaction, or a
+                # problem only visible once the last step is in. A finding
+                # here re-enters the SAME replan path a step failure would;
+                # `outcome` becomes a _Replan and falls through to it below.
+                review = _run_final_review(agent, task, plan, base_sha, root_id,
+                                           started_at, replans_used)
+                if review is None:
+                    break
+                outcome = review
             if isinstance(outcome, _Aborted):
                 abort_reason = outcome.reason
                 break
@@ -394,7 +416,7 @@ def run_task(agent: Agent, prompt: str, *, resume_task_id: str | None = None,
                     f"attempt — replanning ({replans_used}/{MAX_REPLANS}).")
             old_step_ids = {s.id for s in plan.steps}
             plan = _replan(agent, task, plan, outcome.step, outcome.failure.problem,
-                           pinned, root_id)
+                           pinned, root_id, trigger=outcome.trigger, prior_task=prior_task)
             db.save_plan(task.id, plan)
             active_ids = {s.id for s in plan.steps}
             for step in plan.steps:
@@ -530,6 +552,11 @@ class _Aborted:
 class _Replan:
     step: PlanStep
     failure: "Failure"
+    #: Which recovery edge produced this -- the step itself exhausting its
+    #: retries, or a later review finding a problem in a step that had
+    #: already passed. `_replan` tells the planner a different story for
+    #: each: one never finished, the other did and was undone anyway.
+    trigger: Literal["step_failure", "review"] = "step_failure"
 
 
 _StepsOutcome = _Finished | _Aborted | _Replan
@@ -537,7 +564,8 @@ _StepsOutcome = _Finished | _Aborted | _Replan
 
 def _run_steps(agent: Agent, task: Task, plan: Plan, pinned: list[CodeChunk],
                root_id: int, started_at: int, replans_used: int,
-               from_micro_edit: bool) -> _StepsOutcome:
+               from_micro_edit: bool, base_sha: str,
+               prior_task: str | None = None) -> _StepsOutcome:
     """
     Run the plan in dependency order; steps whose dependency failed are skipped.
 
@@ -549,6 +577,10 @@ def _run_steps(agent: Agent, task: Task, plan: Plan, pinned: list[CodeChunk],
     # Resume support: steps already done stay done.
     completed = {s.step_id for s in db.get_steps(task.id) if s.status == "done"}
     steps_run = 0
+    # L2 batching: every step this call completes, in the order it completed,
+    # and how many of them the last review pass already covered.
+    done_in_order: list[PlanStep] = []
+    reviewed_through = 0
 
     for step in order_steps(plan.steps):
         if step.id in completed:
@@ -584,7 +616,7 @@ def _run_steps(agent: Agent, task: Task, plan: Plan, pinned: list[CodeChunk],
 
         steps_run += 1
         try:
-            result = _run_one_step(agent, task, plan, step, pinned, root_id)
+            result = _run_one_step(agent, task, plan, step, pinned, root_id, prior_task)
         except TaskCancelledError:
             # A stop is not a failure to diagnose and retry. Unwind to the
             # normal finish: commit, diff, and report 'aborted' with the work
@@ -593,6 +625,21 @@ def _run_steps(agent: Agent, task: Task, plan: Plan, pinned: list[CodeChunk],
 
         if result.ok:
             completed.add(step.id)
+            done_in_order.append(step)
+            if (len(done_in_order) - reviewed_through >= BATCH_REVIEW_SIZE
+                    and not _task_has_unclean_steps(db, task.id, plan)):
+                window = done_in_order[reviewed_through:]
+                reviewed_through = len(done_in_order)
+                steps_by_id = {s.step_id: s for s in db.get_steps(task.id)}
+                after_sha = steps_by_id[window[-1].id].checkpoint_sha
+                if after_sha is not None:
+                    before_sha = _checkpoint_before(done_in_order, steps_by_id,
+                                                    window[0], base_sha)
+                    review_outcome = _review_changes(
+                        agent, task, plan, window, before_sha, after_sha, root_id,
+                        replans_used, started_at, steps_run)
+                    if review_outcome is not None:
+                        return review_outcome
             continue
 
         # Eligible for REPLAN when the decomposition itself looks wrong, not
@@ -610,13 +657,23 @@ def _run_steps(agent: Agent, task: Task, plan: Plan, pinned: list[CodeChunk],
 
 
 def _replan(agent: Agent, task: Task, old_plan: Plan, failed_step: PlanStep,
-            problem: str, pinned: list[CodeChunk], root_id: int) -> Plan:
+            problem: str, pinned: list[CodeChunk], root_id: int,
+            trigger: Literal["step_failure", "review"] = "step_failure",
+            prior_task: str | None = None) -> Plan:
     """
     REPLAN: the doc's row-8/9 recovery -- a step exhausted retries because the
     DECOMPOSITION was wrong, not because one attempt was unlucky. Keeps every
     already-done step exactly as it is (id, status, checkpoint) and asks the
     planner for a fresh breakdown of only what remains, seeded with why the old
     breakdown didn't work.
+
+    `trigger` picks which story the planner is told about the step that
+    triggered this: a step-level failure never finished, but a review-level
+    one DID pass its own checks and was undone anyway once a later pass saw
+    the combined result -- conflating the two would tell the planner
+    something false about work it can see already happened (`single_step_plan`
+    above has the same scar: a summary rendered verbatim into a model's
+    context must not misstate what occurred).
 
     Reuses `make_plan` rather than a bespoke call: the synthesized prompt below
     becomes `task.prompt` for that call, so its existing fallback -- a plan that
@@ -629,15 +686,25 @@ def _replan(agent: Agent, task: Task, old_plan: Plan, failed_step: PlanStep,
 
     listing = ("\n".join(f"- {s.id}: {s.intent}" for s in done_steps)
                if done_steps else "(none yet)")
+    if trigger == "review":
+        step_clause = (
+            f'The step "{failed_step.id}: {failed_step.intent}" passed its own checks '
+            "at the time, but a later review of the combined changes found a problem "
+            f"attributable to it, so its work was rolled back: {problem}\n\nBreak down "
+            "what remains differently — smaller steps, or a different approach to this "
+            "part.")
+    else:
+        step_clause = (
+            f'The step "{failed_step.id}: {failed_step.intent}" could not be completed '
+            "after every retry, even after its changes were rolled back and tried again: "
+            f"{problem}\n\nBreak down what remains differently — smaller steps, or a "
+            "different approach to the part that failed.")
     replan_prompt = (
         f"{task.prompt}\n\n"
         "--- Replanning note ---\n"
         "These steps are already done — do not repeat or undo them:\n"
         f"{listing}\n\n"
-        f'The step "{failed_step.id}: {failed_step.intent}" could not be completed '
-        "after every retry, even after its changes were rolled back and tried again: "
-        f"{problem}\n\nBreak down what remains differently — smaller steps, or a "
-        "different approach to the part that failed.")
+        f"{step_clause}")
 
     seed_chunks = agent.retriever.retrieve(replan_prompt, [], 10, task_id=task.id)
     db.append_event(NewEvent(
@@ -647,7 +714,7 @@ def _replan(agent: Agent, task: Task, old_plan: Plan, failed_step: PlanStep,
                             for c in seed_chunks]}))
     project_files = agent.retriever.list_paths()
     revised = make_plan(agent, task.model_copy(update={"prompt": replan_prompt}),
-                        seed_chunks, pinned, project_files, root_id)
+                        seed_chunks, pinned, project_files, root_id, prior_task)
 
     # done_steps FIRST: normalise_plan resolves id collisions by input
     # position, so a revised step that happens to reuse a done id gets renamed
@@ -655,6 +722,195 @@ def _replan(agent: Agent, task: Task, old_plan: Plan, failed_step: PlanStep,
     # backward.
     return normalise_plan(Plan(summary=old_plan.summary,
                                steps=[*done_steps, *revised.steps]))
+
+
+# ---------------------------------------------------------------------------
+# L2: review -- a pass over a batch's accumulated diff
+# ---------------------------------------------------------------------------
+
+
+def _run_final_review(agent: Agent, task: Task, plan: Plan, base_sha: str,
+                      root_id: int, started_at: int,
+                      replans_used: int) -> _Replan | None:
+    """
+    The end-of-task counterpart to the periodic review inside `_run_steps`:
+    everything a per-batch pass could miss because it only ever saw one
+    batch -- a cross-batch interaction, or a problem only visible once the
+    last step is in. Fires once, over the WHOLE task's diff, from `base_sha`
+    to wherever HEAD actually is.
+
+    Reading HEAD directly rather than committing a fresh snapshot is safe
+    here specifically because every step attempt, pass or fail, already
+    commits (`_run_one_step`'s pre-attempt snapshot and post-verify
+    checkpoint) -- there is no window in this loop where the tree is dirty
+    and uncommitted by the time `_run_steps` returns `_Finished`.
+    """
+    db = agent.db
+    if _task_has_unclean_steps(db, task.id, plan):
+        # A partial failure already has its own honest record and its own
+        # explanation in describe_outcome -- a second judgement layer on top
+        # of that can only muddy it, and the diff itself may include a failed
+        # step's fail-forward leftovers that don't belong to any done step.
+        return None
+    steps_by_id = {s.step_id: s for s in db.get_steps(task.id)}
+    ordered_done = [s for s in order_steps(plan.steps)
+                    if steps_by_id.get(s.id) is not None
+                    and steps_by_id[s.id].status == "done"]
+    if not ordered_done:
+        return None
+    after_sha = agent.checkpoints.head() or base_sha
+    return _review_changes(agent, task, plan, ordered_done, base_sha, after_sha,
+                           root_id, replans_used, started_at,
+                           len(db.get_steps(task.id)))
+
+
+def _review_changes(agent: Agent, task: Task, plan: Plan, ordered: list[PlanStep],
+                    before_sha: str, after_sha: str, root_id: int,
+                    replans_used: int, started_at: int,
+                    steps_run: int) -> _Replan | None:
+    """
+    L2: an LLM pass over what L1's mechanical checks (`verify_changes`,
+    `TAXONOMY`) cannot see, because each of those judges one step's own
+    acceptance criteria and nothing before this looks at the accumulated
+    diff as a whole -- drift from the request, duplicated logic, a later
+    step quietly undoing an earlier guarantee.
+
+    A finding is not ground truth, it is one more model call, so it never
+    acts directly on the tree: it is turned into the same `_Replan` shape a
+    step failure produces, spending from the same `MAX_REPLANS` ceiling and
+    going through the same `_replan` call -- review is a convenience, never a
+    dependency, exactly like `diagnose_failure` above. Called both
+    periodically (a few just-completed steps) and once at the end (every
+    step the task ran); `ordered` is whichever span is being looked at.
+    """
+    db = agent.db
+    if before_sha == after_sha:
+        return None
+    over_budget = check_budget(agent, task, started_at, steps_run)
+    if over_budget:
+        _report(agent, f"Skipping review ({over_budget}).")
+        return None
+
+    diff = agent.checkpoints.diff(before_sha, after_sha)
+    if not diff.strip():
+        return None
+
+    review_event_id = db.append_event(NewEvent(
+        task_id=task.id, parent_id=root_id, kind="review",
+        payload={"steps": [s.id for s in ordered]}))
+    step_notes = [f"{s.id}: {s.intent}" for s in ordered]
+
+    try:
+        result = review_batch(agent, task, plan, step_notes, _cap_diff(diff),
+                              review_event_id)
+    except Exception as err:      # noqa: BLE001 -- review is a convenience, never a dependency
+        db.append_event(NewEvent(
+            task_id=task.id, parent_id=review_event_id, kind="error",
+            payload={"message": str(err), "action": "batch review skipped"},
+            status="error"))
+        return None
+
+    db.append_event(NewEvent(
+        task_id=task.id, parent_id=review_event_id, kind="review",
+        payload={"ok": result.ok, "issues": [i.wire() for i in result.issues]},
+        status="ok" if result.ok else "error"))
+    if result.ok or not result.issues:
+        return None
+
+    issue = result.issues[0]
+    if replans_used >= MAX_REPLANS:
+        # Still worth surfacing -- the human review screen shows this event --
+        # just not worth acting on when there is no budget left to act with.
+        _report(agent, f"Review flagged a problem, but no replans remain: "
+                       f"{issue.description}")
+        return None
+
+    # The model's own guess is free and usually right; a batch this small
+    # (BATCH_REVIEW_SIZE) doesn't earn anything fancier than "blame the most
+    # recent step" as the fallback -- the least destructive wrong guess.
+    culprit = next((s for s in ordered if s.id in issue.step_ids), ordered[-1])
+    _report(agent, f"Review flagged {culprit.id}: {issue.description}")
+
+    steps_by_id = {s.step_id: s for s in db.get_steps(task.id)}
+    culprit_before = _checkpoint_before(ordered, steps_by_id, culprit, before_sha)
+    agent.checkpoints.revert_to(culprit_before)
+    db.purge_facts_after(task.id, culprit.id)
+    db.append_event(NewEvent(
+        task_id=task.id, parent_id=review_event_id, kind="checkpoint",
+        step_id=culprit.id,
+        payload={"action": "revert", "to": culprit_before, "reason": "batch review"}))
+    _demote_from(db, task.id, ordered, culprit)
+
+    failure = Failure(
+        failure_class="wrong_approach",
+        problem=f"A later review of the combined changes found a problem: "
+                f"{issue.description}",
+        decided_by="model")
+    return _Replan(step=culprit, failure=failure, trigger="review")
+
+
+def _checkpoint_before(ordered: list[PlanStep], steps_by_id: dict[str, StepRecord],
+                       step: PlanStep, floor_sha: str) -> str:
+    """The checkpoint immediately before `step` within `ordered`, or `floor_sha`
+    if `step` is first."""
+    idx = next(i for i, s in enumerate(ordered) if s.id == step.id)
+    for prior in reversed(ordered[:idx]):
+        record = steps_by_id.get(prior.id)
+        if record is not None and record.checkpoint_sha:
+            return record.checkpoint_sha
+    return floor_sha
+
+
+def _demote_from(db: Store, task_id: str, ordered: list[PlanStep], step: PlanStep) -> None:
+    """
+    Send `step` and everything after it in `ordered` back to pending, so
+    `_replan`'s `done_ids` scan (and the next `_run_steps` call) stop treating
+    them as finished.
+
+    Resets `attempts` to 0, deliberately -- unlike a step that exhausts its
+    own retries and keeps its honest `failed` count (§8's comment on
+    `_replan`), a demoted step has no failure history: every prior attempt at
+    it actually PASSED. `attempts` is a display counter only (the retry
+    ceiling is `_run_one_step`'s own local loop, never read from this column),
+    so there is nothing to preserve by carrying a stale number forward.
+    """
+    idx = next(i for i, s in enumerate(ordered) if s.id == step.id)
+    for s in ordered[idx:]:
+        _mark_step(db, task_id, s, "pending", None, 0)
+
+
+def _task_has_unclean_steps(db: Store, task_id: str, plan: Plan) -> bool:
+    """
+    True if any step in the CURRENT plan has already failed or been skipped.
+
+    Review's diff is read straight off the checkpoint chain, not assembled
+    per-step -- so it can't distinguish a clean run from one where a failed
+    step (fail-forward: its half-finished files stay on disk) or a skipped
+    dependent sits between two steps that themselves succeeded. A finding
+    attributed to the wrong step there, and a revert that rolls back across
+    one that already has its own honest `failed` record and its own
+    explanation in `describe_outcome`, is worse than reviewing nothing.
+
+    Scoped to `plan.steps`, not every StepRecord this task ever wrote:
+    `_replan` (triggered by review itself, or by a step exhausting its
+    retries) can drop a step from the plan entirely, and the cleanup below it
+    relabels an abandoned-but-still-`pending` one `skipped` -- that record is
+    stale bookkeeping for work whose tree changes were already reverted, not
+    evidence the CURRENT diff is polluted.
+    """
+    active = {s.id for s in plan.steps}
+    return any(s.status in ("failed", "skipped") and s.step_id in active
+              for s in db.get_steps(task_id))
+
+
+def _cap_diff(diff: str) -> str:
+    """Explicit and visible, rather than an eviction that silently drops the
+    one block a review call cannot do its job without (see context.py's
+    `diff` field, pinned for exactly this reason)."""
+    if len(diff) <= REVIEW_DIFF_CHAR_CAP:
+        return diff
+    return (f"{diff[:REVIEW_DIFF_CHAR_CAP]}\n\n"
+            f"... diff truncated at {REVIEW_DIFF_CHAR_CAP} of {len(diff)} chars ...")
 
 
 # How the loop responds to each failure class. Something labels the failure;
@@ -763,7 +1019,8 @@ class StepResult:
 
 
 def _run_one_step(agent: Agent, task: Task, plan: Plan, step: PlanStep,
-                  pinned: list[CodeChunk], root_id: int) -> StepResult:
+                  pinned: list[CodeChunk], root_id: int,
+                  prior_task: str | None = None) -> StepResult:
     """Execute one step, with retries governed by the failure taxonomy."""
     db = agent.db
     step_event_id = db.append_event(NewEvent(
@@ -803,7 +1060,7 @@ def _run_one_step(agent: Agent, task: Task, plan: Plan, step: PlanStep,
                 # They are deliberately not the same object: exclusions must
                 # hold still for the whole attempt, or the executor would swap
                 # models between turns of a step that is going fine.
-                list(spent_models), spent_models)
+                list(spent_models), spent_models, prior_task)
             evidence.looping = result.blocked_kind == "looping"
             evidence.turn_limit = result.blocked_kind == "turn_limit"
 
@@ -1063,7 +1320,8 @@ class _TurnsResult:
 def _execute_step_turns(agent: Agent, task: Task, plan: Plan, step: PlanStep,
                         pinned: list[CodeChunk], parent_id: int,
                         hint: str | None = None, exclude: list[str] | None = None,
-                        spent: set[str] | None = None) -> _TurnsResult:
+                        spent: set[str] | None = None,
+                        prior_task: str | None = None) -> _TurnsResult:
     """
     Drive one step's executor turns until it says done, blocks, or loops.
 
@@ -1096,7 +1354,7 @@ def _execute_step_turns(agent: Agent, task: Task, plan: Plan, step: PlanStep,
             agent, task, plan, step, facts, chunks, pinned,
             recent_outcomes, transcript, project_files, parent_id, hint,
             must_act_now(exploring) if exploring >= EXPLORE_BUDGET else None,
-            exclude)
+            exclude, prior_task)
         action = turn_result.turn
         # Recorded on the SINK, not the return value: `call_model` raises past
         # every return below when a model exhausts its repairs, and that is

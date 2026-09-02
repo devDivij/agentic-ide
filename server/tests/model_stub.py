@@ -17,18 +17,30 @@ ROLE_MARKERS = {
     "You break work into small": "plan",
     "You make one focused change": "execute",
     "You classify why something failed": "diagnose",
+    "You review a batch of already-passing changes": "review",
     "concise, accurate programming assistant": "ask",
+    "You rank a short list of candidate code entities": "locate",
 }
 
 # What a role says when a test did not script that call. The executor gives up
-# (ending the step cleanly); the rest reply with something no schema accepts,
-# which is what a real model failing looks like.
+# (ending the step cleanly); the review pass says everything looked fine (it
+# fires at the end of essentially every task, so silence should mean "no
+# opinion", not a fabricated finding); the rest reply with something no schema
+# accepts, which is what a real model failing looks like.
 ROLE_DEFAULTS = {
     "execute": '{"thought":"","action":"blocked","blockedReason":"script exhausted"}',
     "classify": '{"unscripted": true}',
     "plan": '{"unscripted": true}',
     "diagnose": '{"unscripted": true}',
+    "review": '{"ok": true, "issues": []}',
     "ask": '{"unscripted": true}',
+    # NOT '{"entityIds": []}': that would validate as a real "nothing is
+    # relevant" ranking and empty out retrieve()'s candidate list for every
+    # unscripted test. Schema-invalid, like plan/classify/diagnose, so an
+    # unscripted call fails validation and hits retrieve()'s own
+    # except-and-degrade, which keeps the candidates and falls back to
+    # lexical sort -- "no opinion", not "nothing is relevant".
+    "locate": '{"unscripted": true}',
 }
 
 

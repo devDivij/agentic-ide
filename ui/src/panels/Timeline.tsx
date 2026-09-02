@@ -18,6 +18,7 @@ import {
 } from '../activity.ts';
 import { api } from '../api.ts';
 import { diffFiles } from '../diff.ts';
+import { samePin, tokenizePrompt, type PinRef } from '../pins.ts';
 import { DiffLines } from './DiffLines.tsx';
 
 /** One task in the conversation, whether it is live, finished, or historical. */
@@ -66,8 +67,36 @@ function useTick(active: boolean, everyMs = 500): void {
 // A task: the prompt that started it, and everything that came of it
 // ---------------------------------------------------------------------------
 
+/**
+ * A message with its `@path[:12-40]` references rendered as clickable chips
+ * (spec 7b: the output chat, not just the input box, must support pinning
+ * and unpinning through these). Clicking one toggles it in the shared tray.
+ */
+function PromptText({
+  text, pins, onTogglePin,
+}: {
+  text: string;
+  pins: PinRef[];
+  onTogglePin: (pin: PinRef) => void;
+}): JSX.Element {
+  return (
+    <>
+      {tokenizePrompt(text).map((tok, i) => tok.pin ? (
+        <button
+          key={i}
+          className={`pin-ref ${pins.some((p) => samePin(p, tok.pin!)) ? 'active' : ''}`}
+          title="Click to pin/unpin this into the composer's context"
+          onClick={() => onTogglePin(tok.pin!)}
+        >
+          {tok.text}
+        </button>
+      ) : <span key={i}>{tok.text}</span>)}
+    </>
+  );
+}
+
 export function TaskEntry({
-  projectRoot, task, approvals, actions, explaining,
+  projectRoot, task, approvals, actions, explaining, pins, onTogglePin,
 }: {
   /** Needed only to diff a proposed write against what is on disk now. */
   projectRoot: string;
@@ -75,6 +104,8 @@ export function TaskEntry({
   approvals: ApprovalRequest[];
   actions: TaskActions;
   explaining: boolean;
+  pins: PinRef[];
+  onTogglePin: (pin: PinRef) => void;
 }): JSX.Element {
   const running = task.live && task.status === 'running';
   useTick(running);
@@ -101,7 +132,9 @@ export function TaskEntry({
       <>
         <div className="bubble user">
           <div className="bubble-label">you</div>
-          {task.prompt || <span className="muted">(resumed task)</span>}
+          {task.prompt
+            ? <PromptText text={task.prompt} pins={pins} onTogglePin={onTogglePin} />
+            : <span className="muted">(resumed task)</span>}
         </div>
         <div className="bubble agent">
           <div className="bubble-label">agent</div>

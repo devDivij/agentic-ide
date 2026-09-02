@@ -20,6 +20,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, type TaskRow } from './api.ts';
 import type { ConversationWire } from './types.ts';
 import { useAgentStream } from './state.ts';
+import {
+  addPin as addPinTo, removePin as removePinFrom, togglePin as togglePinIn, withPinTags,
+  type PinRef,
+} from './pins.ts';
 import { Chat } from './panels/Chat.tsx';
 import { Files } from './panels/Files.tsx';
 import { ProjectPicker } from './panels/ProjectPicker.tsx';
@@ -60,6 +64,12 @@ export function App(): JSX.Element {
   const [tab, setTab] = useState<Tab>('chat');
   const [picking, setPicking] = useState(false);
   const [draft, setDraft] = useState('');
+  /**
+   * Manual context control (spec: files/code blocks must be addable and
+   * removable from the active context at any time). This tray is the source
+   * of truth for what gets pinned; `draft` stays the free-text message.
+   */
+  const [pins, setPins] = useState<PinRef[]>([]);
   const [toast, setToast] = useState<string | null>(null);
   /** The chats this project holds, most recently active first. */
   const [conversations, setConversations] = useState<ConversationWire[]>([]);
@@ -122,6 +132,7 @@ export function App(): JSX.Element {
           setHistory([]);
           setConversations([]);
           setDraft('');          // an @path tag pointing into the old tree
+          setPins([]);
           setConversationId(chat);
           // The review pane builds a diff for state.task against the project
           // root; after a switch that pairing no longer exists.
@@ -159,6 +170,20 @@ export function App(): JSX.Element {
         setToast(e.message);
       });
   };
+
+  const addPin = useCallback((pin: PinRef): void => {
+    setPins((prev) => addPinTo(prev, pin));
+  }, []);
+
+  const removePin = useCallback((pin: PinRef): void => {
+    setPins((prev) => removePinFrom(prev, pin));
+  }, []);
+
+  const toggleChatPin = useCallback((pin: PinRef): void => {
+    setPins((prev) => togglePinIn(prev, pin));
+  }, []);
+
+  const clearPins = useCallback((): void => setPins([]), []);
 
   const resume = (taskId: string): void => {
     void api.resumeTask(projectRoot, taskId).catch((e: Error) => {
@@ -240,8 +265,8 @@ export function App(): JSX.Element {
                 projectRoot={projectRoot}
                 filesChangedAt={state.filesChangedAt}
                 agentRunning={running}
-                onPin={(ref) => {
-                  setDraft((d) => (d ? `${d} ${ref}` : ref));
+                onPin={(pin) => {
+                  addPin(pin);
                   setTab('chat');
                 }}
                 onOpenProject={openProject}
@@ -276,6 +301,10 @@ export function App(): JSX.Element {
                 onReview={() => setTab('review')}
                 draft={draft}
                 setDraft={setDraft}
+                pins={pins}
+                onRemovePin={removePin}
+                onTogglePin={toggleChatPin}
+                onClearPins={clearPins}
               />
             )}
             {tab === 'review' && (

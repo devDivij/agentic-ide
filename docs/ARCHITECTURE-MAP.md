@@ -155,6 +155,21 @@ FOR EACH STEP (skipped if any dependency failed):
                  attempts exhausted ──► step_end{failure{class, problem, response,
                                           decidedBy: code|model, advice}}
     ▼
+[REVIEW] L2 — every 3 steps done (BATCH_REVIEW_SIZE), and once more at the end
+    │        over the WHOLE task's diff, base..head: a pass over what no
+    │        single step's own acceptance criteria could see (drift, dupe
+    │        logic, a later step undoing an earlier guarantee)
+    │        skipped: no diff to look at, or the budget gate says stop
+    │        ok=true or no issues ──► nothing happens, loop continues
+    │        ok=false, no replans left ──► finding logged, not acted on
+    │        ok=false, a replan left ──► culprit = the step the model named,
+    │            else the batch's most recent step (no bisection — batches
+    │            are 3 steps, not worth it); revert tree to the checkpoint
+    │            before it, purgeFacts, demote it (+ everything after it in
+    │            the reviewed span) back to pending ──► SAME REPLAN edge a
+    │            step failure takes (wrong_approach, MAX_REPLANS=2 shared),
+    │            just told the true story: this step PASSED its own checks
+    ▼
 [FINALISE] commit 'final' → unified diff(base..final) → countChangedFiles
     │        composeReport() from the steps' own closing words (no model call)
     │        collectLinks() (dev-server URLs) · describeOutcome(): status +
@@ -233,6 +248,10 @@ execute   ≤12 per step   3000     75s   FLAT schema on purpose (small models
 diagnose  rare           1200     40s   reasoning suppressed; reached only when
                                        classifyInCode has no evidence; picks 1
                                        of 7 labels, NEVER decides the response
+review    ~1 per 3 steps 1500     45s   L2, over a batch's diff (32k window,
+          + 1 at the end                capped at 40k chars); {ok, issues[]};
+                                       NEVER decides the response — a finding
+                                       becomes a REPLAN, same as diagnose
 ask       on demand      1200     75s   /bytheway; structurally isolated: no
                                        task, no store, no facts passed in
 ```
@@ -307,7 +326,7 @@ Mutable state beside the log: tasks(budget_json, plan_json, base_sha) ·
 steps(status, checkpoint_sha, attempts, ordinal) · facts(purged_at) · pins.
 Crash-safe by construction: nothing lives inside a model conversation.
 Event kinds: task_start/end · step_start/end · llm_call · tool_call · route ·
-assemble · verify · compact · checkpoint · error.
+assemble · verify · review · compact · checkpoint · error.
 ```
 
 ## 7. Model portfolio (`providers.py` — data, not code)
@@ -392,21 +411,27 @@ refuses file access outside projects the user explicitly opened, and refuses
 ```
 Retrieval is lexical.      No tree-sitter graph, k-hop expansion, BM25 or
                            embeddings. retrieve()'s body is the documented seam.
-Verification is shallow.   Syntax + optional test command. No milestone gates,
-                           checklist calls, cross-family final grader, no bisect
-                           recovery. (Fact-purge on revert IS built.)
+Verification is shallow.   Syntax + optional test command. No cross-family
+                           final grader, no checkpoint-bisect recovery. (A
+                           lighter milestone check IS built: REVIEW, §2 — an
+                           LLM pass every BATCH_REVIEW_SIZE=3 steps and once
+                           at the end, over the accumulated diff, that can
+                           trigger a revert+replan through the ordinary
+                           TAXONOMY path. Fact-purge on revert IS built.)
 Routing is static.         Preference tiers + buckets + pay-vs-wait. No bandit/
                            history adaptation, no escalation ladder, no
                            de-escalation at milestones.
 Steps are sequential.      orderSteps gives topological order but nothing runs
                            concurrently.
-Compaction is eviction.    Priority drop-list only; no summarisation pass.
+Compaction is eviction.    Priority drop-list, relevance-ranked within each
+                           tier (lexical term overlap vs. the prompt/step,
+                           same technique as retrieval.py); no summarisation
+                           pass -- paraphrasing dropped context is exactly
+                           the misremembering this design avoids.
 Diagnose nearly never      classifyInCode answers from evidence first; the
 fires.                     worker exists for the genuinely ambiguous "blocked".
 /bytheway is untraced.     Structural isolation trade-off: no db → no events;
                            visible only on its own chat bubble.
-Task status 'done' is      typed in TaskStatus but NO code path sets it;
-unreachable.               terminal states are awaiting_review | failed | aborted.
 Router.snapshot()/headroom computed in-process; no HTTP route exposes them yet.
 No desktop packaging.      Web app + single-process server; not Electron.
 No eval harness.           41 offline unit tests pin behaviours (taxonomy
@@ -437,7 +462,7 @@ Small wart: Settings.testProvider awaits without client-side try/catch.
 
 | Concern | Implemented in |
 |---|---|
-| The one loop, stuck detector, budgets, taxonomy, salvage marking | `agent/orchestrator.py` |
+| The one loop, stuck detector, budgets, taxonomy, salvage marking, L2 review | `agent/orchestrator.py` |
 | Model jobs + prompt contracts | `agent/workers.py` |
 | Route→dispatch→log→validate→repair | `agent/call.py`; HTTP in `agent/llm.py`; tolerance in `agent/parse.py` |
 | Context assembly + eviction | `agent/context.py` |
@@ -454,4 +479,4 @@ Small wart: Settings.testProvider awaits without client-side try/catch.
 | Headless driver | `cli.py` (run/resume/providers/trace) |
 | UI shell/tabs/pinning | `ui/src/App.tsx`, `panels/*`; stream fold in `state.ts`; readable feed in `activity.ts` |
 | Wire contract shared by both halves | `shared/types.py` (type-only import from the UI) |
-| Behaviour pins | `server/tests/` (228 offline tests, 11 files) |
+| Behaviour pins | `server/tests/` (234 offline tests, 11 files) |

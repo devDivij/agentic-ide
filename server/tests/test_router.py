@@ -118,8 +118,8 @@ def test_a_hairy_step_prefers_the_stronger_paid_model():
     """A weak model that fails a step costs more wall-clock than it saves."""
     router = Router(configured={"openrouter"})
     paid = lambda ranked: [c.model.id for c in ranked if c.model.cost_per_m_tok_in > 0]
-    assert paid(router.rank("execute", difficulty="hairy"))[0] == "qwen/qwen3-coder"     # 30B
-    assert paid(router.rank("execute"))[0] == "mistralai/devstral-small"                 # 24B
+    assert paid(router.rank("execute", difficulty="hairy"))[0] == "mistralai/codestral-2508"          # 22B, higher swe_score
+    assert paid(router.rank("execute"))[0] == "qwen/qwen3-coder-30b-a3b-instruct"                     # 30B, cheaper cost_out
 
 
 def test_excluded_and_retired_models_are_not_ranked():
@@ -151,6 +151,18 @@ def test_no_configured_key_for_a_role_is_a_clear_error():
     router = Router(configured=set())
     with pytest.raises(NoUsableModelError, match="Configure at least one API key"):
         router.pick("execute", 100)
+
+
+def test_max_wait_ms_zero_raises_instead_of_sleeping():
+    """
+    A caller for whom the call is only an optional enhancement (retrieval's
+    entity ranking) passes 0 so a busy bucket fails fast instead of blocking
+    the step for up to MAX_WAIT_MS.
+    """
+    router = Router(configured={"groq"})
+    router._buckets["groq"].penalize(50_000)
+    with pytest.raises(NoUsableModelError, match="rate-limited for more than 0s"):
+        router.pick("classify", 100, max_wait_ms=0)
 
 
 def test_snapshot_covers_every_provider():

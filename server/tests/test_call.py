@@ -14,8 +14,8 @@ import agentzero.agent.call as call_module
 from agentzero.agent.call import CallDeps, CallFailedError, call_model
 from agentzero.agent.context import ContextRequest, build_context
 from agentzero.agent.llm import (
-    ChatResult, ModelGoneError, TaskCancelledError, TransientProviderError,
-    TruncatedReasoningError,
+    ChatResult, JsonGenerationFailedError, ModelGoneError, TaskCancelledError,
+    TransientProviderError, TruncatedReasoningError,
 )
 from agentzero.agent.router import Router
 
@@ -85,6 +85,26 @@ def test_a_malformed_reply_is_repaired_on_the_same_model(
     assert "- verdict: Field required" in repair_prompt
 
 
+def test_an_empty_reply_is_repaired_without_replaying_an_empty_assistant_turn(
+        monkeypatch, deps, store, task, context):
+    """
+    A reasoning model that spends its whole budget thinking can return HTTP
+    200 with empty content. Replaying that as an assistant-role message is
+    itself invalid on at least one real provider ("must have non-empty
+    content or tool calls") -- turning a repairable malformed reply into a
+    hard provider error on the very next attempt. Nothing to quote, so the
+    assistant turn should be skipped, not sent empty.
+    """
+    seen = script(monkeypatch, "", '{"verdict": "medium"}')
+    result = call_model(deps, task_id="t1", role="classify", context=context, schema=Answer)
+
+    assert result.value.verdict == "medium"
+    repair_messages = seen[1]["messages"]
+    assert all(m.content.strip() for m in repair_messages)
+    assert repair_messages[-1].role == "user"
+    assert "completely empty" in repair_messages[-1].content
+
+
 def test_repairs_are_capped_and_report_the_validation_error(
         monkeypatch, deps, store, task, context):
     script(monkeypatch, '{"a": 1}', '{"b": 2}', '{"c": 3}')
@@ -92,6 +112,37 @@ def test_repairs_are_capped_and_report_the_validation_error(
         call_model(deps, task_id="t1", role="classify", context=context, schema=Answer)
     assert excinfo.value.kind == "malformed_output"
     assert "verdict" in str(excinfo.value)
+
+
+def test_a_provider_side_json_rejection_is_repaired_not_switched(
+        monkeypatch, deps, store, task, context):
+    """
+    Groq (and other OpenAI-compatible APIs) can reject json_object mode with a
+    400 'json_validate_failed' before any content reaches us. That is a
+    malformed reply, same remedy as a schema-validation failure -- repair on
+    the SAME model with what it produced attached -- not a provider outage
+    that burns a fallback to a different model.
+    """
+    seen = script(monkeypatch,
+                  JsonGenerationFailedError("groq", "qwen/qwen3.8-27b", "not json at all"),
+                  '{"verdict": "medium"}')
+    result = call_model(deps, task_id="t1", role="classify", context=context, schema=Answer)
+
+    assert result.value.verdict == "medium"
+    assert seen[0]["model"] == seen[1]["model"]
+    repair_prompt = seen[1]["messages"][-1].content
+    assert "not json at all" in repair_prompt
+    assert "malformed_output" in str(store.get_events("t1"))
+
+
+def test_repeated_json_rejections_from_the_same_model_are_capped(
+        monkeypatch, deps, store, task, context):
+    script(monkeypatch, *[
+        JsonGenerationFailedError("groq", "qwen/qwen3.8-27b", "still not json")
+        for _ in range(3)])
+    with pytest.raises(CallFailedError) as excinfo:
+        call_model(deps, task_id="t1", role="classify", context=context, schema=Answer)
+    assert excinfo.value.kind == "malformed_output"
 
 
 def test_a_truncated_reply_buys_room_instead_of_spending_a_repair(
@@ -122,6 +173,22 @@ def test_a_reasoning_model_that_never_answered_gets_a_bigger_budget(
                         schema=Answer, max_tokens=2048)
     assert result.value.verdict == "easy"
     assert seen[1]["max_tokens"] > seen[0]["max_tokens"]
+
+
+def test_max_fallbacks_zero_gives_up_after_the_first_provider_error(
+        monkeypatch, deps, store, task, context):
+    """
+    A caller for whom the call is only an optional enhancement (retrieval's
+    entity ranking) passes max_fallbacks=0 so it fails fast on the first
+    provider error and falls back to its own cheap degrade path, instead of
+    spending the same per-provider retry budget as the task's own work.
+    """
+    script(monkeypatch, TransientProviderError("429", "groq", 1_000, 429),
+           '{"verdict": "easy"}')
+    with pytest.raises(CallFailedError) as excinfo:
+        call_model(deps, task_id="t1", role="classify", context=context, schema=Answer,
+                  max_fallbacks=0)
+    assert excinfo.value.kind == "transient_api"
 
 
 def test_a_transient_failure_switches_provider_without_spending_a_repair(

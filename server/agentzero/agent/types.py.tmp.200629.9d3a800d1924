@@ -66,14 +66,9 @@ Role = Literal[
                  # passing steps did wrong that no single step's own checks
                  # could see (never decides what to do -- same split as diagnose)
     "ask",       # /bytheway:      an isolated one-off question, no task state
-    "locate",    # many per task:  rank retrieval's candidate entities by
-                 # relevance to a query (LocAgent). Its own identity, not
-                 # "plan" -- it used to borrow that label and the trace lied
-                 # about what call was actually running.
 ]
 
-ROLES: tuple[Role, ...] = (
-    "classify", "plan", "execute", "diagnose", "review", "ask", "locate")
+ROLES: tuple[Role, ...] = ("classify", "plan", "execute", "diagnose", "review", "ask")
 
 # ---------------------------------------------------------------------------
 # Task, plan, step
@@ -194,11 +189,12 @@ FailureClass = Literal[
     "test_failure",       # a check or test went red         -> revert + retry clean
     "wrong_approach",     # same failure repeating           -> revert + retry clean
     "budget_exhausted",   # a ceiling was hit                -> abort with partial diff
+    "no_api_key",         # no provider has a key configured -> abort immediately
 ]
 
 FAILURE_CLASSES: tuple[FailureClass, ...] = (
     "malformed_output", "transient_api", "patch_conflict", "missing_context",
-    "test_failure", "wrong_approach", "budget_exhausted",
+    "test_failure", "wrong_approach", "budget_exhausted", "no_api_key",
 )
 
 # ---------------------------------------------------------------------------

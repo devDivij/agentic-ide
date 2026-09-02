@@ -184,6 +184,16 @@ export function describeNode(node: TraceNode): ActivityLine | null {
         : line('checks passed', 'ok');
     }
 
+    case 'review': {
+      // Two 'review' events per pass: an opening one (just which steps are
+      // in scope) and the verdict. Only the verdict is worth a line.
+      if (!isObject(node.payload) || !('ok' in node.payload)) return null;
+      const issues = Array.isArray(node.payload.issues) ? node.payload.issues.length : 0;
+      return node.payload.ok
+        ? line('reviewed the recent steps: no problems found', 'ok')
+        : line(`review flagged a problem${issues > 1 ? ` (${issues})` : ''}`, 'bad');
+    }
+
     case 'checkpoint': {
       if (!isObject(node.payload)) return null;
       if (node.payload.action === 'revert') return line('rolled back to the last good state', 'bad');

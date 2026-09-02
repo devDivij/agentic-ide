@@ -11,8 +11,10 @@
  *   - a plain message starts a coding task;
  *   - /bytheway <question> is answered in isolation, with zero task context,
  *     and never disturbs a running task;
- *   - @path and @path:12-40 tags (inserted by clicking code in the file
- *     viewer) pin exact files or lines into the agent's context.
+ *   - clicking code in the file viewer, or clicking an @-reference in a past
+ *     message, adds it to the pin tray above the composer as a removable
+ *     chip. The tray is the source of truth for what is pinned; sending a
+ *     message serialises it into the `@path:12-40` tags the server parses.
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -24,6 +26,7 @@ import type {
 import { api, type TaskRow } from '../api.ts';
 import type { LogLine } from '../state.ts';
 import { nodesFor, stepsFromTrace } from '../activity.ts';
+import { pinLabel, withPinTags, type PinRef } from '../pins.ts';
 import { Aside, TaskEntry, type ChatTask, type TaskActions } from './Timeline.tsx';
 
 export function Chat({
@@ -31,6 +34,7 @@ export function Chat({
   onRenameConversation,
   task, steps, trace, logs, approvals, asides, history, running,
   onSubmit, onBytheway, onResume, onStop, onApprove, onReview, draft, setDraft,
+  pins, onRemovePin, onTogglePin, onClearPins,
 }: {
   projectRoot: string;
   /** The open chat; null while a new one has not been sent into yet. */
@@ -55,6 +59,11 @@ export function Chat({
   onReview: () => void;
   draft: string;
   setDraft: (value: string) => void;
+  /** The active manual-context tray — files/ranges pinned by hand. */
+  pins: PinRef[];
+  onRemovePin: (pin: PinRef) => void;
+  onTogglePin: (pin: PinRef) => void;
+  onClearPins: () => void;
 }): JSX.Element {
   const [showLog, setShowLog] = useState(false);
   /** Traces fetched on demand for tasks that failed before this page loaded. */
@@ -110,8 +119,9 @@ export function Chat({
       return;
     }
     if (running) return;
-    onSubmit(text);
+    onSubmit(withPinTags(text, pins));
     setDraft('');
+    onClearPins();
   };
 
   // Tasks and asides share one timeline, ordered by when they happened.
@@ -160,6 +170,8 @@ export function Chat({
               approvals={entry.task.id === liveId ? approvals : []}
               actions={actions}
               explaining={explaining === entry.task.id}
+              pins={pins}
+              onTogglePin={onTogglePin}
             />
           ))}
 
@@ -189,6 +201,27 @@ export function Chat({
       </div>
 
       <div className="composer">
+        {pins.length > 0 && (
+          <div className="pin-tray" title="Pinned into this message's context">
+            {pins.map((p) => (
+              <span key={`${p.path}:${p.startLine ?? ''}-${p.endLine ?? ''}`} className="pin-chip">
+                <span className="pin-chip-icon">@</span>
+                {pinLabel(p)}
+                <button
+                  className="pin-chip-remove"
+                  title="Remove from context"
+                  aria-label={`Unpin ${pinLabel(p)}`}
+                  onClick={() => onRemovePin(p)}
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+            <button className="ghost small" onClick={onClearPins} title="Remove all pins">
+              clear
+            </button>
+          </div>
+        )}
         <div className="composer-row">
           <textarea
             ref={composer}
@@ -214,7 +247,7 @@ export function Chat({
         </div>
         <div className="composer-hint muted small">
           <b>Ctrl↵</b> to send · <code>/bytheway …</code> asks a question instead of
-          starting a task · <code>@file:12-40</code> pins exact code (click lines in a file)
+          starting a task · click lines in a file, or an <code>@ref</code> above, to pin/unpin context
         </div>
       </div>
     </div>

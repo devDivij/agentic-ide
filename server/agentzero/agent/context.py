@@ -12,10 +12,15 @@ single decision buys two requirements for free:
 Compaction: the durable state usually fits, but the fact ledger and retrieved
 chunks grow on long tasks. When the assembled window would exceed budget we
 drop blocks in strict priority order (cross-step outcomes first, then
-retrieved chunks, then oldest facts) and report what was dropped, so the
-caller can record a visible `compact` event. Never dropped: the user's
-request, project rules, the plan, the current step, user pins, the step's own
-transcript, and the output contract.
+retrieved chunks, then facts) -- and, within each tier, the blocks least
+relevant to the current step first, not just whichever happens to sit at the
+end of the list. Relevance is scored the same lexical way retrieval.py scores
+code: term overlap against the prompt, the step's intent and its target
+files. Never a summary -- dropping the wrong block is visible and
+recoverable in the next call's window; paraphrasing it is not. We report what
+was dropped, so the caller can record a visible `compact` event. Never
+dropped: the user's request, project rules, the plan, the current step, user
+pins, the step's own transcript, and the output contract.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ from __future__ import annotations
 from typing import Literal
 
 from .llm import ChatMessage, estimate_tokens
+from .retrieval import extract_terms
 from .types import CodeChunk, Data, Fact, Plan, PlanStep, Role
 
 
@@ -49,6 +55,11 @@ class ContextRequest(Data):
     chunks: list[CodeChunk] = []
     #: Outcome lines from earlier steps. First thing dropped under pressure.
     recent_outcomes: list[str] = []
+    #: The batch's unified diff, for the `review` role only. Pinned rather
+    #: than evictable: a review call with no diff to look at still answers
+    #: "ok" -- a silent false negative, not a visible drop. The caller caps
+    #: its length before it ever reaches here.
+    diff: str | None = None
     # What the executor already did within the CURRENT step. Passed as state,
     # not conversation -- which is what makes switching models mid-step safe.
     # Never evicted: dropping it makes the model repeat its own edits.
@@ -151,7 +162,13 @@ def build_context(req: ContextRequest) -> BuiltContext:
             f"(pinned by the user) ---\n{pin.text}", "pinned")
 
     if req.prior_task:
-        add("prior_task", "prior-task", req.prior_task, "fact")
+        # Pinned, not evictable: this is what resolves "it"/"them" back to
+        # what the previous task actually did. A plan or execute call for a
+        # pronoun-only follow-up ("rather make it green") has near-zero term
+        # overlap with this block under the relevance scoring below -- it
+        # would be first in line to drop under budget pressure, silently
+        # reintroducing the exact anaphora failure this field exists to fix.
+        add("prior_task", "prior-task", req.prior_task, "pinned")
 
     # --- evictable -----------------------------------------------------------
     for fact in req.facts:
@@ -163,6 +180,10 @@ def build_context(req: ContextRequest) -> BuiltContext:
     if req.recent_outcomes:
         outcomes = "\n".join(f"  - {o}" for o in req.recent_outcomes)
         add("outcomes", "recent", f"Recent steps:\n{outcomes}", "outcome")
+
+    if req.diff:
+        add("diff", "batch-diff",
+            f"Diff to review:\n```diff\n{req.diff}\n```", "pinned")
 
     # --- pinned tail ---------------------------------------------------------
     if req.previous_attempt:
@@ -179,7 +200,7 @@ def build_context(req: ContextRequest) -> BuiltContext:
         add("contract", "output-format", req.output_contract, "pinned")
 
     # --- fit to budget -------------------------------------------------------
-    kept, dropped = _evict_to_fit(blocks, budget_tokens(req.role))
+    kept, dropped = _evict_to_fit(blocks, budget_tokens(req.role), _query_terms(req))
 
     messages = [
         ChatMessage(role="system", content=system_preamble(req.role)),
@@ -205,24 +226,64 @@ def budget_tokens(role: Role) -> int:
     Token ceiling for one call. Conservative (the router may pick any model
     serving this role, and the smallest window defines what must fit).
     """
-    window = 32_000 if role == "execute" else 16_000
+    window = 32_000 if role in ("execute", "review") else 16_000
     return int(window * WINDOW_FRACTION)
 
 
-def _evict_to_fit(blocks: list[_Block], budget: int) -> tuple[list[_Block], list[_Block]]:
+def _query_terms(req: ContextRequest) -> set[str]:
+    """
+    What the current call is actually about, for scoring evictable blocks by
+    relevance rather than by list position. Lexical, like retrieval.py --
+    no embeddings, no extra model call, consistent with the rest of the
+    system's "no compaction is smarter than the wrong compaction" stance.
+    """
+    parts = [req.prompt]
+    if req.step:
+        parts.append(req.step.intent)
+        parts.extend(req.step.target_files)
+    if req.previous_attempt:
+        parts.append(req.previous_attempt)
+    if req.directive:
+        parts.append(req.directive)
+    return {t.lower() for t in extract_terms(" ".join(parts))}
+
+
+def _relevance(block: _Block, terms: set[str]) -> int:
+    """
+    How many of the query terms are actually salient in this block -- not
+    merely present somewhere in it, which a long block satisfies by sheer
+    size even when it is not what the step is about. `extract_terms` picks
+    each block's own top few terms by frequency, so this stays a fair
+    comparison between a large chunk and a two-line fact.
+    """
+    block_terms = {t.lower() for t in extract_terms(block.text)}
+    return len(terms & block_terms)
+
+
+def _evict_to_fit(blocks: list[_Block], budget: int,
+                   query_terms: set[str]) -> tuple[list[_Block], list[_Block]]:
     """
     Drop the least valuable blocks until the total fits. Pinned blocks are
     exempt: if they alone exceed the budget we send them anyway -- silently
     discarding the plan or the user's pins would be worse than a big prompt.
+
+    Most droppable tier first. Within a tier, the block with the fewest
+    query-term hits goes first -- a fact about last week's CI flake makes way
+    before one that names the file the current step is touching, even if the
+    flake note was added more recently. Ties (including an empty query, which
+    scores everything 0) fall back to size -- drop the bigger block first,
+    since it buys back more budget for the same loss -- then list position.
     """
     total = sum(b.tokens for b in blocks)
     if total <= budget:
         return blocks, []
 
-    # Most droppable first; within a priority, later (older-listed) first.
     removable = sorted(
         ((b, i) for i, b in enumerate(blocks) if b.priority != "pinned"),
-        key=lambda pair: (-EVICTION_ORDER[pair[0].priority], -pair[1]))
+        key=lambda pair: (-EVICTION_ORDER[pair[0].priority],
+                           _relevance(pair[0], query_terms),
+                           -pair[0].tokens,
+                           -pair[1]))
 
     removed: set[int] = set()
     dropped: list[_Block] = []
@@ -246,9 +307,17 @@ def system_preamble(role: Role) -> str:
             return f"{base} You make one focused change at a time using the tools provided."
         case "diagnose":
             return f"{base} You classify why something failed. You never propose a fix."
+        case "review":
+            return (f"{base} You review a batch of already-passing changes for problems "
+                    "no single step's own checks could see -- drift from the request, "
+                    "duplicated logic, a later change undoing an earlier guarantee. "
+                    "You never propose a fix.")
         case "classify":
             return f"{base} You estimate task difficulty."
         case "ask":
             return ("You are a concise, accurate programming assistant. "
                     "Answer the question directly.")
+        case "locate":
+            return (f"{base} You rank a short list of candidate code entities by "
+                    "relevance to a query. You never propose a fix.")
     raise ValueError(f"unknown role {role!r}")

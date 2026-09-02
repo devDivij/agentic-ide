@@ -133,9 +133,10 @@ export const api = {
       `/api/providers/${encodeURIComponent(providerId)}/key`,
       { method: 'PUT', body: JSON.stringify({ apiKey }) }),
 
-  testProvider: (providerId: string) =>
+  testProvider: (providerId: string, apiKey: string = '') =>
     request<{ reachable: boolean; detail: string }>(
-      `/api/providers/${encodeURIComponent(providerId)}/test`, { method: 'POST' }),
+      `/api/providers/${encodeURIComponent(providerId)}/test`,
+      { method: 'POST', body: JSON.stringify({ apiKey }) }),
 
   listFiles: (projectRoot: string, path: string) =>
     request<{ path: string; entries: Array<{ name: string; directory: boolean }> }>(
@@ -149,7 +150,28 @@ export const api = {
     request<{ path: string; bytes: number }>('/api/file', {
       method: 'PUT', body: JSON.stringify({ projectRoot, path, content }),
     }),
+
+  createEntry: (projectRoot: string, path: string, directory: boolean) =>
+    request<{ path: string; directory: boolean }>('/api/file', {
+      method: 'POST', body: JSON.stringify({ projectRoot, path, directory }),
+    }),
+
+  renameEntry: (projectRoot: string, path: string, newPath: string) =>
+    request<{ path: string }>('/api/file/rename', {
+      method: 'PUT', body: JSON.stringify({ projectRoot, path, newPath }),
+    }),
+
+  deleteEntry: (projectRoot: string, path: string) =>
+    request<{ path: string }>('/api/file', {
+      method: 'DELETE', body: JSON.stringify({ projectRoot, path }),
+    }),
+
+  search: (projectRoot: string, query: string) =>
+    request<{ query: string; results: SearchResult[]; truncated: boolean }>(
+      `/api/search?projectRoot=${encodeURIComponent(projectRoot)}&query=${encodeURIComponent(query)}`),
 };
+
+export interface SearchResult { path: string; line: number; text: string }
 
 /** Subscribe to the event stream. EventSource reconnects on its own. */
 export function subscribe(onEvent: (event: ServerEvent) => void): () => void {

@@ -41,7 +41,8 @@ To swap an implementation you edit the file that owns it. Suggested order:
    execute turns, verify, checkpoint-or-revert → final diff. Read this second;
    everything else exists to serve it.
 3. **`workers.py`** — the model-facing jobs (classify / plan / execute /
-   diagnose / ask): each is a prompt, a Pydantic schema, and one `call_model()`.
+   diagnose / review / ask): each is a prompt, a Pydantic schema, and one
+   `call_model()`.
 4. **`call.py`** — how one structured call is made reliable: route → log →
    dispatch → validate → repair (same model) or fall back (another provider).
 5. **`context.py`** — how a window is built fresh from durable state, and how
@@ -55,14 +56,15 @@ To swap an implementation you edit the file that owns it. Suggested order:
 `server/agentzero/web/` hosts the same runtime over HTTP for the browser UI, and
 `server/agentzero/cli.py` drives it headless — both call the same `run_task()`.
 
-## The five model jobs ("multi-agent" without autonomous agents)
+## The six model jobs ("multi-agent" without autonomous agents)
 
 | Role | Frequency | Job | Why it is safe for a small model |
 |---|---|---|---|
 | classify | 1× per task | easy/medium/hard → sets the budget | one label from three |
 | plan | 1× per task | break the request into steps | routed to the strongest tier; output normalised in code |
 | execute | many | one tool call or "done" per turn | flat schema, tools reassembled in code, stuck-detector watches it |
-| diagnose | on failure | label WHY it failed | one label from seven; the label→action table lives in code |
+| diagnose | on failure | label WHY a step failed | one label from seven; the label→action table lives in code |
+| review | every 3 steps + once at the end | label what a batch of *passing* steps got wrong that no step's own checks could see | `{ok, issues[]}` only; same split as diagnose — never decides the response |
 | ask | on demand | `/bytheway` isolated Q&A | no task state can reach it |
 
 The diagnose split is the key trick for using weak models on judgement-shaped
@@ -71,6 +73,25 @@ work: the model classifies, the orchestrator's `TAXONOMY` table decides
 the pre-attempt checkpoint) and the fact ledger (`purgeFactsAfter`), because
 rolling back code while keeping beliefs formed when the tree was broken is the
 standard way agents poison their own later steps.
+
+`review` reuses the same split one layer up. Every mechanical and per-step
+check (`verify_changes`, `TAXONOMY`) only ever judges one step against its own
+acceptance criteria — nothing looks at the accumulated diff as a whole, so a
+step can pass cleanly and still drift from the request, duplicate logic, or
+quietly undo an earlier step's guarantee. `review_batch` labels that; the
+orchestrator turns a finding into the **same** `_Replan` a step failure
+produces — `wrong_approach`, spent from the same `MAX_REPLANS` ceiling — just
+with a different sentence fed to the planner, since this step passed its own
+checks and was undone anyway (see `_replan`'s `trigger` param). A finding is
+one more model call, not ground truth, so it is a convenience: skipped when
+the task is out of budget, skipped outright once any step in the current plan
+has already failed or been skipped (checkpoints commit on every attempt, pass
+or fail, so a diff spanning a failed step can't be attributed to the right
+step, and reverting could roll back across a step that already has its own
+honest `failed` record), and only ever logged (never acted on) once replans
+run out. Localizing which step in the batch caused it is the model's own
+guess (`stepIds`) falling back to the batch's most recent step — no
+bisection; at a batch size of 3 it isn't worth the extra calls.
 
 ## State: one SQLite file per project
 
@@ -102,9 +123,12 @@ Because each window is rebuilt from source data:
 - switching model or provider mid-task is always safe;
 - "compaction" cannot misremember anything — nothing is ever paraphrased;
 - when the window would overflow, blocks are dropped in a strict priority
-  order (cross-step outcomes → retrieved chunks → oldest facts; never the
-  request, rules, plan, step, pins, step transcript, or contract) and a
-  visible `compact` event records exactly what was dropped.
+  order (cross-step outcomes → retrieved chunks → facts; never the request,
+  rules, plan, step, pins, step transcript, or contract), and *within* a
+  tier the block least relevant to the current step goes first — scored by
+  the same lexical term-overlap `retrieval.py` uses, against the prompt and
+  the step's intent/target files, not by list position — and a visible
+  `compact` event records exactly what was dropped.
 
 ## Routing: buckets, preference tiers, pay-vs-wait
 
@@ -139,7 +163,7 @@ exceeds 80B total parameters, and every entry cites the source of its count.
 
 ## Failure handling, end to end
 
-Three layers, each with its own remedy, deliberately never conflated:
+Four layers, each with its own remedy, deliberately never conflated:
 
 1. **Inside a call** (`call.py`): malformed JSON → repair prompt to the *same*
    model with the exact validation error; 429/5xx/timeout → penalise the
@@ -154,6 +178,13 @@ Three layers, each with its own remedy, deliberately never conflated:
    steps) are checked between steps and abort cleanly — our ceilings sit
    inside the evaluation's hard limits, so we always hand back a partial diff
    instead of being halted at zero.
+4. **Across batches of steps**: layer 3 only ever sees one step at a time, so
+   it cannot catch a step that passed its own checks but is wrong in the
+   context of the others. Every `BATCH_REVIEW_SIZE` (3) completed steps, and
+   once more at the end over the whole task's diff, the `review` worker looks
+   at the accumulated change; a finding is turned into the same `_Replan`
+   layer 3's `wrong_approach` produces, through the same `MAX_REPLANS`
+   ceiling — a fourth layer, not a bypass of the third.
 
 ## Checkpoints: a shadow git repository
 
@@ -191,7 +222,7 @@ do not change.
 | v0 (this prototype) | Planned upgrade | Where |
 |---|---|---|
 | Term extraction + literal search retrieval | tree-sitter symbol graph, hybrid lexical/dense entry, k-hop expansion | `retrieval.py` |
-| Priority-eviction compaction | per-role token budgets, overlap-filtered facts | `context.py` |
+| Priority-eviction compaction, relevance-ranked within each tier (lexical term overlap) | cross-call fact dedup, richer per-role budgets | `context.py` |
 | Syntax + test verification | milestone gates; different-model final gate | `verify.py` |
 | Static preference ranking | provider health scores, escalation ladder | `router.py` |
 | Sequential steps | parallel independent steps (the `depends_on` ready-set already supports it) | `orchestrator.py` |
@@ -203,7 +234,7 @@ do not change.
 | §1 orchestration, stuck detection | `orchestrator.py` (loop, fingerprints, turn caps, budgets) |
 | §2 ≤80B, free/PAYG only | `providers.py` (`assert_legal_catalogue`, cited counts) |
 | §3 smart routing, visible, fallback, settings screen | `router.py`, `call.py` route events, Routing tab, Settings tab |
-| §4 automatic compaction | `context.py` eviction + `compact` events |
+| §4 automatic compaction | `context.py` relevance-ranked eviction + `compact` events |
 | §5 retrieval, per-project isolation | `retrieval.py`; one SQLite file per project |
 | §6 long-horizon, resumable tasks | `store.py` state + `run_task(resume_task_id=...)`, CLI `resume`, UI resume banner |
 | §7 manual context control, tags, /bytheway | `@path` pins (`parsePinTags` → `pins` table → context), file-viewer tagging, `askAside` |

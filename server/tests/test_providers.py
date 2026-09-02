@@ -41,14 +41,14 @@ def test_lookups_miss_cleanly():
 
 
 def test_free_models_cost_nothing_and_paid_ones_do():
-    free = get_model("openrouter", "qwen/qwen3-coder:free")
-    paid = get_model("openrouter", "qwen/qwen3-coder")
+    free = get_model("openrouter", "cohere/north-mini-code:free")
+    paid = get_model("openrouter", "qwen/qwen3-coder-30b-a3b-instruct")
     assert estimate_cost_usd(free, 1_000_000, 1_000_000) == 0
-    assert estimate_cost_usd(paid, 1_000_000, 0) == 0.20
+    assert estimate_cost_usd(paid, 1_000_000, 0) == 0.07
 
 
 def test_integral_parameter_counts_stay_integers_on_the_wire():
     """Settings.tsx renders `{m.totalParamsB}B` raw -- a float would show 30.0B."""
-    assert get_model("nvidia", "nvidia/nemotron-3-nano-30b-a3b").wire()["totalParamsB"] == 30
+    assert get_model("nvidia", "nvidia/nemotron-3.5-lightning-30b-a3b").wire()["totalParamsB"] == 30
     assert isinstance(
-        get_model("nvidia", "nvidia/nemotron-3-nano-30b-a3b").wire()["totalParamsB"], int)
+        get_model("nvidia", "nvidia/nemotron-3.5-lightning-30b-a3b").wire()["totalParamsB"], int)

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -33,7 +34,7 @@ from pydantic import BaseModel
 
 from ..agent.paths import PathEscapeError, confine_path
 from ..agent.providers import PROVIDERS, assert_legal_catalogue, get_provider
-from ..agent.retrieval import IGNORED_DIRS
+from ..agent.retrieval import IGNORED_DIRS, find_matches, scan_project
 from ..agent.router import Router
 from ..agent.store import Store, conversation_title
 from ..agent.workers import ask_aside
@@ -118,7 +119,7 @@ async def guard_and_cors(request: Request, call_next):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Vary"] = "Origin"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     return response
 
 
@@ -179,11 +180,19 @@ def put_provider_key(provider_id: str, body: KeyBody) -> dict[str, Any]:
 
 
 @app.post("/api/providers/{provider_id}/test")
-def test_provider(provider_id: str) -> dict[str, Any]:
+def test_provider(provider_id: str, body: KeyBody = KeyBody()) -> dict[str, Any]:
+    """
+    Test the key actually in the box, not whatever was last saved. Testing
+    must never have a save side effect -- a user trying a key before
+    committing it is exactly the case this endpoint exists for. An empty body
+    falls back to the saved key, so re-testing an already-configured provider
+    without retyping it still works.
+    """
     provider = get_provider(provider_id)
     if provider is None:
         raise HTTPException(404, "Unknown provider")
-    return _probe(provider.base_url, effective_keys().get(provider.id))
+    key = body.apiKey.strip() or effective_keys().get(provider.id)
+    return _probe(provider.base_url, key)
 
 
 def _probe(base_url: str, key: str | None) -> dict[str, Any]:
@@ -522,6 +531,132 @@ def write_file(body: WriteFileBody) -> dict[str, Any]:
     bus.publish({"type": "log", "projectRoot": root, "taskId": None,
                  "level": "info", "message": f"Saved {body.path}"})
     return {"path": body.path, "bytes": len(body.content.encode("utf-8"))}
+
+
+class CreateEntryBody(BaseModel):
+    projectRoot: str | None = None
+    path: str | None = None
+    directory: bool = False
+
+
+@app.post("/api/file", status_code=201)
+def create_entry(body: CreateEntryBody) -> dict[str, Any]:
+    """New file or folder from the tree's "+" button. Never overwrites --
+    that is what PUT /api/file (save) is for."""
+    if not body.projectRoot or not body.path:
+        raise HTTPException(400, "projectRoot and path are required")
+    root = str(Path(body.projectRoot).resolve())
+    try:
+        abs_path = Path(_confine(root, body.path))
+        if abs_path.exists():
+            raise HTTPException(409, f"{body.path} already exists")
+        if body.directory:
+            abs_path.mkdir(parents=True)
+        else:
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+            abs_path.touch()
+    except HTTPException:
+        raise
+    except Exception as err:               # noqa: BLE001
+        raise HTTPException(400, str(err)) from err
+
+    bus.publish({"type": "log", "projectRoot": root, "taskId": None, "level": "info",
+                 "message": f"Created {'folder ' if body.directory else ''}{body.path}"})
+    return {"path": body.path, "directory": body.directory}
+
+
+class RenameEntryBody(BaseModel):
+    projectRoot: str | None = None
+    path: str | None = None
+    newPath: str | None = None
+
+
+@app.put("/api/file/rename")
+def rename_entry(body: RenameEntryBody) -> dict[str, Any]:
+    """Rename or move a file/folder. Confined at both ends -- the classic miss
+    is checking only the source and letting the destination escape."""
+    if not body.projectRoot or not body.path or not body.newPath:
+        raise HTTPException(400, "projectRoot, path and newPath are required")
+    root = str(Path(body.projectRoot).resolve())
+    try:
+        src = Path(_confine(root, body.path))
+        dst = Path(_confine(root, body.newPath))
+        if str(src) == root:
+            raise HTTPException(400, "Refusing to rename the project root")
+        if not src.exists():
+            raise HTTPException(404, f"{body.path} does not exist")
+        if dst.exists():
+            raise HTTPException(409, f"{body.newPath} already exists")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+    except HTTPException:
+        raise
+    except Exception as err:               # noqa: BLE001
+        raise HTTPException(400, str(err)) from err
+
+    bus.publish({"type": "log", "projectRoot": root, "taskId": None, "level": "info",
+                 "message": f"Renamed {body.path} → {body.newPath}"})
+    return {"path": body.newPath}
+
+
+class DeleteEntryBody(BaseModel):
+    projectRoot: str | None = None
+    path: str | None = None
+
+
+@app.delete("/api/file")
+def delete_entry(body: DeleteEntryBody) -> dict[str, Any]:
+    if not body.projectRoot or not body.path:
+        raise HTTPException(400, "projectRoot and path are required")
+    root = str(Path(body.projectRoot).resolve())
+    try:
+        target = Path(_confine(root, body.path))
+        if str(target) == root:
+            raise HTTPException(400, "Refusing to delete the project root")
+        if not target.exists():
+            raise HTTPException(404, f"{body.path} does not exist")
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+    except HTTPException:
+        raise
+    except Exception as err:               # noqa: BLE001
+        raise HTTPException(400, str(err)) from err
+
+    bus.publish({"type": "log", "projectRoot": root, "taskId": None, "level": "info",
+                 "message": f"Deleted {body.path}"})
+    return {"path": body.path}
+
+
+MAX_SEARCH_RESULTS = 200
+
+
+@app.get("/api/search")
+def search_project(projectRoot: str = Query(...), query: str = Query(...)) -> dict[str, Any]:
+    """
+    Project-wide, case-insensitive substring search for the human at the
+    keyboard -- the same pure-Python scanner the agent's own search_code tool
+    uses (agent/retrieval.py), so results honour the same IGNORED_DIRS and
+    size caps and a huge tree cannot stall this synchronous handler.
+    """
+    root = str(Path(projectRoot).resolve())
+    if root not in _opened_projects:
+        raise HTTPException(400, "That folder has not been opened as a project in this session.")
+    term = query.strip()
+    if not term:
+        return {"query": query, "results": [], "truncated": False}
+
+    files = scan_project(root)
+    matches = find_matches(files, term, max_per_file=20)
+    by_path = {f.path: f for f in files}
+    truncated = len(matches) > MAX_SEARCH_RESULTS
+    results = [
+        {"path": m.path, "line": m.line_number,
+         "text": by_path[m.path].lines[m.line_number - 1].strip()}
+        for m in matches[:MAX_SEARCH_RESULTS]
+    ]
+    return {"query": term, "results": results, "truncated": truncated}
 
 
 # ---------------------------------------------------------------------------

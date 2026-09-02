@@ -466,13 +466,23 @@ def test_a_later_step_is_skipped_when_its_dependency_failed(
              "acceptanceCriteria": ["b"], "dependsOn": ["s1"],
              "difficulty": "routine"}]})],
         execute=[broken, claims_done,        # attempt 1
-                 broken, claims_done])       # attempt 2
+                 broken, claims_done],       # attempt 2
+        # Scripted but must never be consumed: a review over a diff that
+        # includes a failed step's fail-forward leftovers, or a revert that
+        # could roll back across a step with its own honest 'failed' record,
+        # would be worse than reviewing nothing. See _task_has_unclean_steps.
+        review=[json.dumps({"ok": False, "issues": [
+            {"description": "should never be seen", "stepIds": ["s1"]}]})])
 
     outcome = run_task(agent, "two steps")
 
     statuses = {s.step_id: s.status for s in agent.db.get_steps(outcome.task_id)}
     assert statuses["s1"] == "failed"
     assert statuses["s2"] == "skipped"
+    assert outcome.status == "failed"        # not silently turned into a replan
+    reviews = [e for e in agent.db.get_events(outcome.task_id)
+              if e.kind == "review" and isinstance(e.payload, dict) and "ok" in e.payload]
+    assert reviews == []
     # A skipped step still leaves a renderable pair of events: emitting only
     # the end would leave the step unrenderable, emitting neither loses it.
     kinds = [(e.kind, e.step_id) for e in agent.db.get_events(outcome.task_id)]
@@ -528,6 +538,98 @@ def test_a_step_that_keeps_looping_earns_a_replan_not_another_attempt(
     replan_events = [e for e in agent.db.get_events(outcome.task_id)
                      if e.kind == "tool_call" and (e.payload or {}).get("tool") == "replan"]
     assert len(replan_events) == 1
+
+
+def test_review_fires_every_batch_and_once_more_at_the_end(monkeypatch, agent, project):
+    """BATCH_REVIEW_SIZE=3: a fourth step means one periodic pass over the
+    first three, then the mandatory final pass -- not one call per step, and
+    not only at the end."""
+    step = lambda i: {"id": f"s{i}", "intent": f"write f{i}.py",
+                      "targetFiles": [f"f{i}.py"], "acceptanceCriteria": ["exists"],
+                      "dependsOn": [], "difficulty": "routine"}
+    write = lambda i: json.dumps({"thought": "w", "action": "write_file",
+                                  "path": f"f{i}.py", "content": f"x = {i}\n"})
+    done = lambda i: json.dumps({"thought": "ok", "action": "done", "summary": f"wrote f{i}",
+                                 "filesTouched": [f"f{i}.py"]})
+    script_model(
+        monkeypatch,
+        classify=[CLASSIFY_TASK],
+        plan=[json.dumps({"summary": "four files",
+                          "steps": [step(1), step(2), step(3), step(4)]})],
+        execute=[x for i in (1, 2, 3, 4) for x in (write(i), done(i))],
+        review=[json.dumps({"ok": True, "issues": []}),
+               json.dumps({"ok": True, "issues": []})])
+
+    outcome = run_task(agent, "four files")
+
+    assert outcome.status == "awaiting_review"
+    for i in (1, 2, 3, 4):
+        assert Path(project, f"f{i}.py").exists()
+
+    reviews = [e for e in agent.db.get_events(outcome.task_id)
+              if e.kind == "review" and isinstance(e.payload, dict) and "steps" in e.payload]
+    assert len(reviews) == 2
+    assert reviews[0].payload["steps"] == ["s1", "s2", "s3"]      # the periodic batch
+    assert set(reviews[1].payload["steps"]) == {"s1", "s2", "s3", "s4"}  # the final pass
+
+
+def test_a_review_finding_reverts_and_replans_a_step_that_already_passed(
+        monkeypatch, agent, project):
+    """
+    L1's mechanical checks only ever judge one step's own acceptance
+    criteria. A step can pass those and still be wrong in a way only a wider
+    look at the diff catches -- that's the review pass's job, and it should
+    behave exactly like any other `wrong_approach`: revert the tree, purge
+    what was learned, and replan the rest.
+    """
+    script_model(
+        monkeypatch,
+        classify=[CLASSIFY_TASK],
+        plan=[
+            json.dumps({"summary": "add a greeter", "steps": [
+                {"id": "s1", "intent": "write greet.py", "targetFiles": ["greet.py"],
+                 "acceptanceCriteria": ["returns a greeting"], "dependsOn": [],
+                 "difficulty": "routine"}]}),
+            # The replan, seeded by the review's finding, produces a fresh step.
+            json.dumps({"summary": "add a greeter", "steps": [
+                {"id": "r1", "intent": "write greet.py correctly",
+                 "targetFiles": ["greet.py"], "acceptanceCriteria": ["returns hi"],
+                 "dependsOn": [], "difficulty": "routine"}]}),
+        ],
+        execute=[
+            # s1 "passes" its own checks -- the file parses -- but returns
+            # the wrong thing.
+            json.dumps({"thought": "w", "action": "write_file", "path": "greet.py",
+                        "content": "def greet():\n    return 'WRONG'\n"}),
+            json.dumps({"thought": "ok", "action": "done", "summary": "wrote greet.py",
+                        "filesTouched": ["greet.py"], "newFacts": ["greet() returns WRONG"]}),
+            # r1 gets it right.
+            json.dumps({"thought": "w", "action": "write_file", "path": "greet.py",
+                        "content": "def greet():\n    return 'hi'\n"}),
+            json.dumps({"thought": "ok", "action": "done", "summary": "wrote greet.py",
+                        "filesTouched": ["greet.py"]}),
+        ],
+        review=[
+            json.dumps({"ok": False, "issues": [
+                {"description": "greet() returns the wrong string", "stepIds": ["s1"]}]}),
+            json.dumps({"ok": True, "issues": []}),
+        ])
+
+    outcome = run_task(agent, "add a greeter")
+
+    assert outcome.status == "awaiting_review"
+    assert Path(project, "greet.py").read_text() == "def greet():\n    return 'hi'\n"
+
+    plan = agent.db.get_plan(outcome.task_id)
+    assert [s.id for s in plan.steps] == ["r1"]     # s1's decomposition was replaced
+
+    events = agent.db.get_events(outcome.task_id)
+    reverts = [e for e in events if e.kind == "checkpoint"
+              and isinstance(e.payload, dict) and e.payload.get("action") == "revert"]
+    assert any(e.payload.get("reason") == "batch review" for e in reverts)
+    reviews = [e for e in events if e.kind == "review" and isinstance(e.payload, dict)
+              and "ok" in e.payload]
+    assert [r.payload["ok"] for r in reviews] == [False, True]
 
 
 def test_an_interrupted_task_resumes_from_the_first_unfinished_step(

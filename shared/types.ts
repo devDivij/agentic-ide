@@ -162,7 +162,7 @@ export interface ConversationWire {
 export type TraceKind =
   | 'task_start' | 'task_end' | 'step_start' | 'step_end'
   | 'llm_call' | 'tool_call' | 'route' | 'assemble'
-  | 'verify' | 'compact' | 'checkpoint' | 'error';
+  | 'verify' | 'review' | 'compact' | 'checkpoint' | 'error';
 
 /**
  * One node of the call hierarchy. `parentId` makes this a tree rather than a
