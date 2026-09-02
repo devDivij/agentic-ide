@@ -47,11 +47,23 @@ Open the UI, go to **Settings**, and paste at least one API key:
 | NVIDIA NIM | `NVIDIA_API_KEY` | build.nvidia.com — free, no card |
 | Groq | `GROQ_API_KEY` | console.groq.com — free tier |
 | OpenRouter | `OPENROUTER_API_KEY` | openrouter.ai — free models + paid overflow |
+| Mistral (La Plateforme) | `MISTRAL_API_KEY` | console.mistral.ai — free tier |
+| Google AI Studio (Gemini API) | `GEMINI_API_KEY` | aistudio.google.com — free tier |
+| Cohere | `COHERE_API_KEY` | dashboard.cohere.com — trial key |
 | Ollama | (none) | local — see below |
 
 Keys are stored in `~/.agentzero/settings.json` (mode 0600) and are never sent
 back to the browser. The environment variables above work too (see
-`.env.example`).
+`.env.example`) -- and settings-screen keys and environment keys are merged,
+not one overriding the other.
+
+A provider can hold more than one key: add another on the Settings screen, or
+suffix the environment variable (`GROQ_API_KEY_2`, `GROQ_API_KEY_3`, ...). The
+router rotates across a provider's keys least-recently-used first and gives
+each its own rate-limit bucket, so this only actually raises your throughput
+against a provider whose limits are per-key -- NVIDIA, Mistral, Google AI
+Studio and OpenRouter are; Groq's are per-organisation, so extra Groq keys are
+tracked the same way but won't lift its real ceiling.
 
 ### Local models (Ollama)
 
@@ -87,9 +99,9 @@ screen. To turn it off instead, set `enabled=False` on the `ollama`
 `ProviderSpec` in `server/agentzero/agent/providers.py`.
 
 Then click the project button in the header, choose a folder, and describe a
-change. The agent classifies the task, plans it, executes step by step (asking
-before anything side-effecting runs), and hands you a hunk-by-hunk diff to
-accept or reject.
+change. The agent classifies the task, plans it, and executes step by step —
+asking you to approve or reject each side-effecting action (a file write, a
+shell command) before it happens.
 
 ## Headless (no UI)
 
@@ -117,11 +129,11 @@ npm run cli -- trace <taskId> --project /path/to/repo
 
 ```
 server/agentzero/agent/   the agentic core — start with types.py, then orchestrator.py
-server/agentzero/web/     HTTP host: routes, SSE stream, review, settings
+server/agentzero/web/     HTTP host: routes, SSE stream, revert, settings
 server/agentzero/cli.py   headless driver
 server/tests/             the offline suite (pytest)
 shared/types.ts           the wire contract, mirrored by agent/types.py
-ui/src/                   React front-end (chat, files, review, routing, trace, settings)
+ui/src/                   React front-end (chat, files, routing, trace, settings)
 docs/                     architecture and design rationale
 ```
 

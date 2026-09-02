@@ -4,8 +4,7 @@
  */
 
 import type {
-  AsideBubble, ConversationWire, ProvidersResponse, ReviewBundle, ServerEvent,
-  TraceNode,
+  AsideBubble, ConversationWire, ProvidersResponse, ServerEvent, TraceNode,
 } from './types.ts';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -115,17 +114,6 @@ export const api = {
     request<{ events: TraceNode[] }>(
       `/api/tasks/${encodeURIComponent(taskId)}/trace?projectRoot=${encodeURIComponent(projectRoot)}`),
 
-  review: (projectRoot: string, taskId: string) =>
-    request<ReviewBundle>(
-      `/api/tasks/${encodeURIComponent(taskId)}/review?projectRoot=${encodeURIComponent(projectRoot)}`),
-
-  applyReview: (
-    projectRoot: string, taskId: string, acceptedHunkIds: string[], feedback?: string,
-  ) =>
-    request<{ applied: number; rejected: number; files: string[]; requeuedSteps: string[] }>(
-      `/api/tasks/${encodeURIComponent(taskId)}/review`,
-      { method: 'POST', body: JSON.stringify({ projectRoot, acceptedHunkIds, feedback }) }),
-
   /**
    * Reset the tree to right after `stepId` finished and discard every step
    * after it. Does NOT retry those steps — the tree just goes back; what
@@ -138,10 +126,15 @@ export const api = {
 
   providers: () => request<ProvidersResponse>('/api/providers'),
 
-  setKey: (providerId: string, apiKey: string) =>
-    request<{ ok: boolean; configured: Record<string, boolean> }>(
-      `/api/providers/${encodeURIComponent(providerId)}/key`,
-      { method: 'PUT', body: JSON.stringify({ apiKey }) }),
+  addKey: (providerId: string, apiKey: string) =>
+    request<{ ok: boolean; configured: Record<string, boolean>; keyCount: Record<string, number> }>(
+      `/api/providers/${encodeURIComponent(providerId)}/keys`,
+      { method: 'POST', body: JSON.stringify({ apiKey }) }),
+
+  removeKey: (providerId: string, index: number) =>
+    request<{ ok: boolean; configured: Record<string, boolean>; keyCount: Record<string, number> }>(
+      `/api/providers/${encodeURIComponent(providerId)}/keys/${index}`,
+      { method: 'DELETE' }),
 
   testProvider: (providerId: string, apiKey: string = '') =>
     request<{ reachable: boolean; detail: string }>(

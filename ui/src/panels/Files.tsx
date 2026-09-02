@@ -51,7 +51,7 @@ export function Files({
    * the agent had just created were simply invisible.
    */
   filesChangedAt: number;
-  /** A task is running: anything you save may land in its review diff. */
+  /** A task is running: anything you save may land in its diff. */
   agentRunning: boolean;
   onPin: (pin: PinRef) => void;
   onOpenProject: (absolutePath: string) => void;
@@ -542,7 +542,7 @@ export function Files({
             {active.editing && agentRunning && !active.conflict && (
               <div className="warn-banner small">
                 A task is running. Anything you save now becomes part of that
-                task's review diff, indistinguishable from the agent's own edits.
+                task's diff, indistinguishable from the agent's own edits.
               </div>
             )}
 

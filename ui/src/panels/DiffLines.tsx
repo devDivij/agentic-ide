@@ -3,10 +3,8 @@
  * two line-number gutters, the +/- marker in its own column, syntax colour,
  * and the changed part of an edited line picked out inside the row.
  *
- * Shared between the Review tab (diffing two checkpoints after the fact) and
- * the approval prompt (diffing a proposed write against disk before it
- * happens) — the same two texts deserve to look like the same diff regardless
- * of which moment produced them.
+ * Used by the approval prompt, which diffs a proposed write against disk
+ * before it happens.
  */
 
 import type { DiffRow } from '../diff.ts';

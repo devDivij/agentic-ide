@@ -14,7 +14,7 @@
 // ---------------------------------------------------------------------------
 
 export type TaskStatusWire =
-  | 'running' | 'awaiting_review' | 'done' | 'aborted' | 'failed';
+  | 'running' | 'done' | 'aborted' | 'failed';
 
 export interface TaskSummary {
   id: string;
@@ -199,28 +199,8 @@ export interface RoutingUpdate {
   runnersUp: Array<{ providerId: string; modelId: string }>;
   estimatedCostUsd: number;
   waitedMs: number;
-}
-
-// ---------------------------------------------------------------------------
-// Review artifacts (human-in-the-loop diff)
-// ---------------------------------------------------------------------------
-
-export interface DiffHunk {
-  id: string;
-  file: string;
-  /** Unified-diff text for this hunk alone. */
-  patch: string;
-  /** The plan step that produced it — needed to continue around a rejection. */
-  stepId: string;
-  /** Edits to existing test files are flagged: a green suite the agent
-   *  rewrote is not evidence of anything. */
-  touchesTests: boolean;
-}
-
-export interface ReviewBundle {
-  taskId: string;
-  hunks: DiffHunk[];
-  fullDiff: string;
+  /** Which of the provider's keys this call used -- see router.py's per-key rate buckets. */
+  keyIndex: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +243,14 @@ export interface ProviderInfo {
   providerId: string;
   label: string;
   configured: boolean;
+  /** How many keys are configured -- a provider can hold several now, see router.py. */
+  keyCount: number;
+  /**
+   * How many of `keyCount` were added on this screen and can be removed here.
+   * The rest come from the environment (`.env` or the real env vars) and have
+   * no settings-file position to remove -- shown read-only instead.
+   */
+  removableKeyCount: number;
   enabled: boolean;
   preference: 'user' | 'default' | 'floor';
   keyEnv: string | null;

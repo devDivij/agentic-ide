@@ -24,11 +24,12 @@ Measured, not tuned.
 from __future__ import annotations
 
 import math
+import threading
 import time
 from typing import Callable, Literal
 
 from .providers import (
-    PROVIDERS, Candidate, RateLimits, candidates_for_role, estimate_cost_usd,
+    PROVIDERS, Candidate, RateLimits, candidates_for_role, estimate_cost_usd, get_provider,
 )
 from .store import now_ms
 from .types import Data, Role, TaskBudget
@@ -97,9 +98,17 @@ class _Usage(Data):
 
 class RateBucket:
     """
-    Tracks what we have actually sent to a provider, so we can predict whether
-    a new call fits its limits *before* triggering a 429. Per provider, not per
-    key: Groq's limits are per organisation, so extra keys buy nothing.
+    Tracks what we have actually sent through one (provider, key) pair, so we
+    can predict whether a new call fits its limits *before* triggering a 429.
+
+    One bucket per key, not per provider: a provider whose limits are truly
+    per-key (NVIDIA, Mistral, Google AI Studio, OpenRouter, Cohere -- all
+    account-scoped) gets real extra headroom from a second key. Groq is the
+    known exception: its limits are per ORGANISATION, so a second Groq key is
+    still tracked as its own bucket here (so it stays a normal "extra option"
+    to rotate onto) but will not actually raise Groq's real ceiling -- a 429
+    on paper-headroom is still caught and penalized like any other, just later
+    than it would be for a genuinely per-key provider.
     """
 
     def __init__(self, provider_id: str, limits: RateLimits) -> None:
@@ -107,6 +116,17 @@ class RateBucket:
         self._limits = limits
         self._usage: list[_Usage] = []
         self._penalty_until = 0.0      # set after a real 429/5xx
+        #: When this key was last handed out by the router, for LRU rotation
+        #: across a provider's keys (see Router._select_key). 0 = never used,
+        #: which is why an unused key always sorts before a used one.
+        # `time.monotonic_ns()`, not now_ms(): two picks landing in the same
+        # wall-clock millisecond (plausible for cheap roles like 'classify')
+        # would otherwise tie and break rotation -- nanosecond resolution
+        # makes that practically impossible.
+        self.last_used_ts = 0
+
+    def touch(self) -> None:
+        self.last_used_ts = time.monotonic_ns()
 
     def wait_ms(self, est_tokens: int, now: int | None = None) -> float:
         """0 = can dispatch now; otherwise ms until a call of est_tokens would fit."""
@@ -213,6 +233,9 @@ class RouteDecision(Data):
     estimated_cost_usd: float = 0.0
     #: How long we actually slept waiting for rate-limit room.
     waited_ms: float = 0.0
+    #: Which of the provider's keys this call used -- an ordinal, never the
+    #: key itself, so it is safe to log and show on the wire.
+    key_index: int = 0
 
 
 ASSUMED_OUTPUT_TOKENS = 800
@@ -233,11 +256,62 @@ class Router:
         #: Provider ids that actually have a key configured.
         self.configured = configured
         self._on_decision = on_decision
-        self._buckets = {p.id: RateBucket(p.id, p.limits) for p in PROVIDERS}
+        #: Keys per provider, beyond the single implicit one `configured`
+        #: alone implies. Set by `from_keys`; every provider defaults to 1
+        #: (see `_num_keys`), which is exactly today's one-bucket-per-provider
+        #: behaviour -- so a caller that only ever dealt in provider ids
+        #: (tests, `configured=` construction) is unaffected.
+        self._key_counts: dict[str, int] = {}
+        self._buckets: dict[tuple[str, int], RateBucket] = {}
         # Models that answered 404/410 in this session. A retired model is not
         # rate-limited, it is gone -- so it is dropped from ranking entirely
         # rather than being rediscovered and re-excluded by every later call.
         self._retired: set[str] = set()
+        # Guards key selection + the touch() that commits to it, so two picks
+        # landing at once cannot both claim the same idle key as least-recently
+        # -used. Not held across the network call or across router.pick's own
+        # rate-limit sleep -- only across the "decide, then mark" step.
+        self._lock = threading.Lock()
+
+    @classmethod
+    def from_keys(
+        cls,
+        keys: dict[str, list[str]],
+        on_decision: Callable[[RouteDecision, Role], None] | None = None,
+    ) -> "Router":
+        """
+        The production constructor: one Router built straight from the actual
+        key material, so the bucket count for a provider can never drift from
+        how many keys it really has (a bare `configured` set plus a
+        separately-passed count could disagree; this can't).
+        """
+        router = cls({pid for pid, ks in keys.items() if ks}, on_decision)
+        router._key_counts = {pid: len(ks) for pid, ks in keys.items() if ks}
+        return router
+
+    def _num_keys(self, provider_id: str) -> int:
+        return max(1, self._key_counts.get(provider_id, 1))
+
+    def _select_key(self, provider_id: str, est_tokens: int) -> tuple[int, float]:
+        """
+        Which of this provider's keys to use right now, and how long until it
+        has room. Prefers a key with headroom; among several, the
+        least-recently-used one, so load rotates across every configured key
+        instead of hammering key 0 until it alone is exhausted. Caller must
+        hold `self._lock` -- selection and the `touch()` that commits to it
+        must be atomic, or two concurrent picks can both choose the same idle
+        key.
+        """
+        n = self._num_keys(provider_id)
+        scored = [
+            (i, bucket.wait_ms(est_tokens), bucket.last_used_ts)
+            for i in range(n)
+            for bucket in [self._bucket(provider_id, i)]
+        ]
+        ready = [s for s in scored if s[1] == 0]
+        pool = ready if ready else scored
+        i, wait, _ = min(pool, key=lambda s: (s[1], s[2]))
+        return i, wait
 
     def pick(self, role: Role, estimated_tokens: int, *,
              difficulty: Literal["routine", "hairy"] | None = None,
@@ -265,53 +339,62 @@ class Router:
                 f"Context of ~{est_total} tokens exceeds every available model's "
                 f"window for '{role}'.")
 
-        # 2. Best candidate that can go right now.
-        ready = [c for c in fits if self._bucket(c.provider.id).wait_ms(est_total) == 0]
-        if ready:
-            pick = ready[0]
-            return self._decide(
-                role, estimated_tokens, pick, ready[1:3], 0,
-                f"{pick.provider.label} has rate-limit headroom now; "
-                f"best-ranked option for '{role}'")
+        with self._lock:
+            # Each candidate's best key, chosen and scored together so the
+            # ranked order below never has to re-derive it.
+            evaluated = [(c, *self._select_key(c.provider.id, est_total)) for c in fits]
 
-        # 3. Everything is rate-limited. Pay only if the wait is worth more.
-        waits = [
-            (c, self._bucket(c.provider.id).wait_ms(est_total),
-             estimate_cost_usd(c.model, estimated_tokens, ASSUMED_OUTPUT_TOKENS))
-            for c in fits
-        ]
-        free_waits = [w for _, w, cost in waits if cost == 0]
-        shortest_free_wait = min(free_waits) if free_waits else math.inf
-        payable = sorted(
-            (w for w in waits if w[2] > 0 and is_paying_worth_it(shortest_free_wait, w[2])),
-            key=lambda w: w[2])
-        if payable:
-            candidate, _, cost = payable[0]
-            worth = (shortest_free_wait / 1000) / SECONDS_PER_USD
-            return self._decide(
-                role, estimated_tokens, candidate, [], 0,
-                f"free pool busy for {_fmt(shortest_free_wait)}; that wait is worth "
-                f"${worth:.4f} and this call costs ~${cost:.4f}, so paying is "
-                f"score-positive")
+            # 2. Best candidate that can go right now.
+            ready = [(c, key_index) for c, key_index, wait in evaluated if wait == 0]
+            if ready:
+                pick, key_index = ready[0]
+                return self._decide(
+                    role, estimated_tokens, pick, key_index, [c for c, _ in ready[1:3]], 0,
+                    f"{pick.provider.label} has rate-limit headroom now; "
+                    f"best-ranked option for '{role}'")
 
-        # 4. Cheaper to wait than to pay: actually sleep for the shortest wait.
-        best_candidate, best_wait, _ = min(waits, key=lambda w: w[1])
-        if not math.isfinite(best_wait) or best_wait > wait_cap:
-            raise NoUsableModelError(
-                f"Every provider for '{role}' is rate-limited for more than "
-                f"{wait_cap / 1000:g}s. Add another provider key or try later.")
+            # 3. Everything is rate-limited. Pay only if the wait is worth more.
+            waits = [
+                (c, key_index, wait,
+                 estimate_cost_usd(c.model, estimated_tokens, ASSUMED_OUTPUT_TOKENS))
+                for c, key_index, wait in evaluated
+            ]
+            free_waits = [w for _, _, w, cost in waits if cost == 0]
+            shortest_free_wait = min(free_waits) if free_waits else math.inf
+            payable = sorted(
+                (w for w in waits if w[3] > 0 and is_paying_worth_it(shortest_free_wait, w[3])),
+                key=lambda w: w[3])
+            if payable:
+                candidate, key_index, _, cost = payable[0]
+                worth = (shortest_free_wait / 1000) / SECONDS_PER_USD
+                return self._decide(
+                    role, estimated_tokens, candidate, key_index, [], 0,
+                    f"free pool busy for {_fmt(shortest_free_wait)}; that wait is worth "
+                    f"${worth:.4f} and this call costs ~${cost:.4f}, so paying is "
+                    f"score-positive")
+
+            # 4. Cheaper to wait than to pay: actually sleep for the shortest wait.
+            best_candidate, best_key_index, best_wait, _ = min(waits, key=lambda w: w[2])
+            if not math.isfinite(best_wait) or best_wait > wait_cap:
+                raise NoUsableModelError(
+                    f"Every provider for '{role}' is rate-limited for more than "
+                    f"{wait_cap / 1000:g}s. Add another provider key or try later.")
+
+        # Sleep OUTSIDE the lock: this is the one step that can take up to
+        # `wait_cap`, and it must not block every other pick() in the process.
         time.sleep(best_wait / 1000)
-        return self._decide(
-            role, estimated_tokens, best_candidate, [], best_wait,
-            f"every provider was rate-limited; waited {_fmt(best_wait)} for "
-            f"{best_candidate.provider.label} because that was cheaper than paying")
+        with self._lock:
+            return self._decide(
+                role, estimated_tokens, best_candidate, best_key_index, [], best_wait,
+                f"every provider was rate-limited; waited {_fmt(best_wait)} for "
+                f"{best_candidate.provider.label} because that was cheaper than paying")
 
-    def record_usage(self, provider_id: str, tokens: int) -> None:
+    def record_usage(self, provider_id: str, key_index: int, tokens: int) -> None:
         """Report real usage so the buckets track truth, not our estimates."""
-        self._bucket(provider_id).record(tokens)
+        self._bucket(provider_id, key_index).record(tokens)
 
-    def penalize(self, provider_id: str, retry_after_ms: float) -> None:
-        self._bucket(provider_id).penalize(retry_after_ms)
+    def penalize(self, provider_id: str, key_index: int, retry_after_ms: float) -> None:
+        self._bucket(provider_id, key_index).penalize(retry_after_ms)
 
     def retire(self, provider_id: str, model_id: str) -> None:
         """Stop routing to a model that no longer exists, for the rest of the session."""
@@ -322,8 +405,15 @@ class Router:
         return sorted(self._retired)
 
     def snapshot(self) -> dict[str, dict[str, int]]:
-        """Live headroom per provider, for the dashboard."""
-        return {pid: bucket.headroom() for pid, bucket in self._buckets.items()}
+        """Live headroom per provider, summed across all of its keys, for the dashboard."""
+        out: dict[str, dict[str, int]] = {}
+        for provider in PROVIDERS:
+            combined: dict[str, int] = {}
+            for i in range(self._num_keys(provider.id)):
+                for key, value in self._bucket(provider.id, i).headroom().items():
+                    combined[key] = combined.get(key, 0) + value
+            out[provider.id] = combined
+        return out
 
     def rank(self, role: Role, *,
              difficulty: Literal["routine", "hairy"] | None = None,
@@ -397,19 +487,31 @@ class Router:
 
         return sorted(usable, key=sort_key)
 
-    def _bucket(self, provider_id: str) -> RateBucket:
-        bucket = self._buckets.get(provider_id)
+    def _bucket(self, provider_id: str, key_index: int = 0) -> RateBucket:
+        """Buckets are created lazily, one per (provider, key) pair actually asked for."""
+        slot = (provider_id, key_index)
+        bucket = self._buckets.get(slot)
         if bucket is None:
-            raise KeyError(f"No rate bucket for provider '{provider_id}'")
+            provider = get_provider(provider_id)
+            bucket = RateBucket(provider_id, provider.limits if provider else RateLimits())
+            self._buckets[slot] = bucket
         return bucket
 
-    def _decide(self, role: Role, estimated_tokens: int, pick: Candidate,
+    def _decide(self, role: Role, estimated_tokens: int, pick: Candidate, key_index: int,
                 runners_up: list[Candidate], waited_ms: float,
                 reason: str) -> RouteDecision:
+        # Commits to this key: marks it used (for LRU rotation next time) at
+        # the moment the decision is made, not after the call returns, so a
+        # call that fails still counts as "just used" for rotation purposes.
+        self._bucket(pick.provider.id, key_index).touch()
+        n = self._num_keys(pick.provider.id)
+        if n > 1:
+            reason = f"{reason} (key {key_index + 1}/{n})"
         decision = RouteDecision(
             provider_id=pick.provider.id,
             model_id=pick.model.id,
             reason=reason,
+            key_index=key_index,
             runners_up=[RunnerUp(provider_id=c.provider.id, model_id=c.model.id)
                         for c in runners_up],
             estimated_cost_usd=estimate_cost_usd(

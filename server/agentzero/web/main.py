@@ -39,11 +39,12 @@ from ..agent.router import Router
 from ..agent.store import Store, conversation_title
 from ..agent.workers import ask_aside
 from .events import EventBus
-from .review import apply_selection, build_review, revert_to_step
+from .revert import revert_to_step
 from .session import Session
 from .settings import (
-    EXA_PROVIDER_ID, effective_keys, exa_key, key_presence, load_settings,
-    save_settings, set_provider_key, settings_path,
+    EXA_PROVIDER_ID, add_provider_key, effective_keys, exa_key, key_counts,
+    key_presence, load_settings, remove_provider_key, save_settings, set_provider_key,
+    settings_path, stored_key_counts,
 )
 
 PORT = int(os.environ.get("AGENTZERO_PORT") or 4319)
@@ -145,10 +146,17 @@ async def stream_events() -> StreamingResponse:
 @app.get("/api/providers")
 def get_providers() -> dict[str, Any]:
     presence = key_presence()
+    counts = key_counts()
+    removable = stored_key_counts()
     return {
         "providers": [
             {"providerId": p.id, "label": p.label,
              "configured": presence.get(p.id, False),
+             "keyCount": counts.get(p.id, 0),
+             # How many of keyCount are removable from here -- the rest come
+             # from the environment and have no settings-file position to
+             # remove (see stored_key_counts's docstring).
+             "removableKeyCount": removable.get(p.id, 0),
              "enabled": p.enabled, "preference": p.preference, "keyEnv": p.key_env}
             for p in PROVIDERS
         ],
@@ -173,15 +181,39 @@ class KeyBody(BaseModel):
     apiKey: str = ""
 
 
-@app.put("/api/providers/{provider_id}/key")
-def put_provider_key(provider_id: str, body: KeyBody) -> dict[str, Any]:
+@app.post("/api/providers/{provider_id}/keys")
+def post_provider_key(provider_id: str, body: KeyBody) -> dict[str, Any]:
+    """
+    Add one key to a provider's list. A provider can now hold several -- see
+    router.py's per-key rate buckets -- so this is additive; use DELETE below
+    to remove one by position.
+    """
     if get_provider(provider_id) is None:
         raise HTTPException(404, f"Unknown provider '{provider_id}'")
-    set_provider_key(provider_id, body.apiKey)
+    add_provider_key(provider_id, body.apiKey)
     # Sessions hold their key map; rebuild so the change takes effect now.
     for root in list(_sessions):
         _sessions.pop(root).close()
-    return {"ok": True, "configured": key_presence()}
+    return {"ok": True, "configured": key_presence(), "keyCount": key_counts()}
+
+
+@app.delete("/api/providers/{provider_id}/keys/{index}")
+def delete_provider_key(provider_id: str, index: int) -> dict[str, Any]:
+    if get_provider(provider_id) is None:
+        raise HTTPException(404, f"Unknown provider '{provider_id}'")
+    stored_count = stored_key_counts().get(provider_id, 0)
+    if not (0 <= index < stored_count):
+        # A stale screen (open before a key was removed elsewhere -- exactly
+        # what closing every session below guards against) could still send
+        # an out-of-range index. Saying so beats a silent "ok" for a delete
+        # that deleted nothing.
+        raise HTTPException(
+            400, f"No key at position {index} for '{provider_id}' "
+                 f"(reload the Settings screen)")
+    remove_provider_key(provider_id, index)
+    for root in list(_sessions):
+        _sessions.pop(root).close()
+    return {"ok": True, "configured": key_presence(), "keyCount": key_counts()}
 
 
 @app.put("/api/search/key")
@@ -204,14 +236,25 @@ def test_provider(provider_id: str, body: KeyBody = KeyBody()) -> dict[str, Any]
     Test the key actually in the box, not whatever was last saved. Testing
     must never have a save side effect -- a user trying a key before
     committing it is exactly the case this endpoint exists for. An empty body
-    falls back to the saved key, so re-testing an already-configured provider
-    without retyping it still works.
+    falls back to every already-configured key, tested individually: with
+    several keys in rotation, one of them being dead or revoked is exactly the
+    failure this button exists to catch, and reporting only key 1's result
+    would hide it.
     """
     provider = get_provider(provider_id)
     if provider is None:
         raise HTTPException(404, "Unknown provider")
-    key = body.apiKey.strip() or effective_keys().get(provider.id)
-    return _probe(provider.base_url, key)
+    draft = body.apiKey.strip()
+    if draft:
+        return _probe(provider.base_url, draft)
+    stored = effective_keys().get(provider.id) or []
+    if len(stored) <= 1:
+        return _probe(provider.base_url, stored[0] if stored else None)
+    results = [_probe(provider.base_url, key) for key in stored]
+    return {
+        "reachable": all(r["reachable"] for r in results),
+        "detail": "; ".join(f"key {i + 1}: {r['detail']}" for i, r in enumerate(results)),
+    }
 
 
 def _probe(base_url: str, key: str | None) -> dict[str, Any]:
@@ -381,44 +424,8 @@ def post_approval(body: ApprovalBody) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# Review
+# Revert
 # ---------------------------------------------------------------------------
-
-
-@app.get("/api/tasks/{task_id}/review")
-def get_review(task_id: str, projectRoot: str = Query(...)) -> dict[str, Any]:
-    bundle, _raw = build_review(str(Path(projectRoot).resolve()), task_id)
-    return {"taskId": bundle.task_id, "hunks": bundle.hunks, "fullDiff": bundle.full_diff}
-
-
-class ReviewBody(BaseModel):
-    projectRoot: str | None = None
-    acceptedHunkIds: list[str] = []
-    feedback: str | None = None
-
-
-@app.post("/api/tasks/{task_id}/review")
-def post_review(task_id: str, body: ReviewBody) -> dict[str, Any]:
-    if not body.projectRoot:
-        raise HTTPException(400, "projectRoot required")
-    root = str(Path(body.projectRoot).resolve())
-    try:
-        result = apply_selection(root, task_id, body.acceptedHunkIds, body.feedback)
-    except Exception as err:               # noqa: BLE001
-        raise HTTPException(400, str(err)) from err
-
-    bus.publish({"type": "log", "projectRoot": root, "taskId": task_id, "level": "info",
-                 "message": f"Applied {result.applied} hunk(s), "
-                            f"rejected {result.rejected}."})
-    # A rejected hunk's step came back to life (HITL -> SCHEDULE, doc §15):
-    # pick the run back up the same way an interrupted-task resume does, so the
-    # redo streams over SSE like any other run instead of sitting there until
-    # the person separately hits "Resume".
-    if result.requeued_steps:
-        session = session_for(root)
-        if not session.is_running:
-            session.start("", resume_task_id=task_id)
-    return result.wire()
 
 
 class RevertBody(BaseModel):
@@ -430,7 +437,7 @@ class RevertBody(BaseModel):
 def post_revert(task_id: str, body: RevertBody) -> dict[str, Any]:
     """
     Reset the tree to right after `stepId` finished and discard every step
-    after it -- deliberately does NOT auto-resume (see review.py's module
+    after it -- deliberately does NOT auto-resume (see revert.py's module
     note): a revert means the user wants to go a different direction, and the
     next thing that should run is their next prompt, not the old plan's
     unchanged tail.
@@ -471,7 +478,7 @@ def post_bytheway(body: AskBody) -> dict[str, Any]:
         keys = effective_keys()
         # A fresh router: the aside must not touch any task's routing state,
         # and its call is still rate-limit-aware and logged like any other.
-        result = ask_aside(Router(set(keys.keys())), keys, question)
+        result = ask_aside(Router.from_keys(keys), keys, question)
     except Exception as err:               # noqa: BLE001
         raise HTTPException(400, str(err)) from err
 
@@ -561,9 +568,9 @@ def write_file(body: WriteFileBody) -> dict[str, Any]:
 
     Confined exactly like reading is: an opened project, never `.agentzero`.
     One honest caveat, which the UI shows rather than hides -- a file saved
-    while a task is running lands inside that task's `base..head` diff, so the
-    review screen will offer your own edit back to you as if the agent had
-    made it.
+    while a task is running lands inside that task's `base..head` diff, so its
+    automated batch review and closing report will attribute your own edit to
+    the agent.
     """
     if not body.projectRoot or not body.path or body.content is None:
         raise HTTPException(400, "projectRoot, path and content are required")

@@ -1,7 +1,7 @@
 """
-Human-in-the-loop review: hunk selection (existing) and step-level revert.
+Step-level revert: throw away a task's tail, keep its head.
 
-Revert is tested against the real orchestrator loop, not a hand-built DB row --
+Tested against the real orchestrator loop, not a hand-built DB row --
 `checkpoint_sha` values and file content have to come from an actual run for
 the test to mean anything.
 """
@@ -16,7 +16,7 @@ import pytest
 from agentzero.agent.orchestrator import create_agent, run_task
 from agentzero.agent.types import ApprovalDecision
 from tests.model_stub import script_model
-from agentzero.web.review import apply_selection, build_review, revert_to_step
+from agentzero.web.revert import revert_to_step
 
 
 @pytest.fixture
@@ -55,7 +55,7 @@ def _run_two_step_task(monkeypatch, agent, project):
 
 def test_reverting_to_an_earlier_step_undoes_the_later_ones(monkeypatch, agent, project):
     outcome = _run_two_step_task(monkeypatch, agent, project)
-    assert outcome.status == "awaiting_review"
+    assert outcome.status == "done"
     assert Path(project, "a.py").exists() and Path(project, "b.py").exists()
 
     result = revert_to_step(project, outcome.task_id, "s1")
@@ -109,28 +109,6 @@ def test_reverting_a_step_that_never_completed_is_rejected(monkeypatch, agent, p
         update={"status": "failed", "checkpoint_sha": None}))
     with pytest.raises(ValueError, match="never completed"):
         revert_to_step(project, outcome.task_id, "s2")
-
-
-def test_revert_moves_the_review_screens_head_so_it_cannot_resurrect_the_discard(
-        monkeypatch, agent, project):
-    """
-    build_review diffs the task's baseline..final checkpoint markers, which
-    live in the event log, not the `steps` table -- if revert doesn't also
-    move the 'final' marker, the review screen keeps showing b.py's creation
-    as an acceptable hunk, and accepting it brings the discarded step back.
-    """
-    outcome = _run_two_step_task(monkeypatch, agent, project)
-    revert_to_step(project, outcome.task_id, "s1")
-
-    bundle, _ = build_review(project, outcome.task_id)
-    assert "b.py" not in bundle.full_diff
-    assert all(h["file"] != "b.py" for h in bundle.hunks)
-
-    # And accepting whatever the (now b.py-free) review screen offers must not
-    # bring it back either.
-    apply_selection(project, outcome.task_id, [h["id"] for h in bundle.hunks])
-    assert not Path(project, "b.py").exists()
-    assert Path(project, "a.py").read_text() == "a = 1\n"
 
 
 def test_facts_learned_after_the_reverted_step_do_not_survive(monkeypatch, agent, project):

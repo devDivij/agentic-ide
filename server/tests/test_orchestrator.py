@@ -173,7 +173,16 @@ def test_an_empty_rules_file_is_not_used(tmp_path):
 
 def test_keys_are_read_from_the_environment():
     keys = keys_from_env({"NVIDIA_API_KEY": " nv ", "GROQ_API_KEY": "", "OTHER": "x"})
-    assert keys == {"nvidia": "nv"}
+    assert keys == {"nvidia": ["nv"]}
+
+
+def test_multiple_keys_are_read_via_numbered_suffixes():
+    keys = keys_from_env({
+        "NVIDIA_API_KEY": "nv1", "NVIDIA_API_KEY_2": "nv2",
+        # A gap at _3 stops the scan -- _4 must not be picked up.
+        "NVIDIA_API_KEY_4": "nv4",
+    })
+    assert keys == {"nvidia": ["nv1", "nv2"]}
 
 
 # -- outcome wording ---------------------------------------------------------
@@ -190,25 +199,25 @@ class _FakeStore:
 def test_completing_every_step_without_changing_a_file_says_so():
     """
     "Completed" and "changed something" are different claims; conflating them
-    sent a user to a Review pane to accept a diff that did not exist.
+    would imply an edit happened when the agent had, correctly, done nothing.
     """
-    out = describe_outcome("awaiting_review", 2, 2, None, _FakeStore(), "t",
+    out = describe_outcome("done", 2, 2, None, _FakeStore(), "t",
                            changed_anything=False, salvaged_steps=0)
     assert "without changing any files" in out["summary"]
     assert "nothing to review" in out["advice"]
 
 
 def test_a_salvaged_run_does_not_claim_a_clean_finish():
-    out = describe_outcome("awaiting_review", 2, 2, None, _FakeStore(), "t",
+    out = describe_outcome("done", 2, 2, None, _FakeStore(), "t",
                            changed_anything=True, salvaged_steps=1)
     assert "did not complete cleanly" in out["summary"]
     assert "more likely than usual to be incomplete" in out["advice"]
 
 
-def test_a_clean_finish_points_at_the_diff():
-    out = describe_outcome("awaiting_review", 2, 2, None, _FakeStore(), "t",
+def test_a_clean_finish_says_so_plainly():
+    out = describe_outcome("done", 2, 2, None, _FakeStore(), "t",
                            changed_anything=True, salvaged_steps=0)
-    assert out["summary"].startswith("Done — all 2 steps completed")
+    assert out["summary"] == "Done — all 2 steps completed."
     assert "advice" not in out
 
 
@@ -262,7 +271,7 @@ def test_a_whole_task_runs_classify_plan_execute_verify_and_diff(
 
     outcome = run_task(agent, "add a greeter")
 
-    assert outcome.status == "awaiting_review"
+    assert outcome.status == "done"
     assert outcome.steps_completed == 1 and outcome.steps_total == 1
     assert Path(project, "greet.py").read_text() == "def greet():\n    return 'hi'\n"
     assert "greet.py" in outcome.diff and count_changed_files(outcome.diff) == 1
@@ -407,7 +416,7 @@ def test_a_question_wearing_a_question_mark_is_promoted_into_real_work(
 
     outcome = run_task(agent, "can you rename the calc function?")
 
-    assert outcome.status == "awaiting_review"
+    assert outcome.status == "done"
     assert Path(project, "a.py").exists()
 
 
@@ -424,7 +433,7 @@ def test_a_micro_edit_skips_the_planning_call(monkeypatch, agent, project):
 
     outcome = run_task(agent, "change x to 2")
 
-    assert outcome.status == "awaiting_review"
+    assert outcome.status == "done"
     # No plan call at all: the step is built directly from triage.
     assert seen["plan"] == []
     assert len(seen["classify"]) == 1 and len(seen["execute"]) == 2
@@ -452,7 +461,7 @@ def test_planning_failure_degrades_to_one_step_instead_of_killing_the_task(
 
     outcome = run_task(agent, "make a.py")
 
-    assert outcome.status == "awaiting_review"
+    assert outcome.status == "done"
     plan = agent.db.get_plan(outcome.task_id)
     assert len(plan.steps) == 1
     assert plan.steps[0].intent == "make a.py"      # the user's own words
@@ -523,7 +532,7 @@ def test_work_that_exists_outranks_the_models_self_assessment(
 
     outcome = run_task(agent, "write a.py")
 
-    assert outcome.status == "awaiting_review"
+    assert outcome.status == "done"
     assert Path(project, "a.py").exists()
     step_end = [e for e in agent.db.get_events(outcome.task_id)
                 if e.kind == "step_end"][-1]
@@ -616,7 +625,7 @@ def test_a_step_that_keeps_looping_earns_a_replan_not_another_attempt(
 
     outcome = run_task(agent, "do a big thing")
 
-    assert outcome.status == "awaiting_review"
+    assert outcome.status == "done"
     assert Path(project, "a.py").exists()
     plan = agent.db.get_plan(outcome.task_id)
     assert [s.id for s in plan.steps] == ["r1"]
@@ -649,7 +658,7 @@ def test_review_fires_every_batch_and_once_more_at_the_end(monkeypatch, agent, p
 
     outcome = run_task(agent, "four files")
 
-    assert outcome.status == "awaiting_review"
+    assert outcome.status == "done"
     for i in (1, 2, 3, 4):
         assert Path(project, f"f{i}.py").exists()
 
@@ -704,7 +713,7 @@ def test_a_review_finding_reverts_and_replans_a_step_that_already_passed(
 
     outcome = run_task(agent, "add a greeter")
 
-    assert outcome.status == "awaiting_review"
+    assert outcome.status == "done"
     assert Path(project, "greet.py").read_text() == "def greet():\n    return 'hi'\n"
 
     plan = agent.db.get_plan(outcome.task_id)
@@ -754,7 +763,7 @@ def test_an_interrupted_task_resumes_from_the_first_unfinished_step(
         ])
     second = run_task(agent, "", resume_task_id=first.task_id)
 
-    assert second.status == "awaiting_review"
+    assert second.status == "done"
     assert seen["classify"] == [] and seen["plan"] == []
     assert Path(project, "b.py").exists()
     # The diff still spans the WHOLE task, not just the part after the restart.

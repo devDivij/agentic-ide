@@ -146,7 +146,7 @@ def _start_task(args: argparse.Namespace, prompt: str, resume_task_id: str | Non
             # was started and stop it rather than leaving orphans behind.
             print(f"\nStopping {len(agent.background)} background process(es) "
                   "started during this task.")
-        return 0 if outcome.status in ("awaiting_review", "done") else 1
+        return 0 if outcome.status == "done" else 1
     finally:
         signal.signal(signal.SIGINT, previous)
         stop_background(agent)
@@ -229,24 +229,27 @@ def _show_providers(quick: bool = False) -> int:
     keys = effective_keys()
     deep = not quick
 
-    print("\nprovider          key      models  endpoint")
+    print("\nprovider          keys     models  endpoint")
     print("-" * 64)
     for provider in PROVIDERS:
-        configured = provider.key_env is None or provider.id in keys
+        provider_keys = keys.get(provider.id) or []
+        configured = provider.key_env is None or bool(provider_keys)
         if not provider.enabled:
             state = "disabled"
         elif not configured:
             state = f"set {provider.key_env}"
         else:
-            state = _ping(provider.base_url, keys.get(provider.id))
-        print(f"{provider.id:<17} {('yes' if configured else 'no'):<8} "
+            state = _ping(provider.base_url, provider_keys[0])
+        key_col = "-" if provider.key_env is None else str(len(provider_keys))
+        print(f"{provider.id:<17} {key_col:<8} "
               f"{len(provider.models):<7} {state}")
 
     print(f"\nmodels (all <=80B total parameters)"
           f"{' — probed with a real call' if deep else ''}:")
     usable: list[str] = []
     for provider in PROVIDERS:
-        configured = provider.key_env is None or provider.id in keys
+        provider_keys = keys.get(provider.id) or []
+        configured = provider.key_env is None or bool(provider_keys)
         for model in provider.models:
             # Most model ids already carry a vendor prefix; do not prepend another.
             qualified = (model.id if model.id.startswith(f"{provider.id}/")
@@ -257,7 +260,8 @@ def _show_providers(quick: bool = False) -> int:
                     "no key" if not configured else "")
                 print(f"  {qualified:<44} {size}  {why:<22} {','.join(model.roles)}")
                 continue
-            ok, text = _probe_model(provider.base_url, model.id, keys.get(provider.id))
+            ok, text = _probe_model(
+                provider.base_url, model.id, provider_keys[0] if provider_keys else None)
             if ok:
                 usable.append(qualified)
             print(f"  {qualified:<44} {size}  {text:<22} {','.join(model.roles)}")

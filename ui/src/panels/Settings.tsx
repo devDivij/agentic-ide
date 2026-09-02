@@ -21,11 +21,20 @@ export function Settings(): JSX.Element {
   };
   useEffect(load, []);
 
-  const save = async (providerId: string): Promise<void> => {
+  const addKey = async (providerId: string): Promise<void> => {
     try {
-      await api.setKey(providerId, drafts[providerId] ?? '');
+      await api.addKey(providerId, drafts[providerId] ?? '');
       setDrafts((d) => ({ ...d, [providerId]: '' }));
       setStatus((s) => ({ ...s, [providerId]: 'saved' }));
+      load();
+    } catch (e) {
+      setStatus((s) => ({ ...s, [providerId]: (e as Error).message }));
+    }
+  };
+
+  const removeKey = async (providerId: string, index: number): Promise<void> => {
+    try {
+      await api.removeKey(providerId, index);
       load();
     } catch (e) {
       setStatus((s) => ({ ...s, [providerId]: (e as Error).message }));
@@ -103,28 +112,48 @@ export function Settings(): JSX.Element {
             </div>
 
             {provider.keyEnv ? (
-              <div className="row">
-                <input
-                  type="password"
-                  placeholder={`Paste ${provider.keyEnv}`}
-                  value={drafts[provider.providerId] ?? ''}
-                  onChange={(e) =>
-                    setDrafts((d) => ({ ...d, [provider.providerId]: e.target.value }))}
-                />
-                <button onClick={() => void save(provider.providerId)}>Save</button>
-                <button onClick={() => void test(provider.providerId)}>Test</button>
-                {provider.configured && (
-                  <button
-                    className="danger"
-                    onClick={() => {
-                      setDrafts((d) => ({ ...d, [provider.providerId]: '' }));
-                      void api.setKey(provider.providerId, '').then(load);
-                    }}
-                  >
-                    Clear
-                  </button>
+              <>
+                {provider.keyCount > 0 && (
+                  <div className="key-list">
+                    {Array.from({ length: provider.keyCount }, (_, i) => (
+                      <div key={i} className="row small">
+                        <span className="muted">key {i + 1}</span>
+                        {i < provider.removableKeyCount ? (
+                          <button
+                            className="ghost"
+                            onClick={() => void removeKey(provider.providerId, i)}
+                          >
+                            remove
+                          </button>
+                        ) : (
+                          // From .env / the environment -- there is no settings-file
+                          // position to remove; edit or unset the env var instead.
+                          <span className="muted">from environment</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
                 )}
-              </div>
+                <div className="row">
+                  <input
+                    type="password"
+                    placeholder={`Paste ${provider.keyEnv}`}
+                    value={drafts[provider.providerId] ?? ''}
+                    onChange={(e) =>
+                      setDrafts((d) => ({ ...d, [provider.providerId]: e.target.value }))}
+                  />
+                  <button onClick={() => void addKey(provider.providerId)}>
+                    {provider.keyCount > 0 ? 'Add another key' : 'Save'}
+                  </button>
+                  <button onClick={() => void test(provider.providerId)}>Test</button>
+                </div>
+                {provider.keyCount > 1 && (
+                  <p className="muted">
+                    Extra keys only help against rate limits that are per-key, not
+                    per-account — check the provider's own docs before relying on it.
+                  </p>
+                )}
+              </>
             ) : (
               <div className="muted">No key required.</div>
             )}

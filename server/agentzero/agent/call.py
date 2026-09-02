@@ -56,7 +56,7 @@ class CallDeps:
 
     db: Store
     router: Router
-    keys: dict[str, str]
+    keys: dict[str, list[str]]
     #: Ends an in-flight call when the user stops the task.
     cancel: CancelToken | None = None
 
@@ -174,11 +174,13 @@ def call_model(
         try:
             result = chat_complete(
                 route.provider_id, route.model_id, messages, keys,
+                key_index=route.key_index,
                 max_tokens=current_max_tokens, temperature=temperature, json=True,
                 suppress_reasoning=suppress_reasoning, timeout_ms=timeout_ms,
                 cancel=deps.cancel)
 
-            router.record_usage(route.provider_id, result.tokens_in + result.tokens_out)
+            router.record_usage(
+                route.provider_id, route.key_index, result.tokens_in + result.tokens_out)
 
             event_id = db.append_event(NewEvent(
                 task_id=task_id, parent_id=parent_id, kind="llm_call",
@@ -318,7 +320,7 @@ def call_model(
         except Exception as err:      # noqa: BLE001 - every provider failure lands here
             transient = isinstance(err, TransientProviderError)
             if transient:
-                router.penalize(err.provider_id, err.retry_after_ms)
+                router.penalize(route.provider_id, route.key_index, err.retry_after_ms)
 
             # A retired model is not a flaky one: take it out of rotation
             # entirely, so the rest of this run stops paying a fallback to

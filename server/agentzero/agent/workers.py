@@ -616,7 +616,7 @@ class AsideAnswer(Data):
     duration_ms: int
 
 
-def ask_aside(router: Router, keys: dict[str, str], question: str) -> AsideAnswer:
+def ask_aside(router: Router, keys: dict[str, list[str]], question: str) -> AsideAnswer:
     """
     Answers a one-off question in the same chat without touching the running
     task. Isolation is structural: this function receives no task, no store and
@@ -632,8 +632,8 @@ def ask_aside(router: Router, keys: dict[str, str], question: str) -> AsideAnswe
                         content="You are a concise, accurate programming assistant."),
             ChatMessage(role="user", content=question),
         ],
-        keys, max_tokens=1200)
-    router.record_usage(route.provider_id, result.tokens_in + result.tokens_out)
+        keys, key_index=route.key_index, max_tokens=1200)
+    router.record_usage(route.provider_id, route.key_index, result.tokens_in + result.tokens_out)
     return AsideAnswer(
         answer=result.text, provider=result.provider, model=result.model,
         cost_usd=result.cost_usd, duration_ms=result.duration_ms)

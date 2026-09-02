@@ -32,7 +32,7 @@ def context():
 @pytest.fixture
 def deps(store):
     return CallDeps(db=store, router=Router(configured={"groq", "nvidia"}), keys={
-        "groq": "k", "nvidia": "k"})
+        "groq": ["k"], "nvidia": ["k"]})
 
 
 def script(monkeypatch, *replies):

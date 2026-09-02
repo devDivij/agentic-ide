@@ -2,7 +2,11 @@
 The orchestrator: one deterministic loop, written in code.
 
   classify -> retrieve -> plan -> per step: [ retrieve, execute turns,
-  verify, checkpoint | revert ] -> final diff -> human review
+  verify, checkpoint | revert ] -> final diff
+
+Every write is human-approved as it happens (the approval callback around
+each tool call) -- there is no separate post-hoc review of the finished
+diff.
 
 Control flow is NEVER delegated to a model. Models fill slots (a plan, a turn,
 a failure label); the loop decides what happens next. This is the single most
@@ -36,7 +40,7 @@ from typing import Any, Callable, Literal
 from .call import CallFailedError
 from .checkpoints import Checkpoints, assert_git_available
 from .llm import CancelToken, TaskCancelledError
-from .providers import PROVIDERS, assert_legal_catalogue
+from .providers import PROVIDERS, assert_legal_catalogue, read_env_keys
 from .retrieval import Retriever
 from .router import BUDGETS, RouteDecision, Router
 from .shell import assert_shell_available, terminate
@@ -123,7 +127,7 @@ class Agent(WorkerCtx):
 
 def create_agent(
     project_root: str,
-    keys: dict[str, str],
+    keys: dict[str, list[str]],
     approval: ApprovalFn,
     *,
     search_api_key: str | None = None,
@@ -137,7 +141,7 @@ def create_agent(
     agent = Agent(
         project_root=project_root,
         db=Store(project_root),
-        router=Router(set(keys.keys()), on_route),
+        router=Router.from_keys(keys, on_route),
         keys=keys,
         search_api_key=search_api_key,
         retriever=Retriever(project_root),
@@ -189,16 +193,20 @@ def read_project_rules(project_root: str) -> str | None:
     return None
 
 
-def keys_from_env(env: dict[str, str] | None = None) -> dict[str, str]:
-    """Read provider keys from the environment (the settings screen adds more)."""
+def keys_from_env(env: dict[str, str] | None = None) -> dict[str, list[str]]:
+    """
+    Read provider keys from the environment (the settings screen adds more).
+    Each provider can have several: `PROVIDER_API_KEY`, then `_2`, `_3`, ...
+    (see providers.read_env_keys).
+    """
     source = os.environ if env is None else env
-    keys: dict[str, str] = {}
+    keys: dict[str, list[str]] = {}
     for provider in PROVIDERS:
         if not provider.key_env:
             continue
-        value = source.get(provider.key_env)
-        if value and value.strip():
-            keys[provider.id] = value.strip()
+        found = read_env_keys(provider.key_env, source)
+        if found:
+            keys[provider.id] = found
     return keys
 
 
@@ -506,7 +514,7 @@ def run_task(agent: Agent, prompt: str, *, resume_task_id: str | None = None,
         ])
         status: TaskStatus = (
             "aborted" if abort_reason
-            else "awaiting_review" if done == len(plan.steps)
+            else "done" if done == len(plan.steps)
             else "failed")
         db.set_status(task.id, status)
 
@@ -847,8 +855,8 @@ def _review_changes(agent: Agent, task: Task, plan: Plan, ordered: list[PlanStep
 
     issue = result.issues[0]
     if replans_used >= MAX_REPLANS:
-        # Still worth surfacing -- the human review screen shows this event --
-        # just not worth acting on when there is no budget left to act with.
+        # Still worth surfacing -- the trace view shows this event -- just
+        # not worth acting on when there is no budget left to act with.
         _report(agent, f"Review flagged a problem, but no replans remain: "
                        f"{issue.description}")
         return None
@@ -1217,7 +1225,7 @@ def describe_outcome(status: TaskStatus, done: int, total: int,
     """
     plural = "" if total == 1 else "s"
 
-    if status == "awaiting_review" and salvaged_steps > 0 and changed_anything:
+    if status == "done" and salvaged_steps > 0 and changed_anything:
         # Every step "passed", but at least one only because its half-finished
         # output happened to parse. Saying "done" here would be a claim the run
         # does not support.
@@ -1230,11 +1238,10 @@ def describe_outcome(status: TaskStatus, done: int, total: int,
                        "often works better than one broad instruction."),
         }
 
-    if status == "awaiting_review":
+    if status == "done":
         # "Completed" and "changed something" are different claims, and
-        # conflating them sent a user to a Review pane to accept a diff that
-        # did not exist. An agent that correctly concludes there is nothing to
-        # do has succeeded, but it must say that rather than imply work was done.
+        # conflating them implied work was done when the agent had, correctly,
+        # done nothing. It must say that rather than imply an edit happened.
         if not changed_anything:
             return {
                 "summary": (f"Completed all {total} step{plural} without changing any "
@@ -1245,8 +1252,7 @@ def describe_outcome(status: TaskStatus, done: int, total: int,
                            "with an @path tag."),
             }
         return {
-            "summary": (f"Done — all {total} step{plural} completed. "
-                        "Review the diff to accept or reject the changes."),
+            "summary": f"Done — all {total} step{plural} completed.",
         }
 
     if status == "aborted":

@@ -81,7 +81,7 @@ ROLES: tuple[Role, ...] = (
 
 Complexity = Literal["easy", "medium", "hard"]
 
-TaskStatus = Literal["running", "awaiting_review", "done", "aborted", "failed"]
+TaskStatus = Literal["running", "done", "aborted", "failed"]
 
 
 class Conversation(Data):

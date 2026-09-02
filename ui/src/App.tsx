@@ -7,9 +7,9 @@
  * Two things here are less obvious than they look:
  *
  *   - Changing the project resets everything downstream of it. The event
- *     stream, the task history, the composer draft and the review target all
- *     describe one folder, and carrying any of them into the next one is how
- *     the chat used to look like it had never changed directory at all.
+ *     stream, the task history and the composer draft all describe one
+ *     folder, and carrying any of them into the next one is how the chat
+ *     used to look like it had never changed directory at all.
  *   - The chat is one conversation at a time, not the project's whole
  *     archive. Which one is remembered per project, so switching away and
  *     back returns you to the thread you were in rather than to a new one.
@@ -27,16 +27,14 @@ import {
 import { Chat } from './panels/Chat.tsx';
 import { Files } from './panels/Files.tsx';
 import { ProjectPicker } from './panels/ProjectPicker.tsx';
-import { Review } from './panels/Review.tsx';
 import { Routing } from './panels/Routing.tsx';
 import { Settings } from './panels/Settings.tsx';
 import { Trace } from './panels/Trace.tsx';
 
-type Tab = 'chat' | 'review' | 'routing' | 'trace' | 'settings';
+type Tab = 'chat' | 'routing' | 'trace' | 'settings';
 
 const TABS: Array<{ id: Tab; label: string }> = [
   { id: 'chat',     label: 'Chat' },
-  { id: 'review',   label: 'Review' },
   { id: 'routing',  label: 'Routing' },
   { id: 'trace',    label: 'Trace' },
   { id: 'settings', label: 'Settings' },
@@ -78,14 +76,6 @@ export function App(): JSX.Element {
     () => readStoredConversation(localStorage.getItem('agentzero.projectRoot') ?? ''));
   /** The tasks of the open chat — the conversation history. */
   const [history, setHistory] = useState<TaskRow[]>([]);
-  /**
-   * Which task's diff the Review tab shows -- set explicitly by clicking
-   * "Review the changes" on a specific task's bubble, so reviewing an OLDER
-   * task in the chat doesn't silently show whatever `state.task` (the most
-   * recently active one) happens to be. Falls back to that when nothing has
-   * been explicitly picked yet -- e.g. clicking the Review tab directly.
-   */
-  const [reviewTaskId, setReviewTaskId] = useState<string | null>(null);
 
   const running = state.task?.status === 'running';
 
@@ -142,10 +132,6 @@ export function App(): JSX.Element {
           setDraft('');          // an @path tag pointing into the old tree
           setPins([]);
           setConversationId(chat);
-          setReviewTaskId(null);
-          // The review pane builds a diff for state.task against the project
-          // root; after a switch that pairing no longer exists.
-          setTab((t) => (t === 'review' ? 'chat' : t));
         }
         refreshConversations(r.path);
         refreshHistory(r.path, chat);
@@ -160,9 +146,6 @@ export function App(): JSX.Element {
       else localStorage.removeItem(conversationKey(projectRoot));
     }
     setHistory([]);
-    // A review target picked in the chat just left must not silently carry
-    // into this one -- same class of bug as the project-switch case above.
-    setReviewTaskId(null);
     if (projectRoot) refreshHistory(projectRoot, id);
   }, [projectRoot, refreshHistory]);
 
@@ -270,9 +253,6 @@ export function App(): JSX.Element {
               {t.id === 'chat' && state.approvals.length > 0 && (
                 <span className="badge">{state.approvals.length}</span>
               )}
-              {t.id === 'review' && state.task?.status === 'awaiting_review' && (
-                <span className="badge">•</span>
-              )}
             </button>
           ))}
         </nav>
@@ -321,7 +301,6 @@ export function App(): JSX.Element {
                 onResume={resume}
                 onStop={stop}
                 onApprove={approve}
-                onReview={(taskId) => { setReviewTaskId(taskId); setTab('review'); }}
                 onRevert={revertStep}
                 draft={draft}
                 setDraft={setDraft}
@@ -329,13 +308,6 @@ export function App(): JSX.Element {
                 onRemovePin={removePin}
                 onTogglePin={toggleChatPin}
                 onClearPins={clearPins}
-              />
-            )}
-            {tab === 'review' && (
-              <Review
-                projectRoot={projectRoot}
-                taskId={reviewTaskId ?? state.task?.id ?? null}
-                onApplied={(message) => { setToast(message); pushLog('info', message); }}
               />
             )}
             {tab === 'routing' && <Routing updates={state.routing} />}

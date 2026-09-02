@@ -37,15 +37,51 @@ def extract_json(text: str) -> Any:
         if parsed is not _NOTHING:
             return parsed
 
-    # Last resort: the outermost balanced {...}.
-    start = trimmed.find("{")
-    end = trimmed.rfind("}")
-    if start != -1 and end > start:
-        parsed = _try_parse(trimmed[start:end + 1])
+    # Last resort: try each top-level balanced {...} span, last one first.
+    # A model that reasons out loud before answering (a `<thought>` preamble,
+    # a restated schema example) often litters earlier braces that have
+    # nothing to do with the real reply -- spanning from the very first "{"
+    # to the very last "}" would swallow all of that as one invalid blob.
+    # The actual answer is reliably the LAST complete object in the text.
+    for candidate in reversed(_balanced_objects(trimmed)):
+        parsed = _try_parse(candidate)
         if parsed is not _NOTHING:
             return parsed
 
     raise ValueError("No JSON object found in model output")
+
+
+def _balanced_objects(text: str) -> list[str]:
+    """Every top-level, brace-balanced {...} substring, in order of appearance.
+
+    Tracks string literals (with escapes) so a brace inside a quoted value
+    never throws off the depth count.
+    """
+    spans = []
+    depth = 0
+    start = None
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                spans.append(text[start:i + 1])
+    return spans
 
 
 def _try_parse(text: str) -> Any:

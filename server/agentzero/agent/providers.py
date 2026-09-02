@@ -150,18 +150,6 @@ PROVIDERS: list[ProviderSpec] = [
                 swe_score=45.0, elo_rating=1280, speed_tps=180,
             ),
             ModelSpec(
-                # Same model card as Google AI Studio's copy below; a separate
-                # entry because it's NIM-hosted, which is a different
-                # rate-limit bucket and (per measurement) different speed.
-                id="google/gemma-4-31b-it",
-                total_params_b=31,
-                params_source="Google model card: Gemma 4 31B-IT, dense",
-                context_tokens=128_000,
-                cost_per_m_tok_in=0, cost_per_m_tok_out=0,
-                roles=["plan", "execute", "locate", "classify", "diagnose", "review", "ask"],
-                swe_score=42.0, elo_rating=1250, speed_tps=130,
-            ),
-            ModelSpec(
                 id="poolside/laguna-xs-2.1",
                 total_params_b=33,
                 params_source="Poolside model card: Laguna XS 2.1 (33B total / 3B active)",
@@ -529,6 +517,32 @@ def estimate_cost_usd(model: ModelSpec, tokens_in: int, tokens_out: int) -> floa
         (tokens_in / 1e6) * model.cost_per_m_tok_in
         + (tokens_out / 1e6) * model.cost_per_m_tok_out
     )
+
+
+def read_env_keys(base_var: str, source: dict[str, str]) -> list[str]:
+    """
+    `base_var`, then `base_var_2`, `base_var_3`, ... stopping at the first gap.
+
+    Lets a provider whose limits are actually per-key (not per-org -- see
+    RateBucket's docstring in router.py, which names Groq as the counter-
+    example: its limits are per organisation, so extra Groq keys are
+    discovered same as any other provider's but buy no real throughput) be
+    given more than one key, the same way `.env` already reads: settings.py
+    uses this for the Settings-screen fallback, orchestrator.py's
+    `keys_from_env` for the headless path.
+    """
+    keys: list[str] = []
+    value = source.get(base_var)
+    if value and value.strip():
+        keys.append(value.strip())
+    i = 2
+    while True:
+        value = source.get(f"{base_var}_{i}")
+        if not value or not value.strip():
+            break
+        keys.append(value.strip())
+        i += 1
+    return keys
 
 
 def assert_legal_catalogue() -> None:

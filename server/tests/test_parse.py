@@ -31,6 +31,36 @@ def test_raises_when_there_is_no_json():
         extract_json("no json here at all")
 
 
+def test_prefers_the_last_object_over_one_echoed_in_a_thought_preamble():
+    """
+    Regression: a `<thought>` preamble that restates the target schema as an
+    example (its own braces) used to make the old first-"{"-to-last-"}" span
+    swallow the whole thing as one invalid blob, discarding a valid trailing
+    reply. See the agent-eval trace this was found in: the model answered
+    correctly every time but the task still failed after two repairs.
+    """
+    text = (
+        '<thought>JSON format: `{"answer": "...", "requiresEdits": boolean}`. '
+        "The 2026 World Cup has not happened yet.</thought>"
+        '{"answer": "The 2026 World Cup has not taken place yet.", '
+        '"requiresEdits": false}'
+    )
+    assert extract_json(text) == {
+        "answer": "The 2026 World Cup has not taken place yet.",
+        "requiresEdits": False,
+    }
+
+
+def test_an_unparseable_earlier_object_does_not_block_a_valid_later_one():
+    assert extract_json('{not valid json} then {"a": 1}') == {"a": 1}
+
+
+def test_a_brace_inside_a_string_does_not_confuse_the_balance_count():
+    assert extract_json('prose {"a": "looks like a } brace"}') == {
+        "a": "looks like a } brace"
+    }
+
+
 def test_parsed_null_is_not_mistaken_for_a_parse_failure():
     """`null` is a valid JSON document; only a failure falls through."""
     assert extract_json("null") is None

@@ -347,8 +347,8 @@ body:has(.splitter.dragging) { user-select: none; }
 
 /* The proposed write, as a diff against disk. Boxed and capped the way the
    plain preview it replaced was — this sits inside a chat bubble, not a full
-   review pane, and a wide diff must scroll inside its own box rather than
-   push the composer off the bottom of the screen. */
+   page, and a wide diff must scroll inside its own box rather than push the
+   composer off the bottom of the screen. */
 .approval-diff {
   max-height: 320px; overflow: auto; border-radius: 5px;
   border: 1px solid var(--line-soft); margin: 6px 0;
@@ -380,32 +380,11 @@ body:has(.splitter.dragging) { user-select: none; }
 .empty { color: var(--muted); display: flex; align-items: center; justify-content: center; text-align: center; height: 100%; }
 .empty.pad { padding: 24px; }
 
-/* --- review ------------------------------------------------------------ */
-.review-bar {
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  padding-bottom: 10px; border-bottom: 1px solid var(--line); margin-bottom: 12px;
-  position: sticky; top: -12px; background: var(--bg); z-index: 2; padding-top: 12px; margin-top: -12px;
-}
+/* --- diff ---------------------------------------------------------------- */
 .warn-banner {
   border: 1px solid var(--warn); border-radius: var(--radius);
   padding: 8px 10px; margin-bottom: 12px; background: #241f14; font-size: 12px;
 }
-.review-feedback { margin-bottom: 12px; }
-.review-feedback textarea {
-  width: 100%; min-height: 44px; resize: vertical; box-sizing: border-box;
-  background: var(--bg); color: var(--text);
-  border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px;
-  font-family: inherit; font-size: 13px;
-}
-.review-feedback textarea:focus { outline: none; border-color: var(--accent); }
-.hunk { border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 12px; overflow: hidden; }
-.hunk.rejected { opacity: .5; }
-.hunk-head {
-  display: flex; align-items: center; gap: 8px;
-  padding: 7px 10px; background: var(--panel); cursor: pointer;
-  border-bottom: 1px solid var(--line);
-}
-.hunk-head:hover { background: var(--panel-2); }
 /* The diff reads like a code host's: numbers from both sides, the marker in
    its own column, and syntax colour on a tinted row rather than one flat
    green or red — the tint says what happened to the line, the colour still
@@ -440,10 +419,6 @@ body:has(.splitter.dragging) { user-select: none; }
    of overwriting it. */
 .word-add { background: var(--word-add); border-radius: 2px; }
 .word-del { background: var(--word-del); border-radius: 2px; }
-
-.hunk-stat { display: flex; gap: 6px; font-family: var(--mono); font-size: 11px; }
-.stat-add { color: var(--ok); }
-.stat-del { color: var(--bad); }
 
 /* --- trace / routing --------------------------------------------------- */
 .totals { display: flex; gap: 18px; padding-bottom: 10px; border-bottom: 1px solid var(--line); margin-bottom: 10px; }
@@ -533,6 +508,8 @@ button.primary:hover:not(:disabled) { filter: brightness(1.12); }
 button.danger { color: var(--bad); }
 button.ghost { background: transparent; border-color: transparent; color: var(--muted); padding: 2px 8px; }
 button.ghost:hover { color: var(--accent); border-color: var(--line); }
+
+.key-list { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }
 
 .tag {
   font-size: 10.5px; padding: 1px 8px; border-radius: 10px; white-space: nowrap;

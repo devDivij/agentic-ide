@@ -80,21 +80,90 @@ def test_the_catalogue_is_reported_without_ever_returning_a_key(client, monkeypa
 
 
 def test_a_key_can_be_set_and_is_never_read_back(client):
-    response = client.put("/api/providers/groq/key", headers=LOCAL,
-                          json={"apiKey": "sk-written"})
+    response = client.post("/api/providers/groq/keys", headers=LOCAL,
+                           json={"apiKey": "sk-written"})
     assert response.status_code == 200
     assert response.json()["configured"]["groq"] is True
+    assert response.json()["keyCount"]["groq"] == 1
 
     body = client.get("/api/providers", headers=LOCAL).json()
     assert "sk-written" not in json.dumps(body)
     # It really was persisted, 0600, where the runtime will find it.
-    assert settings_module.load_settings()["keys"]["groq"] == "sk-written"
+    assert settings_module.load_settings()["keys"]["groq"] == ["sk-written"]
     assert oct(settings_module.SETTINGS_PATH.stat().st_mode)[-3:] == "600"
 
 
+def test_a_second_key_adds_rather_than_replaces(client):
+    client.post("/api/providers/groq/keys", headers=LOCAL, json={"apiKey": "sk-1"})
+    client.post("/api/providers/groq/keys", headers=LOCAL, json={"apiKey": "sk-2"})
+    assert settings_module.load_settings()["keys"]["groq"] == ["sk-1", "sk-2"]
+
+    body = client.get("/api/providers", headers=LOCAL).json()
+    groq = next(p for p in body["providers"] if p["providerId"] == "groq")
+    assert groq["keyCount"] == 2
+
+
+def test_a_key_can_be_removed_by_position(client):
+    client.post("/api/providers/groq/keys", headers=LOCAL, json={"apiKey": "sk-1"})
+    client.post("/api/providers/groq/keys", headers=LOCAL, json={"apiKey": "sk-2"})
+    response = client.delete("/api/providers/groq/keys/0", headers=LOCAL)
+    assert response.status_code == 200
+    assert response.json()["keyCount"]["groq"] == 1
+    assert settings_module.load_settings()["keys"]["groq"] == ["sk-2"]
+
+
 def test_an_unknown_provider_is_a_clean_404(client):
-    assert client.put("/api/providers/nope/key", headers=LOCAL,
-                      json={"apiKey": "x"}).status_code == 404
+    assert client.post("/api/providers/nope/keys", headers=LOCAL,
+                       json={"apiKey": "x"}).status_code == 404
+
+
+def test_removing_an_out_of_range_key_is_a_clean_400(client):
+    client.post("/api/providers/groq/keys", headers=LOCAL, json={"apiKey": "sk-1"})
+    response = client.delete("/api/providers/groq/keys/5", headers=LOCAL)
+    assert response.status_code == 400
+    assert settings_module.load_settings()["keys"]["groq"] == ["sk-1"]
+
+
+def test_environment_keys_are_reported_but_not_removable(client, monkeypatch):
+    """
+    keyCount is the merged total (settings + env); removableKeyCount is
+    settings-file only, since remove_provider_key indexes into that list
+    alone. A UI that let you "remove" an env-sourced key by its position in
+    the merged list would silently no-op or delete the wrong one.
+    """
+    monkeypatch.setenv("GROQ_API_KEY", "env-key")
+    client.post("/api/providers/groq/keys", headers=LOCAL, json={"apiKey": "sk-settings"})
+
+    body = client.get("/api/providers", headers=LOCAL).json()
+    groq = next(p for p in body["providers"] if p["providerId"] == "groq")
+    assert groq["keyCount"] == 2
+    assert groq["removableKeyCount"] == 1
+
+    # Index 1 is the env key -- out of range on the settings-only list. A
+    # stale UI tab could still send this (see delete_provider_key's docstring
+    # note); it must fail loudly, not silently no-op.
+    response = client.delete("/api/providers/groq/keys/1", headers=LOCAL)
+    assert response.status_code == 400
+    assert settings_module.load_settings()["keys"]["groq"] == ["sk-settings"]
+
+
+def test_testing_a_provider_with_several_keys_reports_every_key(client, monkeypatch):
+    """An empty draft probes every configured key, not just the first."""
+    monkeypatch.setenv("GROQ_API_KEY", "k1")
+    client.post("/api/providers/groq/keys", headers=LOCAL, json={"apiKey": "k2"})
+
+    calls = []
+
+    def fake_probe(base_url, key):
+        calls.append(key)
+        return {"reachable": key != "k1", "detail": "reachable" if key != "k1" else "HTTP 401"}
+
+    monkeypatch.setattr(web_main, "_probe", fake_probe)
+    response = client.post("/api/providers/groq/test", headers=LOCAL, json={"apiKey": ""})
+    body = response.json()
+    assert len(calls) == 2
+    assert body["reachable"] is False          # one dead key must sink the overall result
+    assert "key 1" in body["detail"] and "key 2" in body["detail"]
 
 
 def test_a_corrupt_settings_file_does_not_stop_the_app(client):
@@ -395,19 +464,13 @@ def test_a_task_runs_and_its_write_waits_for_a_human(client, tmp_path, monkeypat
     _wait_for(lambda: (not session.is_running) or None)
     tasks = client.get("/api/tasks", headers=LOCAL, params={
         "projectRoot": str(tmp_path), "conversationId": conversation_id}).json()["tasks"]
-    assert len(tasks) == 1 and tasks[0]["status"] == "awaiting_review"
+    assert len(tasks) == 1 and tasks[0]["status"] == "done"
 
     # The trace is queryable after the fact -- same rows the live view streamed.
     trace = client.get(f"/api/tasks/{tasks[0]['id']}/trace", headers=LOCAL,
                        params={"projectRoot": str(tmp_path)}).json()
     assert [e["kind"] for e in trace["events"]][0] == "task_start"
     assert trace["totals"]["tokens"] > 0
-
-    # And the review screen has the diff, hunk by hunk.
-    review = client.get(f"/api/tasks/{tasks[0]['id']}/review", headers=LOCAL,
-                        params={"projectRoot": str(tmp_path)}).json()
-    assert len(review["hunks"]) == 1
-    assert review["hunks"][0]["file"] == "a.py"
 
 
 def test_revert_is_refused_while_a_task_is_running(client, tmp_path, monkeypatch):

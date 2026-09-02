@@ -184,8 +184,9 @@ def chat_complete(
     provider_id: str,
     model_id: str,
     messages: list[ChatMessage],
-    keys: dict[str, str],
+    keys: dict[str, list[str]],
     *,
+    key_index: int = 0,
     max_tokens: int | None = None,
     temperature: float | None = None,
     json: bool = False,
@@ -200,7 +201,11 @@ def chat_complete(
 
     headers = {"Content-Type": "application/json"}
     if provider.key_env:
-        key = keys.get(provider_id)
+        # `key_index` is router.pick()'s choice of which of this provider's
+        # keys to use (see Router._select_key) -- the caller (call.py,
+        # workers.py) passes the route's own key_index straight through.
+        key_list = keys.get(provider_id) or []
+        key = key_list[key_index] if key_index < len(key_list) else None
         if not key:
             raise ValueError(f"No API key configured for {provider.label}")
         headers["Authorization"] = f"Bearer {key}"

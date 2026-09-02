@@ -33,7 +33,7 @@ export function Chat({
   projectRoot, conversationId, conversations, onSelectConversation,
   onRenameConversation,
   task, steps, trace, logs, approvals, asides, history, running,
-  onSubmit, onBytheway, onResume, onStop, onApprove, onReview, onRevert, draft, setDraft,
+  onSubmit, onBytheway, onResume, onStop, onApprove, onRevert, draft, setDraft,
   pins, onRemovePin, onTogglePin, onClearPins,
 }: {
   projectRoot: string;
@@ -56,7 +56,6 @@ export function Chat({
   onResume: (taskId: string) => void;
   onStop: (taskId: string) => void;
   onApprove: (eventId: number, approved: boolean, feedback?: string) => void;
-  onReview: (taskId: string) => void;
   /**
    * Unlike the other actions, this one resolves: nothing streams a follow-up
    * for a revert the way a resume does, so this component has to know when
@@ -117,7 +116,6 @@ export function Chat({
   const actions: TaskActions = {
     onApprove,
     onStop,
-    onReview,
     onResume,
     onRevert: handleRevert,
     onRetry: focusComposer,

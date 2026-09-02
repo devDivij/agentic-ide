@@ -45,8 +45,6 @@ export interface ChatTask {
 export interface TaskActions {
   /** `feedback` is optional guidance, passed on whether or not it was allowed. */
   onApprove: (eventId: number, approved: boolean, feedback?: string) => void;
-  /** Which task's diff to open the Review tab on -- there is no other way to say. */
-  onReview: (taskId: string) => void;
   onResume: (taskId: string) => void;
   onRetry: (prompt: string) => void;
   onAsk: (prompt: string) => void;
@@ -130,10 +128,10 @@ export function TaskEntry({
   const elapsed = running ? Date.now() - task.createdAt : task.elapsedMs;
 
   // TRIAGE's chat lane (orchestrator.ts, mode === 'chat'): finished with no
-  // plan at all. `status === 'done'` reached directly (not via HITL accept)
-  // combines with zero steps only on this path — a task-mode run is always
-  // 'awaiting_review' first, and PlanSchema forbids an empty step list — so
-  // this pair is a safe, if implicit, signal without a dedicated wire field.
+  // plan at all. `status === 'done'` combines with zero steps only on this
+  // path — a task-mode run always has at least one step (PlanSchema forbids
+  // an empty step list) — so this pair is a safe, if implicit, signal
+  // without a dedicated wire field.
   // Rendered like a plain conversation turn: no status chip, no step list,
   // no outcome box with buttons that only make sense for a considered edit.
   if (task.status === 'done' && task.steps.length === 0) {
@@ -217,16 +215,6 @@ export function TaskEntry({
             <span>{task.stepsDone}/{task.stepsTotal} steps</span>
           )}
         </div>
-
-        {/* Only offer the Review pane when there is something in it. A task
-            can complete every step and change nothing — the agent judging
-            that the requested change is already present is a real outcome,
-            and sending someone to review an empty diff reads as a bug. */}
-        {task.status === 'awaiting_review' && end?.changedFiles !== 0 && (
-          <button className="primary" onClick={() => actions.onReview(task.id)}>
-            Review the changes →
-          </button>
-        )}
 
         {/* Every finished task states how it ended, not just the bad ones. */}
         {end && (
@@ -384,14 +372,6 @@ function Outcome({
         {task.resumable && (
           <button className="primary" onClick={() => actions.onResume(task.id)}>
             Resume
-          </button>
-        )}
-        {/* Never offer a review of nothing: changedFiles === 0 is a definite
-            "the diff is empty", while undefined means an older task that
-            never reported it, where offering is the safer guess. */}
-        {end.stepsCompleted > 0 && end.changedFiles !== 0 && (
-          <button onClick={() => actions.onReview(task.id)}>
-            {end.status === 'awaiting_review' ? 'Review the changes' : 'Review partial changes'}
           </button>
         )}
         {task.prompt && (

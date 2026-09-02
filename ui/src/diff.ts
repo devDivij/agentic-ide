@@ -1,21 +1,16 @@
 /**
- * Turning a unified diff hunk into the rows a review screen renders.
- *
- * The server already splits a task's changes into hunks (see
- * `server/agentzero/web/review.py`); this is the other half — what a hunk looks
- * like once a person has to read it. Three things a raw `+`/`-` dump does
- * not give you, and that reading a diff actually depends on:
+ * Turning two whole texts into the rows the approval prompt renders as a
+ * diff. Three things a raw `+`/`-` dump does not give you, and that reading a
+ * diff actually depends on:
  *
  *   1. **Line numbers on both sides.** "It broke at line 240" is unanswerable
- *      from a patch body; the `@@ -a,b +c,d @@` header holds the answer and
- *      nothing was decoding it.
+ *      from a patch body; a line-level diff holds the answer and nothing was
+ *      decoding it.
  *   2. **The marker out of the text.** `+  const x = 1` is not a line of
  *      code, and feeding it to a syntax highlighter tokenises the `+` as an
  *      operator. The marker belongs in the gutter; `text` here is the line.
  *   3. **What changed *within* a line.** A one-character edit and a rewritten
  *      line look identical when both are a red row above a green one.
- *
- * Pure string logic, no DOM: `server/test/agent.test.ts` imports it directly.
  */
 
 import { highlight, type Token } from './highlight.ts';
@@ -41,8 +36,6 @@ export interface DiffRow {
   changed: Range[];
 }
 
-const HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
-
 // ---------------------------------------------------------------------------
 // Diffing two whole files (before a write ever happens)
 // ---------------------------------------------------------------------------
@@ -51,10 +44,9 @@ const HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
  * A line-level diff between two full texts.
  *
  * This exists for the approval prompt: `write_file` proposes a complete
- * replacement file *before* anything lands on disk, so there is no git
- * checkpoint pair to ask the server for a hunk from (that machinery, in
- * `server/agentzero/web/review.py`, only exists after the fact). The comparison has
- * to happen here, client-side, against whatever is on disk right now.
+ * replacement file *before* anything lands on disk, so there is no shadow-repo
+ * checkpoint pair to diff yet -- the comparison has to happen here,
+ * client-side, against whatever is on disk right now.
  *
  * `oldText === null` means the file does not exist yet — a create, not an
  * edit — and every line is shown as added with no diffing to do.
@@ -169,47 +161,6 @@ function myersDiff(a: string[], b: string[]): EditOp[] {
     }
   }
   return ops.reverse();
-}
-
-/**
- * Parse one hunk body into rows.
- *
- * Tolerant in the same way the server's parser is: an unexpected line becomes
- * a `meta` row rather than throwing, because one odd line must not be able to
- * make a whole review unreadable.
- */
-export function parseHunk(patch: string): DiffRow[] {
-  const rows: DiffRow[] = [];
-  let oldNo = 0;
-  let newNo = 0;
-
-  for (const line of patch.split('\n')) {
-    const header = HEADER.exec(line);
-    if (header) {
-      oldNo = Number(header[1]);
-      newNo = Number(header[3]);
-      rows.push({ kind: 'meta', oldNo: null, newNo: null, text: line, changed: [] });
-      continue;
-    }
-    const marker = line[0];
-    if (marker === '+') {
-      rows.push({ kind: 'add', oldNo: null, newNo: newNo++, text: line.slice(1), changed: [] });
-    } else if (marker === '-') {
-      rows.push({ kind: 'del', oldNo: oldNo++, newNo: null, text: line.slice(1), changed: [] });
-    } else if (marker === '\\') {
-      // "\ No newline at end of file" — git's note about the line above, not
-      // a line of the file. It numbers nothing.
-      rows.push({ kind: 'meta', oldNo: null, newNo: null, text: line, changed: [] });
-    } else {
-      // A context line, including the empty string git writes for a blank one.
-      rows.push({
-        kind: 'ctx', oldNo: oldNo++, newNo: newNo++,
-        text: marker === ' ' ? line.slice(1) : line, changed: [],
-      });
-    }
-  }
-
-  return markWordChanges(rows);
 }
 
 // ---------------------------------------------------------------------------

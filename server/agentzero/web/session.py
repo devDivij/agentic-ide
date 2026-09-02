@@ -158,6 +158,7 @@ class Session:
             "runnersUp": [r.wire() for r in decision.runners_up],
             "estimatedCostUsd": decision.estimated_cost_usd,
             "waitedMs": decision.waited_ms,
+            "keyIndex": decision.key_index,
         }})
 
     # -- approvals -------------------------------------------------------------

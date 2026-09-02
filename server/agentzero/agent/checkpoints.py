@@ -10,7 +10,7 @@ the real project:
 
 Consequences: the project need not be a git repo at all; the user's .git,
 index and branches are never opened; no remote, account, or network is
-involved. And the review diff has the right baseline -- `base..head` is
+involved. And the task's own diff has the right baseline -- `base..head` is
 exactly what the agent changed during this task, excluding whatever the user
 already had dirty in their tree.
 
@@ -28,10 +28,7 @@ from pathlib import Path
 # git identity, commit signing enabled, background gc, user hooks -- and, on
 # Windows, git's default line-ending rewriting, which would report every line
 # of every file as changed and bury the agent's actual diff.
-#
-# Public because the review screen re-enters the same shadow repo
-# (web/review.py); two copies of this list would drift.
-SHADOW_GIT_CONFIG = [
+_SHADOW_GIT_CONFIG = [
     "-c", "user.name=Agent Zero",
     "-c", "user.email=agent@localhost",
     "-c", "commit.gpgsign=false",
@@ -80,7 +77,8 @@ class Checkpoints:
             self._git(["read-tree", "-u", "--reset", sha])
 
     def diff(self, from_sha: str, to_sha: str) -> str:
-        """Unified diff between two checkpoints -- the artifact the review screen shows."""
+        """Unified diff between two checkpoints -- fed to the automated batch
+        review and the task's closing report."""
         return self._git(
             ["diff", "--no-color", "--unified=3", from_sha, to_sha]).stdout
 
@@ -94,7 +92,7 @@ class Checkpoints:
         location = [] if bare else [
             "--git-dir", self.git_dir, "--work-tree", self.project_root]
         return subprocess.run(
-            ["git", *SHADOW_GIT_CONFIG, *location, *args],
+            ["git", *_SHADOW_GIT_CONFIG, *location, *args],
             cwd=self.project_root, capture_output=True, text=True, check=True)
 
 

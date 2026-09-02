@@ -186,7 +186,7 @@ def test_max_wait_ms_zero_raises_instead_of_sleeping():
     this test is actually about (groq busy, nothing else ready).
     """
     router = Router(configured={"groq"})
-    router._buckets["groq"].penalize(50_000)
+    router.penalize("groq", 0, 50_000)
     with pytest.raises(NoUsableModelError, match="rate-limited for more than 0s"):
         router.pick("classify", 100, max_wait_ms=0, exclude=_OLLAMA_CANDIDATES)
 
@@ -194,3 +194,37 @@ def test_max_wait_ms_zero_raises_instead_of_sleeping():
 def test_snapshot_covers_every_provider():
     from agentzero.agent.providers import PROVIDERS
     assert set(Router(configured=set()).snapshot()) == {p.id for p in PROVIDERS}
+
+
+# -- multiple keys per provider -----------------------------------------------
+
+
+def test_a_second_key_is_used_once_the_first_is_penalized():
+    router = Router.from_keys({"groq": ["k1", "k2"]})
+    first = router.pick("classify", 100, exclude=_OLLAMA_CANDIDATES)
+    assert first.key_index == 0
+    router.penalize("groq", 0, 50_000)
+    second = router.pick("classify", 100, exclude=_OLLAMA_CANDIDATES)
+    assert second.key_index == 1
+    assert "key 2/2" in second.reason
+
+
+def test_keys_rotate_least_recently_used_first():
+    """Neither key is ever picked twice before the other has had a turn."""
+    router = Router.from_keys({"groq": ["k1", "k2", "k3"]})
+    picked = [router.pick("classify", 100, exclude=_OLLAMA_CANDIDATES).key_index
+              for _ in range(6)]
+    assert picked == [0, 1, 2, 0, 1, 2]
+
+
+def test_a_provider_with_no_keys_configured_is_unusable_even_via_from_keys():
+    router = Router.from_keys({"groq": []})
+    assert "groq" not in router.configured
+
+
+def test_penalizing_one_key_does_not_penalize_its_sibling():
+    router = Router.from_keys({"groq": ["k1", "k2"]})
+    router.penalize("groq", 0, 50_000)
+    decision = router.pick("classify", 100, max_wait_ms=0, exclude=_OLLAMA_CANDIDATES)
+    assert decision.provider_id == "groq"
+    assert decision.key_index == 1

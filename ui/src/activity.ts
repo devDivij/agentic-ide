@@ -104,8 +104,8 @@ export function stepsFromTrace(nodes: TraceNode[]): StepWire[] {
   for (const node of nodes) {
     // A revert (checkpoint action:'revert') doesn't touch step_start/step_end
     // history -- those already-recorded events stay true accounts of what
-    // happened. It marks the AFFECTED steps 'pending' again on top, same as
-    // a rejected review hunk requeuing one. This has to run in the SAME
+    // happened. It marks the AFFECTED steps 'pending' again on top. This has
+    // to run in the SAME
     // ordered pass as step_start/step_end below, not a separate loop after
     // it: a later resume re-completing a reverted step writes a fresh
     // step_end AFTER this event's seq, and a second loop would blindly
