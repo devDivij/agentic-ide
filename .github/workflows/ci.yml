@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  # Linux is the verified path. Windows and macOS setup is documented in
+  # docs/setup.md but is NOT yet covered here -- server/scripts/setup.mjs
+  # creates a venv and pip-installs, and that has not been exercised on a
+  # Windows runner. Adding those to the matrix is a good first contribution;
+  # expect to fix setup.mjs rather than the workflow.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # `npm install` runs server/scripts/setup.mjs via postinstall, which
+      # creates server/.venv and installs the Python runtime into it.
+      - run: npm install
+
+      # The suite isolates itself from provider keys and `.env`, so this is
+      # the same run a developer with keys configured gets locally.
+      - run: npm test
+
+      - run: npm run typecheck
+
+      - run: npm run build

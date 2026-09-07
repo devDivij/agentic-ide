@@ -11,13 +11,41 @@ Models are used to fill specific roles (e.g., planning, coding, reviewing), but 
 The entire task lifecycle runs synchronously through this structured pipeline:
 `classify -> retrieve -> plan -> per step: [ retrieve, execute turns, verify, checkpoint | revert ] -> final diff -> human review`
 
-Because the loop structure is hardcoded in the [orchestrator engine](file:///C:/Users/bhara/agentic-ide/server/agentzero/agent/orchestrator.py), a model cannot "go rogue" or spawn agents endlessly. The system is unrepresentable as an infinite recursion.
+```mermaid
+flowchart TD
+    P([Prompt]) --> C{Classify}
+    C -->|chat| X1[Answer]
+    C -->|lookup| X2[Read-only answer]
+    C -->|micro-edit| X3[One edit, no plan]
+    C -->|task| RT[Retrieve]
+    RT --> PL[Plan]
+    PL --> ST[/Next pending step/]
+    ST --> SR[Retrieve for this step]
+    SR --> EX[Execute turns]
+    EX --> VF{Verify}
+    VF -->|pass| CP[Checkpoint]
+    VF -->|fail| DG{Diagnose}
+    DG -->|mechanical| EX
+    DG -->|approach| RB[Revert + purge] --> PL
+    CP --> RW{Every 3 steps}
+    RW -->|drift| RB
+    RW -->|clean| ST
+    ST -->|plan done| F([Final diff])
+    style P fill:#1f2937,color:#fff
+    style F fill:#065f46,color:#fff
+    style RB fill:#7f1d1d,color:#fff
+```
+
+Because the loop structure is hardcoded in
+[`orchestrator.py`](../server/agentzero/agent/orchestrator.py), no model output
+can add a stage, skip verification, or spawn another agent. There is no code
+path by which the system recurses.
 
 ---
 
 ## 2. Triage Classification (The Front Door)
 
-Before launching a full planning cycle, every prompt passes through a fast classification step (handled in [workers.py](file:///C:/Users/bhara/agentic-ide/server/agentzero/agent/workers.py)) to determine its intent:
+Before launching a full planning cycle, every prompt passes through a fast classification step (handled in [workers.py](../server/agentzero/agent/workers.py)) to determine its intent:
 - **Chat:** A greeting or clarification (e.g., "hi", "thanks") that needs no file changes.
 - **Lookup:** A read-only question about the codebase (e.g., "where is the auth logic?").
 - **Micro-edit:** A trivial, single-file change (e.g., "fix this typo") that can bypass the planner entirely.
@@ -63,7 +91,19 @@ If verification fails, the orchestrator diagnoses the failure. To save time and 
 
 ## 6. Backtracking, Reverting, and Replanning
 
-When a step fails, the system does not blindly retry the same action over and over. It responds based on a hardcoded **Failure Taxonomy**.
+When a step fails, the system does not blindly retry the same action over and over. It responds based on a hardcoded **Failure Taxonomy** (`TAXONOMY` in `orchestrator.py`), which maps each failure class to one of three responses:
+
+```mermaid
+flowchart LR
+    F([Step failed]) --> K{Failure class}
+    K -->|test_failure<br/>malformed_output| R["**retry** — fail forward<br/>keep the tree, hand over logs,<br/>forbid the same approach"]
+    K -->|stuck loop<br/>turn limit<br/>repeated retry failure| V["**revert** — backtrack<br/>roll tree to pre-step snapshot,<br/>purge the step's facts, replan"]
+    K -->|budget exhausted<br/>unrecoverable| A["**abort** — stop cleanly<br/>emit the partial diff"]
+    R --> E[Execute again]
+    V --> PL[Replan<br/>max 2 per task]
+    style F fill:#7f1d1d,color:#fff
+    style A fill:#78350f,color:#fff
+```
 
 - **Fail Forward (Retry):** If the failure was a mechanical error (e.g., `test_failure` or `malformed_output`), the agent is given the error logs, told not to repeat the previous approach, and asked to fix the code. The tree is NOT reverted, allowing the agent to read its own broken code and fix it.
 - **Backtrack (Revert & Replan):** If the failure represents a flawed approach (e.g., the model got stuck in a loop, ran out of turns, or couldn't fix the tests after multiple retries), the orchestrator recognizes that retrying is futile. 
@@ -86,6 +126,13 @@ After every 3 completed steps, and once at the very end of the task, a review ag
 
 ---
 
+![The trace call tree with per-node tokens and timings](images/trace.png)
+
+*Each model and tool call nests under the step that caused it. The `error → route`
+pairs are providers failing and the router moving on without losing the step.*
+
+---
+
 ## 8. Persistence and Resuming
 
 A complex task might span longer than a single session. What if the user closes the IDE or a crash happens?
@@ -97,4 +144,15 @@ If interrupted, the task can be fully resumed exactly where it left off, picking
 
 ## Summary
 
-The orchestration pipeline ensures that small models are actively managed, monitored, and course-corrected. By rigidly structuring task decomposition, isolating context, mechanically verifying outputs, and employing robust failsafes to detect loops and trigger intelligent rollbacks, the system consistently delivers multi-step coding solutions without endless retries or runaway costs.
+Small models are managed rather than trusted: the loop decomposes the task,
+hands each step only its own context, verifies mechanically before accepting a
+"done", and distinguishes a failure worth retrying from one worth undoing.
+
+**Trade-offs worth stating.** Steps run strictly sequentially. Parallel execution
+would cut wall-clock time on independent steps, and was rejected because
+concurrent edits to one tree produce conflicts the agent then has to reason
+about, and because parallel calls burn free-tier rate limits several times
+faster — the router's headroom logic assumes one in-flight call per task. The
+budgets (12 turns, 4 explore, 2 replans, review every 3 steps) are tuned
+constants, not derived ones; they are the numbers that stopped runaway tasks in
+practice, and they live at the top of `orchestrator.py` to be adjusted.

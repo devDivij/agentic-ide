@@ -16,13 +16,13 @@ This process evaluates four primary factors:
 3. **Provider Rate Limits:** Has the provider's free tier been exhausted?
 4. **Cost vs. Time:** Is it better to wait for a free rate limit to reset, or pay a fraction of a cent to continue immediately?
 
-These decisions are calculated and executed in [the routing engine](file:///C:/Users/bhara/agentic-ide/server/agentzero/agent/router.py).
+These decisions are calculated and executed in [the routing engine](../server/agentzero/agent/router.py).
 
 ---
 
 ## 2. Model Constraints and the Catalogue
 
-Before any routing decision can be made, the system strictly enforces the hardware and cost limitations. The catalogue of available models, defined in the [providers configuration](file:///C:/Users/bhara/agentic-ide/server/agentzero/agent/providers.py), acts as the source of truth for the router.
+Before any routing decision can be made, the system strictly enforces the hardware and cost limitations. The catalogue of available models, defined in the [providers configuration](../server/agentzero/agent/providers.py), acts as the source of truth for the router.
 
 ### Parameter Limits
 Every model integrated into the system is strictly capped at a total parameter count of **80B or less**. This is rigorously enforced at startup; the system will refuse to run if a non-compliant model is detected. Each model entry cites its parameter count to ensure compliance.
@@ -56,7 +56,26 @@ The ranking order evaluates the following:
 
 In a multi-agent system, rate limits are hit frequently. The router is designed to handle these gracefully without losing task progress, looping endlessly, or crashing.
 
-The system uses intelligent [rate buckets](file:///C:/Users/bhara/agentic-ide/server/agentzero/agent/router.py) to predict whether a call will fit a provider's limits *before* making the call and triggering a `429 Too Many Requests` error. It tracks requests per minute, tokens per minute, requests per day, and tokens per day.
+The system uses intelligent [rate buckets](../server/agentzero/agent/router.py) to predict whether a call will fit a provider's limits *before* making the call and triggering a `429 Too Many Requests` error. It tracks requests per minute, tokens per minute, requests per day, and tokens per day.
+
+```mermaid
+sequenceDiagram
+    participant O as Orchestrator
+    participant R as Router
+    participant G as Groq (free, fast)
+    participant N as NVIDIA (free)
+    participant L as Ollama (local floor)
+
+    O->>R: call(role=execute, tokens=6k)
+    R->>R: rank candidates, check rate buckets
+    R->>G: request
+    G-->>R: 429 / no headroom
+    Note over R: bucket marked exhausted<br/>until reset — no retry loop
+    R->>N: next-ranked candidate
+    N-->>R: 200 OK
+    R-->>O: result + reason:<br/>Groq TPM exhausted, NVIDIA has headroom
+    Note over O: task progress never rewound —<br/>the step's turn continues
+```
 
 ### The Fallback Process
 If the top-ranked model is currently rate-limited, the router doesn't just fail. It smoothly evaluates the next best candidate. For instance, Groq provides incredibly fast models, but its token-per-minute ceiling is low. When Groq hits its limit, the router seamlessly hands off the workload to another provider (like NVIDIA or a local model) without skipping a beat.
@@ -76,6 +95,13 @@ The rule states that **$1 of spend is roughly equivalent to 16,340 seconds of wa
 When all free models are busy, the router calculates the cost of using the cheapest paid overflow model. If the cost of the paid API is less than the value of the time spent waiting for the free tier to reset, the system will spend the money to keep the task moving. If paying is too expensive relative to a very short wait, the router will deliberately sleep the process until the free rate limit clears. 
 
 This ensures that token costs are kept incredibly low while minimizing unnecessary execution time.
+
+---
+
+![Live routing decisions with reasons and runners-up](images/routing.png)
+
+*Every decision names the model, the role it was chosen for, the reason, which key
+of the provider's pool was used, and the runners-up it beat.*
 
 ---
 
@@ -101,4 +127,16 @@ Because rate limits are tracked per provider, supplying multiple API keys across
 
 ## Summary
 
-This routing architecture completely shifts the paradigm from a static "one-model-fits-all" approach to a hyper-dynamic, context-aware engine. By intelligently evaluating task complexity, context windows, real-time rate limits, and a strict cost-vs-time mathematical formula, the system extracts the absolute maximum performance out of small, open-weight models while keeping costs negligible and execution times fast. It handles failures gracefully, never loses task progress, and operates with 100% transparency.
+The router replaces a static model choice with a per-prompt decision over role,
+difficulty, context size, live rate-limit headroom, and a cost-vs-time exchange
+rate derived from the scoring weights. Every decision carries the reason it was
+made, and a rate limit or a dead endpoint costs a fallback rather than the task.
+
+**Trade-offs worth stating.** Ranking is a hand-written comparator over static
+catalogue metadata (Elo, SWE-bench, TPS, price) — not a learned policy. It is
+deterministic, debuggable, and explains itself in one line, but it cannot adapt
+to a model that is having a bad day; the metadata has to be updated by hand when
+a provider changes its lineup. Rate-limit prediction is likewise optimistic: it
+estimates output at `ASSUMED_OUTPUT_TOKENS` (800) before the call, so a run of
+unusually long completions can still draw a `429`, which is handled as a normal
+fallback rather than being prevented.

@@ -8,7 +8,7 @@ To solve this, our IDE completely abandons the concept of a rolling conversation
 
 ## 1. No Rolling Transcripts: Durable Memory
 
-There is no persistent conversational text log fed back into the model. Instead, every single time the orchestrator calls a model, the [context builder](file:///C:/Users/bhara/agentic-ide/server/agentzero/agent/context.py) constructs the prompt completely fresh.
+There is no persistent conversational text log fed back into the model. Instead, every single time the orchestrator calls a model, the [context builder](../server/agentzero/agent/context.py) constructs the prompt completely fresh.
 
 All state—the plan, the current step, live facts, retrieved code, and task outcomes—lives in a local SQLite database. This "stateless" context assembly provides massive benefits for **Long-Horizon, Multi-Session Tasks**:
 - **Crash Resilience:** If a model call times out, the IDE is closed, or a rate limit halts execution, the task doesn't die. Because state lives on disk, the system simply re-reads the database and resumes exactly where it left off.
@@ -21,6 +21,21 @@ All state—the plan, the current step, live facts, retrieved code, and task out
 Even without a transcript, a long task can accumulate too many retrieved code chunks and facts. The system must autonomously compress the context to avoid crashing into the model's token limit.
 
 When the built context approaches the safe token ceiling (a conservative fraction of the model's actual context window), the system triggers **Automatic Compaction**.
+
+```mermaid
+flowchart TD
+    B[Build context fresh<br/>from SQLite] --> S{"Over the safe token ceiling?<br/>WINDOW_FRACTION = 0.6"}
+    S -->|no| SEND([Send to model])
+    S -->|yes| E[Evict: lowest tier first,<br/>least lexically relevant<br/>within the tier]
+    E --> T3[3· Past step outcomes]
+    T3 --> T2[2· Retrieved code chunks]
+    T2 --> T1[1· Extracted facts]
+    T1 --> T0["0· **pinned** — never evicted:<br/>original request, AGENTS.md,<br/>plan, current step, user pins"]
+    T0 -.->|line never crossed| SEND
+    E -.->|under ceiling| SEND
+    style T0 fill:#065f46,color:#fff
+    style SEND fill:#1f2937,color:#fff
+```
 
 ### The Compaction Strategy
 Compaction does not rely on LLM summarization. Summarizing past events leads to the model "misremembering" crucial details later. Instead, the system uses a strict **Eviction Protocol**:
@@ -45,6 +60,8 @@ While the automated retrieval pipeline is highly effective, the developer always
 
 ---
 
+---
+
 ## 4. The `/bytheway` Command
 
 During a complex, long-running task, a developer will often have a sudden, unrelated question (e.g., *"Wait, how do I install this specific package?"*). 
@@ -57,4 +74,14 @@ To handle this, the IDE includes the `/bytheway` command. When a user prefixes a
 
 ## Summary
 
-By abandoning the standard rolling transcript in favor of a stateless, DB-backed context builder, the system achieves true long-horizon resilience. Through intelligent, lexical compaction and strict eviction tiers, it avoids context crashes without ever misremembering past steps. Finally, manual tagging and the `/bytheway` command give the developer surgical control over exactly what the model sees at any given moment.
+Dropping the rolling transcript for a DB-backed builder is what makes a task
+survive a crash, and what stops the model reading its own earlier mistakes back
+as fact. Eviction is lexical and tiered rather than summarised, so a dropped
+block can be restored verbatim rather than recalled approximately.
+
+**Trade-offs worth stating.** Lexical relevance scoring is cheap and has no
+failure mode, but it is bag-of-words: a block that matters for reasons the
+step's wording does not mention can be evicted, and only returns when a later
+step names it. Rebuilding context from scratch on every call also re-sends
+tokens a conversation-based agent would have cached — the cost of never
+misremembering is paying for the same plan text more than once.

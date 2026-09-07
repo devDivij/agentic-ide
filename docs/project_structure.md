@@ -4,6 +4,45 @@ This document serves as a high-level map of the codebase, explaining how the dif
 
 The project is broadly split into two halves: a robust Python backend (`server/agentzero`) that handles orchestration, reasoning, and file interactions, and a reactive TypeScript/React frontend (`ui/`) that serves as the developer interface.
 
+```mermaid
+flowchart TB
+    subgraph UI["ui/ — React + Vite"]
+        CH[Chat] --- FI[Files] --- TL[Timeline]
+        RO[Routing] --- TR[Trace] --- SE[Settings]
+    end
+
+    subgraph WEB["server/agentzero/web/ — FastAPI"]
+        MA[main.py<br/>routes] --- EV[events.py<br/>SSE stream]
+        RV[revert.py] --- ST2[settings.py] --- SS[session.py]
+    end
+
+    subgraph CORE["server/agentzero/agent/ — the engine"]
+        OR[orchestrator.py<br/>the loop]
+        OR --> WK[workers.py<br/>roles + prompts]
+        OR --> RT[retrieval.py<br/>code graph]
+        OR --> CX[context.py<br/>builder + eviction]
+        OR --> VE[verify.py]
+        OR --> TO[tools.py]
+        OR --> CK[checkpoints.py<br/>shadow git]
+        WK --> RR[router.py] --> PR[providers.py]
+        RR --> CL[call.py / llm.py]
+        TO --> SH[shell.py / paths.py]
+    end
+
+    DB[(SQLite<br/>store.py)]
+    TS["shared/types.ts<br/>wire contract"]
+
+    UI <-->|HTTP + SSE| WEB
+    WEB --> CORE
+    OR <--> DB
+    TS -.mirrored by.-> CORE
+    TS -.type-only import.-> UI
+
+    style OR fill:#1f2937,color:#fff
+    style DB fill:#065f46,color:#fff
+    style TS fill:#78350f,color:#fff
+```
+
 ---
 
 ## 1. Backend (`server/agentzero`)

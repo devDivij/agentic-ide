@@ -48,9 +48,6 @@ from .types import (
 )
 
 SCHEMA = """
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-
 -- A chat: the thread of tasks a person thinks of as one conversation.
 -- Rows are created by the first task sent into them, so an abandoned
 -- "New chat" leaves nothing here.
@@ -135,6 +132,19 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, seq);
 """
 
+#: Bumped whenever SCHEMA or `_migrate` changes. `Store.__init__` compares it
+#: against the file's `PRAGMA user_version` and only runs the schema and the
+#: migration when they differ, so the common case -- opening a database this
+#: build already created -- takes no write lock at all. A database written
+#: before this marker existed reads as 0 and is migrated exactly as before.
+SCHEMA_VERSION = 1
+
+#: How long a statement waits for another connection's lock before giving up.
+#: The web host opens a Store per request while a task's loop is writing from
+#: a worker thread, so brief contention is normal and must block rather than
+#: raise. Five seconds (Python's default) is not enough under a slow write.
+BUSY_TIMEOUT_MS = 15_000
+
 DEAD_BUDGET_COLUMNS = (
     "budget_usd", "budget_seconds", "budget_tokens", "budget_steps",
     "budget_retries",
@@ -186,8 +196,85 @@ class Store:
         )
         self.db.row_factory = sqlite3.Row
         with self._lock:
+            self._configure_connection()
+            # Opening a database this build already wrote is a pure read: no
+            # DDL, no write lock, nothing for a concurrently running task to
+            # contend with. Only a new or older file pays for the schema.
+            if self._schema_version() != SCHEMA_VERSION:
+                self._upgrade(project_root)
+
+    def _upgrade(self, project_root: str) -> None:
+        """
+        Bring the file up to `SCHEMA_VERSION`, taking the only write lock a
+        `Store()` ever needs.
+
+        Whether being unable to take that lock is fatal depends on what is
+        already in the file, and the two cases want opposite timeouts:
+
+          - **No tables yet.** There is no store to hand back, so wait the full
+            busy timeout and let the error out if it still fails.
+          - **Tables already there.** The file is usable exactly as it stands;
+            all that is missing is the version stamp (and, for a genuinely old
+            file, a migration). Blocking an HTTP request for fifteen seconds to
+            write a bookkeeping row is worse than doing nothing, so try briefly
+            and leave it for the next uncontended open.
+        """
+        fresh = not self._has_core_tables()
+        if not fresh:
+            self.db.execute("PRAGMA busy_timeout = 250")
+        try:
             self.db.executescript(SCHEMA)
             self._migrate(project_root)
+            self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        except sqlite3.OperationalError:
+            if fresh:
+                raise
+        finally:
+            if not fresh:
+                self.db.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+
+    def _configure_connection(self) -> None:
+        """
+        Per-connection settings, applied on every open.
+
+        `foreign_keys` is per-connection state, not a property of the file, so
+        it has to be set here rather than in SCHEMA -- skipping the schema for
+        an up-to-date database must not quietly turn constraint enforcement
+        off.
+
+        `journal_mode` is the opposite: it IS a property of the file and
+        persists, but *changing* it takes an exclusive lock. Running
+        `PRAGMA journal_mode = WAL` unconditionally on every open meant any
+        reader holding a transaction made the next `Store()` fail with
+        "database is locked" -- which, since the web host builds a Store per
+        request, surfaced as a 500 on an otherwise healthy server. Reading the
+        mode first costs nothing and only writes when it actually differs.
+        """
+        self.db.execute("PRAGMA foreign_keys = ON")
+        mode = self.db.execute("PRAGMA journal_mode").fetchone()[0]
+        if str(mode).lower() != "wal":
+            # Converting an existing file to WAL needs exclusive access, which
+            # a live reader denies. WAL is a concurrency optimisation, not a
+            # correctness requirement -- the store is perfectly usable in the
+            # rollback journal mode -- so a busy database must not stop us
+            # opening it. Try briefly, give up quietly, convert on a later
+            # uncontended open. Without the short timeout this would block the
+            # caller for the full BUSY_TIMEOUT_MS before failing anyway.
+            self.db.execute("PRAGMA busy_timeout = 250")
+            try:
+                self.db.execute("PRAGMA journal_mode = WAL")
+            except sqlite3.OperationalError:
+                pass
+        self.db.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+
+    def _schema_version(self) -> int:
+        return int(self.db.execute("PRAGMA user_version").fetchone()[0])
+
+    def _has_core_tables(self) -> bool:
+        row = self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'"
+        ).fetchone()
+        return row is not None
 
     def close(self) -> None:
         with self._lock:

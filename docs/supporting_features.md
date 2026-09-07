@@ -1,44 +1,122 @@
-# Agentic IDE: Supporting Features
+# Supporting Features
 
-While robust orchestration, retrieval, and context management form the core of the Agentic IDE, several supporting features elevate the system from a basic autonomous script to a safe, controllable, and highly capable pair-programmer. 
-
-These features give the developer precise control over what the agent sees, what it can do, and how its work is finalized.
+Orchestration, retrieval and context management are the core. These are the
+features around them that decide what the agent can see, what it is allowed to
+do, and how its work gets undone when it goes wrong.
 
 ---
 
 ## 1. Manual Context Control
 
-Even the smartest automated retrieval pipeline cannot read a developer's mind. The IDE provides granular tools for manual context management, ensuring the developer can easily steer the model.
+Automated retrieval cannot read the developer's mind, so context is also
+steerable by hand.
 
-- **Clickable File and Line Tags:** Users can effortlessly add or remove files and specific code blocks from the active context. Both the input box and the output chat support clickable tags (e.g., `@path/to/file.py:10-20`). Clicking these tags pins the exact code block into the agent's memory.
-- **The `/bytheway` Command:** Often, a developer needs to ask a quick, isolated question (e.g., "What does this regex do?") without confusing the ongoing task's context. The `/bytheway` command intercepts the prompt, isolates it completely from the current task's memory, answers it cleanly, and then seamlessly returns the developer to their original task context.
-
-*(For deep technical details on how context pinning survives eviction, see the [Context Handling documentation](file:///C:/Users/bhara/agentic-ide/docs/context_handling.md))*
-
----
-
-## 2. Autonomy with Safety (Terminal, File, and Web)
-
-The agent possesses significant autonomy, equipped with a curated set of [tools](file:///C:/Users/bhara/agentic-ide/server/agentzero/agent/tools.py) to read files, write code, search the web (via Exa), and run terminal commands.
-
-- **Active Feedback Loops:** The agent actively uses these tools to verify its own work. For example, when it writes a file, the IDE immediately runs a syntax check. If it fails, the agent is instantly told to fix it. The agent can also use `run_command` to run the project's test suite or Git commands to validate behavior.
-- **Strict Human Approval Gates:** Autonomy without safety is dangerous. Any tool that produces a side effect—such as writing a file, running a bash script, or starting a server—is intercepted by a strict human-approval gate. The agent *must* ask for explicit permission before executing the action, ensuring no destructive commands are run silently.
-
----
-
-## 3. Human-in-the-Loop Review
-
-When a task finishes, the user shouldn't have to blindly accept hundreds of lines of AI-generated code. The IDE provides a granular, Git-backed review interface powered by the [review engine](file:///C:/Users/bhara/agentic-ide/server/agentzero/web/review.py).
-
-- **Accurate Git Diffs:** The system maintains a hidden, shadow Git repository. When a task completes, it generates an accurate, readable unified diff comparing the task's start state to its finish state.
-- **Block-Level (Hunk) Accept/Reject:** The user is not forced into an "all-or-nothing" decision. The diff is parsed into individual hunks, allowing the developer to accept or reject changes line-block by line-block.
-- **Intelligent Partial Approvals:** If a user rejects a specific block of code, what happens to the rest of the task? The system calculates the "blast radius." It identifies any subsequent steps that depended on the rejected code, resets the files to baseline, applies only the accepted patches, and automatically requeues the dependent steps with the human's rejection feedback attached. The task resumes safely without breaking.
+- **Clickable file and line tags.** Files and specific code blocks can be added
+  to or removed from the active context at any time, with `@path`,
+  `@path:12` and `@path:12-40`. Tags work in both the input box and the output
+  chat — clicking a line in the file viewer inserts the tag, and clicking a tag
+  in a reply opens that exact range. The parsing lives in
+  [`pins.ts`](../ui/src/pins.ts) and `_PIN_TAG` in
+  [`orchestrator.py`](../server/agentzero/agent/orchestrator.py).
+- **Pins survive compaction.** A tagged block is stored at `pinned` priority,
+  the tier the eviction pass never touches. See
+  [Context Handling](context_handling.md#2-automatic-context-compaction) for the
+  eviction order.
+- **`/bytheway`.** Asks one isolated question with zero task context and
+  returns to the task untouched — useful mid-task ("what does this regex do?")
+  without polluting the step's prompt or paying for the full context.
 
 ---
 
-## 4. Persistent Preferences (AGENTS.md)
+## 2. Tools and Approval Gates
 
-Developers often establish project-wide rules (e.g., "Always use functional React components" or "Never use snake_case"). These are stored in a project-level `AGENTS.md` file.
+The executor has a small, fixed catalogue defined in
+[`tools.py`](../server/agentzero/agent/tools.py):
 
-- **Guaranteed Adherence:** The IDE parses this file and injects it into every single prompt sent to the model.
-- **Compaction Immunity:** Because it is classified as a critical infrastructure block, the `AGENTS.md` rules are strictly pinned. Even during severe context compaction events where old logs and code chunks are evicted to save tokens, the project rules survive. A stated preference is mathematically guaranteed to be present in the context window for every single output.
+| Tool | Side-effecting | Notes |
+|---|---|---|
+| `read_file` | no | |
+| `list_files` | no | |
+| `search_code` | no | |
+| `web_search` | no | via [Exa](https://exa.ai); degrades to "not configured" without `EXA_API_KEY` |
+| `write_file` | **yes** | syntax-checked immediately after the write |
+| `run_command` | **yes** | the project's test suite, linters, and its *own* git (diff/log/status/branch/commit/merge) |
+| `start_server` | **yes** | long-running processes, output pumped back to the agent |
+
+**Git is reached through `run_command`, not through dedicated tools.** The agent
+runs `git` against the project's own repository the same way a developer would.
+This is deliberate: a `git_commit` tool would have to re-implement staging,
+message conventions and conflict handling that `git` already does, and every
+project's git workflow differs. The shadow repository used for checkpoints is
+separate and is never exposed to the model.
+
+**Every side-effecting tool call stops and waits for a human.** The approval
+callback wraps each call in the orchestrator loop; the UI surfaces it in the
+Timeline with the exact command or file content to be written, and nothing runs
+until it is approved. This is the safety boundary — the agent has real terminal
+access, and the gate is what makes that acceptable.
+
+**Tools are also the feedback loop.** After a `write_file`, mechanical
+verification runs a pure syntax check (`python -m py_compile`, `node --check`)
+with no model call; a failure goes straight back to the agent as an error to
+fix. The agent uses `run_command` to run the project's tests and read the exit
+code, which is the same signal the orchestrator's L1 verification uses to decide
+whether a step may close.
+
+![A pending write_file approval showing the exact diff](images/approval.png)
+
+*A side-effecting call stops here with the exact diff it wants to apply. The note
+box redirects the agent in one turn — a bare reject tends to make it retry the
+same thing.*
+
+---
+
+## 3. Diffs and Revert
+
+Changes are backed by a hidden shadow git repository. Each completed step
+commits a checkpoint, so the tree's state at every step boundary is
+recoverable, and the diff between any two of them is a real `git diff` rather
+than a reconstruction.
+
+- **Live diffs.** Edits render as unified diffs as the agent makes them
+  ([`DiffLines.tsx`](../ui/src/panels/DiffLines.tsx)), with the final task diff
+  taken from the first checkpoint to the last.
+- **Revert to a step.** The Timeline can roll the working tree back to exactly
+  how it looked after any earlier completed step
+  ([`revert.py`](../server/agentzero/web/revert.py)). Every step after the
+  target returns to `pending` with its checkpoint and attempt count cleared.
+- **Beliefs are purged with the code.** Facts the reverted steps recorded are
+  dropped along with their commits. A fact about code that no longer exists is
+  precisely how a later attempt gets poisoned, so revert follows the same rule
+  the orchestrator's own backtracking does.
+- **Nothing auto-retries after a revert.** Re-running the old plan's later steps
+  unchanged would just reproduce whatever was being reverted away from. The
+  user's next message decides what happens instead.
+
+The approval gate in §2 is what stands between the agent and an unwanted
+change: writes are accepted or rejected one at a time, as they are proposed,
+rather than reviewed in a batch at the end.
+
+---
+
+![A completed three-step task with a revert link on each step](images/plan.png)
+
+*Every completed step carries a **Revert to here** link: the tree returns to that
+step's checkpoint and everything after it goes back to pending.*
+
+---
+
+## 4. Project Memory (`AGENTS.md`)
+
+Project-wide rules — "always use functional React components", "run `make
+check` before claiming done", folder conventions — live in an `AGENTS.md` at the
+project root.
+
+- **Injected into every model call**, not just the first. There is no rolling
+  transcript for a rule to scroll out of.
+- **Never evicted.** `AGENTS.md` is classified alongside the user's original
+  request and the active plan as a block compaction may not drop, so a stated
+  preference is still in the window after any number of compaction events.
+
+This repository ships its own [`AGENTS.md`](../AGENTS.md), which is both a
+worked example and the rules the agent follows when working on itself.

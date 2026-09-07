@@ -33,13 +33,31 @@ This means the index actually understands how the code works together. If the ag
 
 When an agent needs context for a task (e.g., "Update the user profile validation logic"), the pipeline executes a multi-stage search strategy:
 
+```mermaid
+flowchart LR
+    I([Step intent]) --> T[1· Extract terms<br/>strip stop words]
+    T --> G[2· Graph search<br/>match nodes by name]
+    G --> X["3· Traverse 1 hop<br/>invokes / invoked-by"]
+    X --> RK{4· Rank candidates}
+    RK -->|model ok| M[LLM relevance ranking]
+    RK -->|"model fails or<br/>malformed output"| L[Lexical closeness<br/>fallback]
+    M --> P[5· Extract line ranges]
+    L --> P
+    P --> O([Targeted chunks<br/>never whole files])
+    style I fill:#1f2937,color:#fff
+    style O fill:#065f46,color:#fff
+    style L fill:#78350f,color:#fff
+```
+
 1. **Term Extraction:** The system parses the agent's intent, stripping out stop words and extracting high-value keywords.
 2. **Graph Search:** The system looks up these keywords against the Code Graph to find the initial relevant entities (classes or functions).
 3. **Graph Traversal (Expansion):** The system then traverses the graph, walking one hop outwards. It gathers the entities that *invoke* or *are invoked by* the initial matches. This is how the system effortlessly retrieves related logic scattered across multiple files.
 4. **LLM-Powered Ranking:** Instead of dumping all the found code, the pipeline sends a lightweight, structured request to a fast reasoning model. The model's only job is to evaluate the issue against the list of candidate graph nodes and rank them by actual relevance.
 5. **Precise Extraction:** Finally, the system pulls exactly the line ranges for the highly-ranked classes and functions. The agent receives clean, targeted code chunks, not overwhelming thousands of lines of code.
 
-These steps are orchestrated by the [retrieval engine](file:///C:/Users/bhara/agentic-ide/server/agentzero/agent/retrieval.py).
+These steps are orchestrated by the [retrieval engine](../server/agentzero/agent/retrieval.py).
+
+---
 
 ---
 
@@ -51,4 +69,23 @@ A brittle system would crash or return an empty result, stalling the entire task
 
 If the model fails to rank the candidates, the system instantly detects the failure and recovers by falling back to a **lexical closeness heuristic**. It scores the graph nodes internally based on how closely their structural names match the extracted search terms, sorts them, and returns the best matches.
 
-This guarantees that the agent always receives high-quality context, ensuring uninterrupted progress even when external APIs stumble.
+The agent therefore always receives ranked context, even when the ranking model
+is unavailable or returns malformed output.
+
+---
+
+## 5. Trade-offs Worth Stating
+
+The graph is built by lightweight structural parsing, not a full AST per
+language. It resolves `contains` reliably and `invokes` by name matching, which
+means a call through a variable, a decorator, or dynamic dispatch is invisible
+to it — the one-hop expansion catches the common case and misses the clever one.
+It also indexes in memory and rebuilds per project open, which keeps isolation
+absolute and start-up cost proportional to repository size.
+
+Plain vector embeddings were rejected for the reason in §2, but the honest
+comparison is that embeddings would find code that is *described* similarly to
+the request, where the graph finds code that is *connected* to it. For "update
+the validation on this endpoint", connectivity wins. For a vague request that
+names no existing symbol, term extraction has less to grab, and the lexical
+fallback is what carries it.

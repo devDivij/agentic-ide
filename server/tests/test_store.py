@@ -20,8 +20,9 @@ from agentzero.agent.types import NewEvent, Plan, PlanStep, StepRecord, Task, Ta
 
 def test_wal_and_foreign_keys_are_actually_on(store):
     """
-    Both are set inside SCHEMA. WAL is what lets the SSE poller read while a
-    task thread writes; without foreign_keys the ON DELETE CASCADE clauses on
+    Both are set per connection in `_configure_connection`, NOT in SCHEMA --
+    see the note there. WAL is what lets the SSE poller read while a task
+    thread writes; without foreign_keys the ON DELETE CASCADE clauses on
     steps/facts/pins/events are dead weight. Asserted rather than assumed
     because a pragma that fails to apply does so silently.
     """
@@ -188,6 +189,60 @@ def test_resumable_lists_only_running_tasks(store, task, project, budget):
                            prompt="x", status="done", complexity="easy",
                            created_at=now_ms(), budget=budget))
     assert [t.id for t in store.list_resumable(project)] == ["t1"]
+
+
+def test_a_second_open_still_gets_the_pragmas_with_the_schema_skipped(project):
+    """
+    An up-to-date database skips the schema entirely on reopen. `foreign_keys`
+    is per-CONNECTION state rather than a property of the file, so skipping
+    that work must not quietly leave the second connection with cascades
+    switched off.
+    """
+    first = Store(project)
+    first.close()
+
+    second = Store(project)
+    try:
+        assert second.db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert second.db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        second.close()
+
+
+def test_opening_a_rollback_journal_database_survives_a_held_lock(project):
+    """
+    Regression. `PRAGMA journal_mode = WAL` lived in SCHEMA and therefore ran
+    on every open, but *changing* journal mode needs exclusive access. A file
+    still in rollback-journal mode -- one an older build wrote, or one whose
+    first open was interrupted -- could then not be opened at all while any
+    other connection held it: `sqlite3.OperationalError: database is locked`,
+    which for the web host (a Store per request) meant a 500 on a server that
+    was otherwise fine.
+
+    WAL is a concurrency optimisation, not a correctness requirement, so
+    failing to switch it must never stop the store opening.
+    """
+    Store(project).close()
+    # Put the file back the way an older build would have left it.
+    seed = sqlite3.connect(state_db_path(project), isolation_level=None)
+    seed.execute("PRAGMA journal_mode = delete")
+    seed.close()
+
+    other = sqlite3.connect(state_db_path(project), isolation_level=None)
+    other.execute("PRAGMA busy_timeout = 100")
+    other.execute("BEGIN")
+    other.execute("SELECT * FROM tasks").fetchall()
+    try:
+        reopened = Store(project)          # used to raise "database is locked"
+        try:
+            # Usable despite not having managed the WAL switch.
+            assert reopened.db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+            assert reopened.list_conversations(project) == []
+        finally:
+            reopened.close()
+    finally:
+        other.execute("ROLLBACK")
+        other.close()
 
 
 # -- migration from databases older builds wrote -----------------------------
